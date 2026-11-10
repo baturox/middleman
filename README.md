@@ -129,18 +129,58 @@ cargo install --git https://github.com/baturox/middleman --locked
 
 ## Quick start
 
-```sh
-middleman init            # pick OpenRouter, log in with your browser (or paste a key), pick scope and mode
-middleman setup claude    # shows every change to Claude Code's files, asks, backs them up, applies
+Run `middleman init`. It asks four things with arrow-key menus and checks your key before saving:
+
+```text
+  🛡  middleman setup                              step 1 of 4 · Where to install
+✔ Install for… · All my projects (user)
+
+  🛡  middleman setup                                      step 2 of 4 · Provider
+? Pick a provider ›
+❯ Recommended  OpenRouter        one key for DeepSeek, Qwen, Kimi, GLM and 300+ models
+  Direct       DeepSeek          DeepSeek's own API, very cheap coding models · URL unverified
+               …
+  Local, free  Ollama            models on this computer, no key
+  Other        Custom URL        any OpenAI-compatible endpoint
+✔ Pick a provider · OpenRouter
+
+  OpenRouter · get a key at https://openrouter.ai/settings/keys
+✔ How do you want to connect OpenRouter? · Paste an API key
+✔ Paste your OpenRouter API key (hidden) · ********
+  ✗ OpenRouter rejected this key (HTTP 401).
+    The key is wrong, incomplete or revoked. Copy it again from https://openrouter.ai/settings/keys.
+✔ What now? · Paste a different key
+✔ Paste your OpenRouter API key (hidden) · ********
+  ✓ OpenRouter works: label middleman, limit $10.00 ($7.50 left), used $2.50
+  ✓ Key stored in macOS Keychain (service middleman, account openrouter)
+✔ Default model for coding jobs (optional) · Automatic
+✔ Add another provider? · no
+
+  🛡  middleman setup                                  step 3 of 4 · Routing mode
+✔ When may Claude delegate? · Ask me each time (confirm)
+
+  🛡  middleman setup                                          step 4 of 4 · Done
+  Config         ~/.config/middleman/config.toml
+  Mode           Ask me each time (confirm)
+  Providers      ✓ OpenRouter  label middleman, $7.50 left · key in macOS Keychain
+✔ Connect to Claude Code now? (runs `middleman setup claude`, shows the changes first) · yes
 ```
 
-That's it. Restart Claude Code and the statusline shows `🛡 middleman ✓ openrouter`.
+Restart Claude Code and the statusline shows `🛡 middleman ✓ openrouter`.
 
-- `init` stores the key in your OS keychain (macOS Keychain, Windows Credential Manager, Linux
-  Secret Service). You never type it on the command line, so it isn't in your shell history.
-- `setup claude` registers the MCP server, allows its two tools, adds the prompt hook, the
-  statusline and the CLAUDE.md block. `--dry-run` only shows the changes; `--undo` puts the old
+- **Routing modes:** *confirm* (the default) shows you what would be sent and waits for
+  `middleman approve <id>` in your terminal; *auto* lets Claude delegate safe, big-enough jobs
+  by itself (all logged); *explicit* only delegates prompts that start with `cheap:`.
+- The key goes to your OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret
+  Service), never into the config or your shell history. Run `init` again to keep, update or
+  start fresh (the old config is backed up).
+- `setup claude` (also offered at the end of `init`) registers the MCP server, allows its two
+  tools, adds the prompt hook, the statusline and the CLAUDE.md block, and lists each change
+  first. `--dry-run` only shows them, `--details` adds the exact keys, `--undo` puts the old
   files back.
+- Scripts: `middleman init --yes` (OpenRouter, user scope, confirm mode), plus
+  `--providers`, `--mode`, `--scope`, `--base-url` and `--key-stdin`. `middleman init --list`
+  shows every provider and whether its key is set.
 - Later: `middleman models refresh` fetches current prices, `middleman usage` and `middleman tune`
   show where your Claude Code money goes, and `middleman doctor` checks everything.
 
@@ -149,7 +189,7 @@ That's it. Restart Claude Code and the statusline shows `🛡 middleman ✓ open
 
 ```sh
 middleman provider add            # pick a provider, paste the key (hidden), it's checked with a free request
-middleman provider list           # where each key is stored (never the key)
+middleman provider list           # where each key is stored (never the key); --all lists every provider
 middleman provider test openrouter
 middleman provider rotate openrouter
 middleman provider remove deepseek
@@ -248,8 +288,8 @@ that exact request, for 30 minutes.
 |---|---|
 | `middleman usage` | Your Claude Code spend from local logs (totals only, never message text) |
 | `middleman tune` | Recommended settings, with estimated savings |
-| `middleman init` | Guided setup: provider, key (browser login or hidden paste), scope, routing mode |
-| `middleman setup claude` | Connect to Claude Code (`--dry-run`, `--undo`, `--scope project`) |
+| `middleman init` | Guided setup: scope, provider and key (checked live), routing mode (`--list`, `--yes`) |
+| `middleman setup claude` | Connect to Claude Code (`--dry-run`, `--details`, `--undo`, `--scope project`) |
 | `middleman provider add/list/test/rotate/remove` | Manage provider keys in the OS keychain |
 | `middleman watch` | Live view of delegations in another terminal |
 | `middleman report` | What was delegated, to which model, and the net saving (`--html` for a dashboard) |
