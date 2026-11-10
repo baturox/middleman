@@ -148,7 +148,10 @@ mod tests {
             "sig=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
         ));
         // long token without digits; contextual hex and lower+digit tokens
-        assert!(fires(concat!("value: wJalrXUtnFEMI", "zKtMDENGgbPxRfiCYzzQWERTYqq")));
+        assert!(fires(concat!(
+            "value: wJalrXUtnFEMI",
+            "zKtMDENGgbPxRfiCYzzQWERTYqq"
+        )));
         assert!(fires("secret_hex = 736b5f6c6976655f6162636465"));
         assert!(fires("session k3j4h5k2j3h4k5j6h7k8j9m2"));
     }

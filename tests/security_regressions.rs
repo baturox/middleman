@@ -298,7 +298,10 @@ async fn detector_evasion_matrix_never_reaches_provider() {
         ),
         (
             "aws secret 1 digit",
-            concat!("aws_secret_access_key: wJalrXUtnFEMI", "zKtMDENGgbPxRfiCYzzQWERTY7q"),
+            concat!(
+                "aws_secret_access_key: wJalrXUtnFEMI",
+                "zKtMDENGgbPxRfiCYzzQWERTY7q"
+            ),
             concat!("wJalrXUtnFEMI", "zKtMDENGgbPxRfiCYzzQWERTY7q"),
             false,
         ),
@@ -383,10 +386,18 @@ async fn secrets_in_every_payload_field_block() {
         .mount(&s)
         .await;
     let e = env(&format!("{}/v1", s.uri()), "openai", "S1", "");
-    std::fs::write(e.root.join(concat!("src/acme_AKIA", "ABCDEFGHIJKLMNOP.py")), "x = 1\n").unwrap();
+    std::fs::write(
+        e.root.join(concat!("src/acme_AKIA", "ABCDEFGHIJKLMNOP.py")),
+        "x = 1\n",
+    )
+    .unwrap();
     let p = Pipeline::new(e.cfg.clone()).unwrap();
     let mut r = summarize("hello world");
-    r.instructions = concat!("Summarize for bob@megacorp-mail.io using key AKIA", "ABCDEFGHIJKLMNOP").into();
+    r.instructions = concat!(
+        "Summarize for bob@megacorp-mail.io using key AKIA",
+        "ABCDEFGHIJKLMNOP"
+    )
+    .into();
     assert_eq!(p.run(r).await.status, Status::Blocked);
     let mut r = summarize("hello world");
     r.inputs[0].label = "ghp_abcdefghijklmnopqrstuvwxyz0123456789".into();
