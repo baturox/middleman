@@ -11,8 +11,8 @@ Short answer:
 - **Source code does leave. That is the product.** Only the requested lines are sent, but those
   lines go out with their identifiers, comments and string literals intact.
 - **Four real leaks were found**, all of metadata around the code (paths, URL paths, git
-  submodule files). None exposes a dictionary name or a secret. Each has a failing test waiting
-  for the fix.
+  submodule files). None exposes a dictionary name or a secret. **All four are fixed**, as are
+  the User-Agent, cache-permission and ledger-project risks (see "Fixed since" below).
 - The audit log of today's real runs is clean.
 
 ## How it was tested
@@ -39,8 +39,7 @@ files that were never requested) must not appear. Name canaries are compared on 
 Run it:
 
 ```
-cargo test --test leak_validation                 # 30 pass
-cargo test --test leak_validation -- --ignored    # the 6 fixed_* tests fail until the leaks are fixed
+cargo test --test leak_validation                 # 32 pass, including every fixed_* test
 MM_LEAK_AUDIT_LOG=~/.local/state/middleman/audit-2026-11.jsonl \
 MM_LEAK_AUDIT_NEEDLES=name,repo,host cargo test --test leak_validation real_audit -- --nocapture
 ```
@@ -57,19 +56,20 @@ RISK = by design or low impact; you should know about it.
 | 1 | Split forms (`quasar_ledger`, `Quasar Ledger`, `Z e p h y r i n e`) | PASS | `split_and_spaced_forms_block_with_zero_requests`: refused, 0 requests |
 | 1 | Names that are not in the dictionary | RISK | `control_names_missing_from_the_dictionary_are_sent_verbatim`: `ZephyrineClient`, `QuasarLedger`, `mkaraca` go out. The dictionary is the only protection for names |
 | 1 | System prompt and envelope say nothing about machine, user, cwd, root, git remote, git user | PASS | `nothing_about_the_machine_user_cwd_or_git_remote_is_sent`; root becomes `/workspace/app` |
-| 1 | Project root at the end of a sentence (`... is at <root>.`) | **LEAK** | `leak_project_root_before_a_full_stop_is_sent`: the full absolute path is sent; only `/Users/<name>` and dictionary terms in it are replaced. Cause: `src/detect/infra.rs` skips a root followed by `.` |
+| 1 | Project root at the end of a sentence (`... is at <root>.`) | FIXED | `fixed_project_root_before_a_full_stop_is_replaced` (was: the full absolute path was sent) |
 | 1 | Only requested files and line ranges are sent | PASS | `only_requested_files_and_line_ranges_are_sent`: slice is byte-exact; README, config, neighbour file, `.git`, `include_str!` target absent |
 | 1 | Company name in a relative path (`zephyrine/billing.rs`) | PASS | `company_name_in_a_relative_path_is_pseudonymized` |
-| 1 | Absolute path with the company name above the root | PASS | `absolute_path_is_sent_root_relative`: header is `src/egress.rs` |
-| 1 | Directory and file names that are not dictionary terms | **LEAK** | `leak_non_dictionary_path_components_are_sent_verbatim`: `--- FILE internal-fraud-engine/risk_scoring_v3.rs ---` is sent as is |
+| 1 | Absolute path with the company name above the root | PASS | `absolute_path_is_sent_root_relative`: header is `src/f1.rs` |
+| 1 | Directory and file names that are not dictionary terms | FIXED | `fixed_path_components_are_pseudonymized`, `fixed_paths_and_urls_are_restored_in_output`: sent as `d1/f1.rs` (conventional top dir and extension kept), restored in the answer (was: `internal-fraud-engine/risk_scoring_v3.rs` sent as is) |
+| 1 | Absolute paths outside the roots | FIXED | `fixed_absolute_paths_outside_roots_are_replaced_whole`: the whole path, not only `/Users/<name>` |
 | 2 | Fraction sent for a line range | PASS | `line_range_minimization_is_measured`: lines 57-128 of `src/pipeline.rs` = 2 434 of 53 821 bytes (4.5 %), plus a 105-byte envelope |
 | 2 | `max_files` (6) and `max_input_chars` (24 000) | PASS | `max_files_and_max_input_chars_hold`, `lowered_max_input_chars_is_enforced_on_the_whole_payload`: whole `pipeline.rs` / `config.rs` refused, nothing truncated or partly sent |
 | 2 | Symlink out of root, directory symlink, `..`, absolute outside path, symlink onto `.git/config`, `.git/*` | PASS | `symlinks_parent_paths_and_dot_git_cannot_be_pulled_in`: all refused; one bad file blocks the whole request |
 | 2 | `mod` / `include_str!` targets | PASS | never followed; middleman reads only named files |
-| 2 | `.gitmodules` and a submodule's `.git` pointer file | **LEAK** (low) | `leak_gitmodules_and_submodule_pointer_are_readable_when_named`: readable when the caller names them. Hosts are replaced; submodule layout and repo path (`:platform/shared-protos.git`) are not |
+| 2 | `.gitmodules` and a submodule's `.git` pointer file | FIXED | `fixed_gitmodules_and_submodule_pointer_are_denied`: `**/.gitmodules`, `**/.git` on the read and write deny list |
 | 3 | Headers | PASS | `default_headers_are_transport_and_auth_only`: only `host, accept, user-agent, content-type, content-length, authorization` (+ `x-api-key, anthropic-version`). No X-Title, no Referer, no cookies, no query string |
-| 3 | `X-Title` | PASS | `x_title_is_sent_only_when_configured`: not in code; sent only if the config has `headers = { "X-Title" = ... }` (the example config does) |
-| 3 | User-Agent | RISK | `risk_default_user_agent_names_the_tool`: `Mozilla/5.0 (compatible; middleman/0.1)` names the tool (and a stale version) |
+| 3 | `X-Title` | PASS | `x_title_is_sent_only_when_configured`: not in code or the example config; sent only if you configure it |
+| 3 | User-Agent | FIXED | `fixed_default_user_agent_does_not_name_the_tool`: `Mozilla/5.0` |
 | 3 | Fingerprint | RISK | `risk_request_shape_is_a_stable_fingerprint`: constant system prompt, envelope, JSON keys; same term gives the same surrogate for the life of one process |
 | 4 | Today's real audit log | PASS | 13 records, 5 sent, 0 hits (details below) |
 | 5 | Restored output delegated again (inline) | PASS | `restored_output_is_resanitized_when_delegated_again`: 2nd request has 0 canaries, 38+ fresh replacements |
@@ -77,23 +77,31 @@ RISK = by design or low impact; you should know about it.
 | 5 | Hostile answer puts a surrogate in a URL | PASS | `restore_never_fills_originals_into_urls_from_a_hostile_answer`: not restored, flagged high risk |
 | 5 | Dry-run preview equals what is sent | PASS | `dry_run_preview_equals_what_is_sent` |
 | 6 | State dir 0700, ledger and audit 0600, no originals | PASS | `state_files_are_private_and_hold_no_originals` |
-| 6 | Ledger `project` = root directory base name | RISK (local) | same test: `"project":"quasarledger"`; shown by `report --by project` |
+| 6 | Ledger `project` | FIXED | same test: a salted hash `p-xxxxxxxx`; `report --by project` shows the overlay `label` when set |
 | 6 | Report (text, HTML), watch, status line, `middleman_status` | PASS | `report_watch_statusline_and_status_show_no_originals` |
 | 6 | Audit `block_reason` repeats a refused path | RISK (local) | `audit_block_reason_repeats_the_requested_path_locally` |
-| 6 | Model catalog cache is 0755 / 0644 | RISK (low) | `risk_catalog_cache_is_world_readable_but_public_data_only`: public model ids and prices only |
-| 7 | URL port, path, repo path, database name | **LEAK** (low) | `leak_url_path_port_and_database_name_are_sent_verbatim`: `svc2.example.net:8443/v2/charges`, `.../platform/...`, `:5432/ledger` |
+| 6 | Model catalog cache permissions | FIXED | `fixed_catalog_cache_is_private`: 0700 / 0600 |
+| 7 | URL port, path, repo path, database name | FIXED | `fixed_url_path_port_and_database_name_are_replaced`: everything after `scheme://` becomes `svcN.example.net/pM`; restored when echoed after `scheme://` |
 | 7 | Identifiers, comments, literals, structure | RISK (by design) | `risk_identifiers_comments_and_structure_are_sent_verbatim` |
 
-Open items and the test that turns green when each is fixed:
+## Fixed since
 
-| Open item | Test (`--ignored`) |
-|-----------|--------------------|
+Each former `LEAK` / open-`RISK` test is gone; its `fixed_*` twin runs in the normal suite.
+
+| Item | Test |
+|------|------|
 | Root followed by `.` | `fixed_project_root_before_a_full_stop_is_replaced` |
-| Path components in `--- FILE` | `fixed_path_components_are_pseudonymized` |
+| Path components in `--- FILE` and mentions | `fixed_path_components_are_pseudonymized`, `fixed_paths_and_urls_are_restored_in_output` |
 | `.gitmodules`, submodule `.git` file | `fixed_gitmodules_and_submodule_pointer_are_denied` |
-| URL path / port / db name | `fixed_url_path_port_and_database_name_are_replaced` |
-| User-Agent names the tool | `fixed_default_user_agent_does_not_name_the_tool` |
+| URL path / port / user / db name | `fixed_url_path_port_and_database_name_are_replaced` |
+| Absolute paths outside roots | `fixed_absolute_paths_outside_roots_are_replaced_whole` |
+| User-Agent names the tool; `X-Title` in the example config | `fixed_default_user_agent_does_not_name_the_tool` |
 | Cache permissions | `fixed_catalog_cache_is_private` |
+| Ledger `project` | `state_files_are_private_and_hold_no_originals` |
+
+Still open: scp-style git URLs (`git@host:org/repo.git`) keep their path (the host is
+replaced); deeper directories of a requested file are dropped from its surrogate, so a model
+importing `pkg.sub.mod` sees `pkg.f1`; route strings (`/api/v1/...`) are not treated as paths.
 
 ## Metadata
 
@@ -165,7 +173,7 @@ itself the secret must be declared `confidential`, which never leaves the machin
    back locally. Small change in `build_payload`; removes project layout from every request.
 3. **Deny `.gitmodules` and a `.git` file on read.** Add `**/.gitmodules` and `**/.git` to
    `BUILTIN_DENY`. One line each.
-4. **`middleman dict suggest`.** Mine the repo for proper nouns: root directory name, git
+4. **`middleman dict suggest`** (done). Mine the repo for proper nouns: root directory name, git
    remote org and repo, package names in manifests, hostnames in configs, git author names,
    capitalized words that are not English or library names. The dictionary is the single point
    of failure for names (see the control test), and today it is filled by hand. Also generate

@@ -345,6 +345,47 @@ after a backup is taken.
 > On a Claude **Pro/Max subscription** you don't pay per token, so these savings mean **more usage
 > before you hit limits**. On **API billing** they are real dollars. Reports show both.
 
+## The cheapest way: `cheap:` prompts
+
+Type the job yourself, with `cheap:` in front:
+
+```
+cheap: write tests for src/date.py -> tests/test_date.py
+cheap: add docstrings to src/util.ts:1-120
+cheap: summarize docs/design.md
+```
+
+The prompt hook runs the delegation itself, through every protection above, and stops the
+prompt there: **Claude never sees it, so Claude spends nothing**. You get a short report in
+place of Claude's answer:
+
+```
+🛡 middleman · cheap: done by a cheap model; Claude spent 0 tokens
+  model    openrouter/qwen/qwen3.8-flash
+  wrote    tests/test_date.py (42 lines)
+  cost     $0.00031 · net saving ~$0.0210
+  risk     low
+  next     review it yourself, or ask Claude: "review tests/test_date.py"
+```
+
+- Syntax: `cheap: <task> <file>[:start-end] [more files] [-> output]`. Tasks: tests,
+  docstrings, summarize, translate, boilerplate, explain (English or Turkish keywords).
+- Without `->`, the output goes next to your test layout (`tests/test_<name>.py`,
+  `<name>.test.ts`, `<name>_test.go`, ...); docstrings are staged over the file itself
+  (`.middleman.new` + `.middleman.patch`); summaries and explanations go to `.middleman/out/`.
+- If the task or the file can't be read off the prompt, nothing is guessed: the prompt is
+  stopped with the syntax. Prompts that touch sensitive topics (auth, billing, secrets,
+  deploys, ...) are refused; ask Claude instead.
+- Typing `cheap:` is your approval, also in `confirm` and `explicit` mode. The usage log marks
+  these runs `"via":"hook"` with zero Claude-side cost, so the savings in `report` are real.
+- The report is shown to you only. If you want Claude to look at the result, ask it to.
+
+**When delegating from inside Claude still pays off.** When Claude calls the MCP tool itself,
+the call and the extra turn cost Claude tokens: in a long session (~380K context) about
+$0.076 of cache reads per delegation, so it only pays when the output is above roughly 4K
+tokens. In short sessions, or for big outputs (a whole test suite, a long translation), it
+still saves money, and middleman's break-even gate refuses the calls that would not.
+
 ## Choosing cheap models
 
 Any OpenAI- or Anthropic-compatible provider works; adding one is a few lines of config. With
@@ -403,6 +444,7 @@ that exact request, for 30 minutes.
 | `middleman check <files>` | Dry run: shows exactly what *would* be sent, without sending it |
 | `middleman route "<prompt>"` | Shows whether a prompt would be delegated, and why |
 | `middleman doctor` | Health check: config, keys, keychain, providers, Claude Code wiring |
+| `middleman dict suggest` | Find company, product and people names in this project (locally) and add the ones you pick to the private dictionary (`--yes`, `--min-confidence`, `--json`) |
 | `middleman models refresh` | Fetch current models and prices from your providers |
 | `middleman approve <id>` | Approve one `confirm`-mode delegation (run it yourself, in a terminal) |
 | `middleman completions <shell>` | Shell completions for bash, zsh, fish, elvish, PowerShell |
@@ -413,8 +455,8 @@ that exact request, for 30 minutes.
 | Risk | What middleman does | What remains |
 |---|---|---|
 | Secrets in code | Detects keys, tokens, passwords, PEM files, high-entropy strings, card/IBAN/ID numbers (also through zero-width characters, Unicode look-alike forms and `"AKIA" + "..."` splits), and **blocks** the request | Unusual secret formats; detection is best-effort |
-| Who you are | Replaces your company/product/customer names (from your private list, matched case- and Unicode-insensitively), hosts, emails and paths; blocks names disguised with separators or Cyrillic/Greek look-alikes | Names you didn't add to the list |
-| Sensitive files | `.env`, keys, `secrets/`, `.git`, `.ssh` and friends are never read | Add your own folders to the deny list |
+| Who you are | Replaces your company/product/customer names (from your private list, matched case- and Unicode-insensitively), hosts, whole URLs (port and path too), emails, absolute paths and the requested files' names (sent as `src/f1.py`, restored in the answer); blocks names disguised with separators or Cyrillic/Greek look-alikes. Generic User-Agent, no tool headers | Names you didn't add to the list (`middleman dict suggest` helps) |
+| Sensitive files | `.env`, keys, `secrets/`, `.git` (also the submodule / worktree `.git` file), `.gitmodules`, `.ssh` and friends are never read | Add your own folders to the deny list |
 | Business logic | Size limits, task-type allow-list, per-provider sensitivity limits | **The code's logic itself can't be hidden.** Only delegate low-value code. |
 | Bad answers | Treated as untrusted and scanned: new hosts/IPs, exec/eval/network calls or import-time side effects mark it high risk, and high-risk output is only staged as `.middleman.new`. Real names are never restored inside URLs or network/exec call arguments, and secret placeholders are never restored into files. Agent, editor, CI, git-hook and shell config files (`.claude/`, `.mcp.json`, `CLAUDE.md`, `.github/`, `.git/`, `conftest.py`, `.zshrc`, ...) can't be written, and symlinks are never followed. Never executed | Claude must review the diff before running anything |
 | Account, IP, timing | Not hidden | Use a separate account or network if this matters |
@@ -469,8 +511,18 @@ See [`config/middleman.example.toml`](config/middleman.example.toml) for every o
   `overwrite: true` only takes effect with `[output] allow_overwrite = true` in your user config.
   `[paths] write_allow = ["tests/**"]` limits where file mode may write.
 
-The prompt hook (local, ~20 ms, never blocks your prompt) is added by `middleman setup claude`.
-It's a `UserPromptSubmit` command hook running `middleman route --hook`.
+The prompt hook is added by `middleman setup claude`: a `UserPromptSubmit` command hook running
+`middleman route --hook` (timeout 150 s). For ordinary prompts it's a local check (~20 ms) that
+only adds advice for Claude; a `cheap:` prompt is run by the hook and never reaches Claude.
+
+- **Private dictionary:** the only thing that hides names is your list. `middleman dict suggest`
+  (also a step in `init`) proposes names from the root folder, the git remote, manifests,
+  git authors, config hosts and recurring proper nouns, and adds the snake / kebab / spaced
+  spellings, so `acme_billing` is replaced instead of blocking the request. `doctor` warns
+  while the list is empty.
+- **Project label:** the usage log stores a salted hash of the project folder, never its name.
+  Put `label = "work-api"` in the project's `.middleman.toml` to see that name in
+  `report --by project`.
 
 </details>
 
