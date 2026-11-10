@@ -25,7 +25,7 @@ middleman is a small program that runs **on your machine**, next to Claude Code.
 3. **🛡️ Hands big, boring jobs to cheap models, safely.** When Claude needs, say, a test suite, it
    can pass the job to middleman. middleman removes secrets, replaces your company's names, hosts and
    emails with fake ones, sends the job to a cheap model, puts the real names back, and writes the
-   result to a file. Claude then just runs the tests.
+   result to a file. Claude reviews the diff, then runs the tests.
 
 The cheap provider only ever sees something like this:
 
@@ -45,8 +45,11 @@ The cheap provider only ever sees something like this:
 2. Claude calls `delegate_task` with the file path. It doesn't paste the code, which keeps Claude's
    own token use small.
 3. middleman reads the file, cleans it, and sends it to `deepseek/deepseek-v4.1-flash`.
-4. The tests come back, the real names are restored, and the result is saved to `tests/test_date_parser.py`.
-5. Claude runs the tests and fixes anything that fails.
+4. The tests come back, a risk scan runs, the real names are restored, and the result is saved to
+   `tests/test_date_parser.py`. If the output contains anything risky (new hosts or IP addresses,
+   process/exec/eval/network calls, import-time side effects), it is only staged as
+   `tests/test_date_parser.py.middleman.new` and Claude is told to read it first.
+5. Claude reviews the diff (reading any flagged lines), then runs the tests and fixes anything that fails.
 
 **Cost:** about **$0.003** with DeepSeek, against about **$0.04** if Claude (Opus) wrote the same
 ~2,000 tokens itself. The saving is logged, so you can check it later with `middleman report`.
@@ -62,8 +65,16 @@ to **keep it on Claude**, and middleman refuses it if Claude tries anyway.
 
 <sub>Editable source: [`docs/architecture.drawio`](docs/architecture.drawio) (open it in draw.io)</sub>
 
-- **Fails closed.** If anything is unclear (a possible secret, an unknown price, a broken config),
-  nothing is sent and Claude does the job itself.
+- **Fails closed.** If anything is unclear (a possible secret, an unknown price, a broken config,
+  a dictionary term hidden with look-alike letters or separators), nothing is sent and Claude does
+  the job itself.
+- **Two independent checks.** Detection runs on a normalized view of the text (Unicode NFKC,
+  invisible characters removed, full case folding). Then the egress gate checks the final payload
+  again, on its own: it re-runs every detector and searches the normalized payload for every
+  dictionary term and every original value. Any hit blocks the request.
+- **Detection is best-effort.** No scanner finds every secret or every way of writing a name. The
+  private dictionary, the deny-listed paths and the rule *only delegate low-value code* remain
+  essential.
 - **Only when it pays off.** Each hand-off costs Claude a little overhead (about 830 output tokens'
   worth on Opus), so small tasks are refused and done by Claude.
 - **Your names stay local.** The mapping from fake names back to real ones lives in memory only and
@@ -75,11 +86,21 @@ to **keep it on Claude**, and middleman refuses it if Claude tries anyway.
 **macOS and Linux**, one line:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/baturox/middleman/main/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/baturox/middleman/main/install.sh | sh
 ```
 
 This downloads the right binary from [Releases](https://github.com/baturox/middleman/releases/latest),
-checks its SHA-256 and installs it to `~/.local/bin`.
+checks its SHA-256 (it refuses to install on a missing or wrong checksum) and installs it to
+`~/.local/bin`. If the GitHub CLI is installed it also verifies the build-provenance attestation
+(`MIDDLEMAN_REQUIRE_ATTESTATION=1` makes a failed check fatal). The macOS binary is not code-signed;
+the installer removes the quarantine flag and says so.
+
+Every release archive carries a [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations).
+To check a download yourself:
+
+```sh
+gh attestation verify middleman-<version>-<target>.tar.gz --repo baturox/middleman
+```
 
 <details>
 <summary>Other options: manual download, Windows, build from source</summary>
@@ -180,6 +201,12 @@ chain = ["auto:code:cheapest", "openrouter/deepseek/deepseek-v4.1-flash", "claud
 mode = "auto"        # auto: Claude delegates when safe · confirm: ask first · explicit: only on "cheap:"
 ```
 
+`confirm` and `explicit` guard against *accidental* delegation; they are advisory, not a security
+boundary (the model sets `user_requested` itself). `confirm` is backed by a one-time token: the dry
+run returns an `approval_id`, you approve it by running `middleman approve <id>` in your own terminal
+(it asks you to type `yes`), and only then can the confirmed call send. Each token works once, for
+that exact request, for 30 minutes.
+
 > 💡 **Claude Haiku 5.5** ($0.10 / $0.50) costs about the same as these models and is first-party,
 > so nothing needs redacting. Use it for anything sensitive that's still routine.
 
@@ -194,17 +221,18 @@ mode = "auto"        # auto: Claude delegates when safe · confirm: ask first ·
 | `middleman route "<prompt>"` | Shows whether a prompt would be delegated, and why |
 | `middleman init` / `doctor` | Setup / health check |
 | `middleman models refresh` | Fetch current models and prices from your providers |
+| `middleman approve <id>` | Approve one `confirm`-mode delegation (run it yourself, in a terminal) |
 
 <details>
 <summary><b>Privacy details: what is and isn't hidden</b></summary>
 
 | Risk | What middleman does | What remains |
 |---|---|---|
-| Secrets in code | Detects keys, tokens, passwords, PEM files, high-entropy strings, card/IBAN/ID numbers, and **blocks** the request | Unusual secret formats |
-| Who you are | Replaces your company/product/customer names (from your private list), hosts, emails and paths | Names you didn't add to the list |
+| Secrets in code | Detects keys, tokens, passwords, PEM files, high-entropy strings, card/IBAN/ID numbers (also through zero-width characters, Unicode look-alike forms and `"AKIA" + "..."` splits), and **blocks** the request | Unusual secret formats; detection is best-effort |
+| Who you are | Replaces your company/product/customer names (from your private list, matched case- and Unicode-insensitively), hosts, emails and paths; blocks names disguised with separators or Cyrillic/Greek look-alikes | Names you didn't add to the list |
 | Sensitive files | `.env`, keys, `secrets/`, `.git`, `.ssh` and friends are never read | Add your own folders to the deny list |
 | Business logic | Size limits, task-type allow-list, per-provider sensitivity limits | **The code's logic itself can't be hidden.** Only delegate low-value code. |
-| Bad answers | Treated as untrusted; warns on new URLs, packages and install commands; never executed | Claude must still review and test |
+| Bad answers | Treated as untrusted and scanned: new hosts/IPs, exec/eval/network calls or import-time side effects mark it high risk, and high-risk output is only staged as `.middleman.new`. Real names are never restored inside URLs or network/exec call arguments, and secret placeholders are never restored into files. Agent, editor, CI, git-hook and shell config files (`.claude/`, `.mcp.json`, `CLAUDE.md`, `.github/`, `.git/`, `conftest.py`, `.zshrc`, ...) can't be written, and symlinks are never followed. Never executed | Claude must review the diff before running anything |
 | Account, IP, timing | Not hidden | Use a separate account or network if this matters |
 
 Resellers and gateways count as untrusted, even when they serve a model called "Claude". Every provider
@@ -225,7 +253,9 @@ Every attempt, including blocked ones, is one JSON line in `~/.local/state/middl
  "claude_overhead_usd":0.0166,"net_savings_usd":0.0216,"validation":"passed"}
 ```
 
-The record also stores the cleaned text exactly as it was sent, so you can audit what left your machine.
+A separate audit log (`audit-YYYY-MM.jsonl`, same directory, 0600) keeps the cleaned text exactly as
+it was sent, plus provider error bodies (with your key removed), so you can audit what left your
+machine. Note that it **retains the sanitized payload**: protect or prune that directory accordingly.
 
 </details>
 
@@ -243,6 +273,9 @@ See [`config/middleman.example.toml`](config/middleman.example.toml) for every o
 - **Budget:** per-call, daily and weekly caps, plus a minimum balance to keep. If the balance can't be
   read, the request is refused.
 - **Per-project rules:** a `.middleman.toml` in a repo can only make the rules **stricter**.
+- **File output:** existing files are staged (`.middleman.new` + `.middleman.patch`); a call's
+  `overwrite: true` only takes effect with `[output] allow_overwrite = true` in your user config.
+  `[paths] write_allow = ["tests/**"]` limits where file mode may write.
 
 Optional prompt hook (local, ~20 ms, never blocks your prompt), merged into `~/.claude/settings.json`:
 

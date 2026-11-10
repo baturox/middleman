@@ -34,14 +34,18 @@ Findings from the prior art (read-only; nothing was run against the live gateway
         v
 +---------------------------- middleman (local, trusted) ----------------------------+
 | 1 intake      read files itself (path allow/deny globs, line ranges, size caps)     |
-| 2 detect      secrets (regex+entropy+checksums), PII, hosts/URLs/IPs/paths, dict    |
+| 2 detect      on raw + NFKC/invisible-stripped/case-folded views (spans mapped back):|
+|               secrets (regex+entropy+checksums), PII, hosts/URLs/IPs/paths, dict;  |
+|               dict also on a separator/look-alike skeleton => hit there = BLOCK    |
 | 3 classify    sensitivity S0..S3 = max(declared, detected); complexity C0..C2       |
 | 4 policy      (task_kind, S, C) -> Allow{provider,model} | Block{reason}            |
 | 5 pseudonymize originals -> typed surrogates; Vault lives in memory per request     |
-| 6 egress gate re-scan final payload; assert no vault original present; else BLOCK   |
+| 6 egress gate independent 2nd check: re-run detectors; normalize final payload and  |
+|               search every dict term + every vault original; any hit => BLOCK      |
 | 7 budget      estimate worst-case cost; per-call/daily/weekly caps; balance reserve |
 | 8 provider    anthropic | openai_compat, non-streaming, hard timeout                |
-| 9 response    scan (unknown surrogates, new URLs, injection markers) -> restore     |
+| 9 response    risk scan (new hosts/IPs, exec/network, import-time calls) -> restore  |
+|               (never inside URLs/sink args; no MM_SECRET in files); risky => stage |
 | 10 ledger + audit (JSONL, 0600): the sanitized payload exactly as sent, cost, why   |
 +--------------------------------------------------------------------------------------+
         |  HTTPS: sanitized text only                      ^ untrusted text
@@ -54,7 +58,9 @@ Findings from the prior art (read-only; nothing was run against the live gateway
 
 Two design rules carry the security:
 
-1. **Type-enforced egress.** `Provider::send` accepts only `Sanitized<OutboundRequest>`, whose constructor is private to the `egress` module. No code path can reach the network with raw text.
+1. **Type-enforced egress.** `Provider::send` accepts only `Sanitized<OutboundRequest>`, whose constructor is private to the `egress` module. No code path can reach the network with raw text. The gate is a second, independent check on the normalized final payload (not a replay of the pseudonymizer's own findings).
+
+Detection is best-effort: neither pass can find a secret format or a spelling of a name it does not describe. The private dictionary, the deny-listed paths and "only delegate low-value code" remain essential.
 2. **Middleman reads the files, not Claude.** The main agent passes paths and line ranges. This saves Claude output tokens and makes path policy enforceable.
 
 ## 2. Crate layout
@@ -172,7 +178,7 @@ Key wrapped in a `Secret` newtype; never in logs, errors, audit, or `.mcp.json`.
 | Code semantics / business logic | Cannot be hidden; size caps, task-kind allow-list, S-level policy, deny-globs for core dirs | Accepted for low-value code |
 | Unique literals / license headers | Strip headers, flag long literals, optional strip_comments | Partial |
 | Metadata (account, IP, timing) | Document; use unlinked account/egress for anonymity | User decision |
-| Malicious response | `<untrusted_output>` wrapper; warn on new URLs/packages; middleman never executes | Needs Claude review |
+| Malicious response | `<untrusted_output_NONCE>` wrapper (per-request random tag, tag text neutralized); provider error bodies and model ids never shown outside it; risk scan stages risky output as `.middleman.new`; no restore into URLs / exec / network sinks; write-deny for agent/CI/hook/shell config; no symlink following; middleman never executes | Needs Claude review of the diff before running |
 | Vault/audit on disk | Vault in memory; audit sanitized; 0600 | Local compromise |
 | Raw text via instructions/inputs | Same pipeline on every field | |
 | Repo loosening config | User-dir config only; project file may only tighten | |
@@ -245,7 +251,7 @@ Built-in preset table (`src/providers/presets.rs`, data only): openrouter, yapay
 ### Routing: middleman picks the model, Claude only hints
 ```toml
 [routing]
-mode = "auto"            # "auto" | "confirm" (dry_run first, Claude asks user) | "explicit" (only on "cheap:" prefix or /delegate)
+mode = "auto"            # "auto" | "confirm" (dry_run first + one-time approval_id the user approves with `middleman approve <id>`) | "explicit" (only on "cheap:" prefix or /delegate; advisory)
 default_quality = "cheap"
 
 [routes.write_tests]  chain = ["auto:code:cheapest", "auto:code:balanced", "claude"]
@@ -279,7 +285,7 @@ With delegation, Claude still pays:
 Plus the cheap model cost (tiny, e.g. gpt-5.6-luna $0.25/1M).
 
 **Consequences (must implement):**
-- **Write results to disk, not back into Claude's context.** `delegate_task` gets `output_path` (or `write_mode: "file" | "inline"`, default `file` for code kinds). The middleman writes the restored output to the target path (must be inside `paths.roots`, not deny-listed, refuse overwriting unless `overwrite: true`; for edits write `<path>.middleman.patch` or a staged file) and returns only a short summary: path, bytes, lines, sha, warnings. Claude verifies by **running tests/compiler**, not by re-reading everything. This is what turns $20/1M output into near-zero.
+- **Write results to disk, not back into Claude's context.** `delegate_task` gets `output_path` (or `write_mode: "file" | "inline"`, default `file` for code kinds). The middleman writes the restored output to the target path (must be inside `paths.roots`, not deny-listed, refuse overwriting unless `overwrite: true` *and* the user config sets `[output] allow_overwrite = true`; for edits, and for any high-risk output, write a staged `<path>.middleman.new` + `<path>.middleman.patch`) and returns only a short summary: path, bytes, lines, sha, risk, warnings. Claude reviews the diff before executing anything and runs tests only after reading flagged lines. This is what turns $20/1M output into near-zero.
 - **Break-even gate.** Delegation only pays when expected output N is large enough: net_savings = N·P_out_claude − (call_tokens·P_out_claude + ctx_tokens·P_cache_read + result_tokens·P_in_claude) − cheap_cost. Config `[economics] min_expected_output_tokens` (default ~800) and `assumed_context_tokens` (default 60000). The hook and the tool description only suggest delegation for tasks expected to produce lots of output (test suites, boilerplate, docs, translations, fixtures), never for one-liners.
 - **Main-model price table** in config, default = Opus 5.5 ($4 / $20 / cache-read $0.20); presets for sonnet-5.5 ($2/$10/$0.10), fable-5.2 ($8/$40/$0.20), haiku-5.5 ($0.10/$0.50). Replace the stale $3/$15 default.
 - **Subscription caveat (README):** on a Claude Pro/Max subscription you don't pay per token; savings show up as **usage-limit headroom**, not dollars. On API billing they are dollars. The report must show both "tokens of Claude output avoided" and "$ at API prices".
