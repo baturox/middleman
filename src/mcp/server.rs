@@ -268,6 +268,36 @@ pub fn summary_line(o: &DelegateOutcome) -> String {
 
 pub struct Server {
     pipeline: Arc<Pipeline>,
+    /// What `initialize` negotiated (protocol version, client info), carried across a
+    /// self re-exec after an upgrade.
+    session: std::sync::Mutex<Option<(String, Value)>>,
+    /// How many times this session was handed to a newer binary.
+    generation: u64,
+}
+
+/// Set in the environment of a re-executed server: the session is already initialized.
+pub const RESUMED_ENV: &str = "MIDDLEMAN_MCP_RESUMED";
+const PROTOCOL_ENV: &str = "MIDDLEMAN_MCP_PROTOCOL";
+const CLIENT_ENV: &str = "MIDDLEMAN_MCP_CLIENT";
+const TOOLS_ENV: &str = "MIDDLEMAN_MCP_TOOLS_SHA";
+const GENERATION_ENV: &str = "MIDDLEMAN_MCP_GENERATION";
+/// How often (ms) to look at the binary on disk; default 3000. `MIDDLEMAN_MCP_NO_REEXEC=1`
+/// turns the re-exec off.
+const CHECK_MS_ENV: &str = "MIDDLEMAN_MCP_RELOAD_CHECK_MS";
+
+/// SHA-256 of the tool list, to tell the client when a new binary changed it.
+pub fn tools_digest() -> String {
+    use sha2::{Digest, Sha256};
+    let t = serde_json::to_vec(&tools()).unwrap_or_default();
+    Sha256::digest(&t)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Should a resumed server send `notifications/tools/list_changed`?
+pub fn tools_changed(previous_digest: Option<&str>) -> bool {
+    previous_digest.is_some_and(|d| d != tools_digest())
 }
 
 fn panic_result(what: &str) -> Value {
@@ -318,8 +348,29 @@ async fn read_line_capped<R: AsyncBufRead + Unpin>(
 
 impl Server {
     pub fn new(pipeline: Pipeline) -> Server {
+        let resumed = std::env::var(RESUMED_ENV).is_ok_and(|v| v == "1");
+        let session = resumed
+            .then(|| {
+                let proto = std::env::var(PROTOCOL_ENV).ok()?;
+                let client = std::env::var(CLIENT_ENV)
+                    .ok()
+                    .and_then(|c| serde_json::from_str(&c).ok())
+                    .unwrap_or(Value::Null);
+                Some((proto, client))
+            })
+            .flatten();
+        let generation = if resumed {
+            std::env::var(GENERATION_ENV)
+                .ok()
+                .and_then(|g| g.parse().ok())
+                .unwrap_or(1)
+        } else {
+            0
+        };
         Server {
             pipeline: Arc::new(pipeline),
+            session: std::sync::Mutex::new(session),
+            generation,
         }
     }
 
@@ -347,9 +398,16 @@ impl Server {
                 } else {
                     DEFAULT_PROTOCOL
                 };
+                if let Ok(mut s) = self.session.lock() {
+                    *s = Some((
+                        version.to_string(),
+                        params.get("clientInfo").cloned().unwrap_or(Value::Null),
+                    ));
+                }
                 Ok(json!({
                     "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}},
+                    // a newer binary that re-executes in place tells the client when its tools change
+                    "capabilities": {"tools": {"listChanged": true}},
                     "serverInfo": {"name": "middleman", "version": env!("CARGO_PKG_VERSION")},
                     "instructions": INSTRUCTIONS,
                 }))
@@ -398,7 +456,15 @@ impl Server {
                     "middleman_status" => {
                         let p = self.pipeline.clone();
                         match tokio::spawn(async move { p.status().await }).await {
-                            Ok(v) => Ok(tool_result(&v, false)),
+                            Ok(mut v) => {
+                                if let Some(m) = v.as_object_mut() {
+                                    m.insert(
+                                        "server".into(),
+                                        json!({"version": env!("CARGO_PKG_VERSION"), "resumed": self.generation}),
+                                    );
+                                }
+                                Ok(tool_result(&v, false))
+                            }
                             Err(_) => Ok(panic_result("middleman_status")),
                         }
                     }
@@ -412,12 +478,42 @@ impl Server {
         }
     }
 
-    /// Serve until stdin closes. Requests are handled sequentially.
+    /// Serve until stdin closes. Requests are handled sequentially. Between requests (when no
+    /// input is buffered) the binary on disk is watched; when an upgrade replaced it, the
+    /// server re-executes the new one in place (unix), keeping the session.
     pub async fn run_stdio(self) -> anyhow::Result<()> {
         let stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
         let mut input = BufReader::new(stdin);
-        while let Some(next) = read_line_capped(&mut input, MAX_LINE_BYTES).await? {
+        let mut watch = reexec::Watch::start();
+        if self.generation > 0 && tools_changed(std::env::var(TOOLS_ENV).ok().as_deref()) {
+            let n = json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
+            let mut s = serde_json::to_string(&n)?;
+            s.push('\n');
+            stdout.write_all(s.as_bytes()).await?;
+            stdout.flush().await?;
+        }
+        loop {
+            if input.buffer().is_empty() {
+                if let Some(w) = watch.as_mut() {
+                    // wait for input without reading it, so an exec loses nothing
+                    loop {
+                        let ready = w.wait_readable().await;
+                        if let Some(path) = w.replaced() {
+                            stdout.flush().await?;
+                            let session = self.session.lock().ok().and_then(|s| s.clone());
+                            let e = reexec::exec(&path, session, self.generation + 1);
+                            tracing::warn!(error = %e, "re-exec failed; serving with this binary");
+                        }
+                        if ready {
+                            break;
+                        }
+                    }
+                }
+            }
+            let Some(next) = read_line_capped(&mut input, MAX_LINE_BYTES).await? else {
+                break;
+            };
             let line = match next {
                 Ok(l) => l,
                 Err(n) => {
@@ -463,9 +559,206 @@ impl Server {
     }
 }
 
+/// Self re-exec after an upgrade replaced the binary (unix only).
+mod reexec {
+    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
+
+    use serde_json::Value;
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct Sig {
+        dev: u64,
+        ino: u64,
+        size: u64,
+        mtime: i64,
+        mtime_ns: i64,
+    }
+
+    #[cfg(unix)]
+    fn sig(p: &std::path::Path) -> Option<Sig> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(p).ok()?;
+        Some(Sig {
+            dev: m.dev(),
+            ino: m.ino(),
+            size: m.size(),
+            mtime: m.mtime(),
+            mtime_ns: m.mtime_nsec(),
+        })
+    }
+
+    pub struct Watch {
+        #[cfg(unix)]
+        path: PathBuf,
+        #[cfg(unix)]
+        seen: Sig,
+        #[cfg(unix)]
+        every: Duration,
+        #[cfg(unix)]
+        last: Instant,
+    }
+
+    impl Watch {
+        /// None when re-exec is off or unsupported (Windows).
+        pub fn start() -> Option<Watch> {
+            #[cfg(unix)]
+            {
+                if std::env::var("MIDDLEMAN_MCP_NO_REEXEC").is_ok_and(|v| v == "1") {
+                    return None;
+                }
+                let exe = std::env::current_exe().ok()?;
+                let path = std::fs::canonicalize(&exe).unwrap_or(exe);
+                let seen = sig(&path)?;
+                let ms = std::env::var(super::CHECK_MS_ENV)
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(3000)
+                    .clamp(50, 60_000);
+                Some(Watch {
+                    path,
+                    seen,
+                    every: Duration::from_millis(ms),
+                    last: Instant::now(),
+                })
+            }
+            #[cfg(not(unix))]
+            None
+        }
+
+        /// Wait until stdin is readable (or EOF), at most one check interval. Nothing is read.
+        pub async fn wait_readable(&self) -> bool {
+            #[cfg(unix)]
+            {
+                let ms = self.every.as_millis().min(i32::MAX as u128) as i32;
+                tokio::task::spawn_blocking(move || {
+                    let mut fds = libc::pollfd {
+                        fd: 0,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: one valid pollfd for fd 0, count 1.
+                    let n = unsafe { libc::poll(&mut fds, 1, ms) };
+                    // an error or a hangup: let the read report it
+                    n != 0
+                })
+                .await
+                .unwrap_or(true)
+            }
+            #[cfg(not(unix))]
+            true
+        }
+
+        /// The binary's path, when it was replaced by one that is safe to run (at most once
+        /// per interval; a rejected file is not looked at again until it changes).
+        pub fn replaced(&mut self) -> Option<PathBuf> {
+            #[cfg(unix)]
+            {
+                if self.last.elapsed() < self.every {
+                    return None;
+                }
+                self.last = Instant::now();
+                let now = sig(&self.path)?;
+                if now == self.seen {
+                    return None;
+                }
+                self.seen = now;
+                match safe_to_exec(&self.path) {
+                    Ok(()) => Some(self.path.clone()),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "the replaced binary is not used");
+                        None
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            None
+        }
+    }
+
+    /// A regular file (not a link), owned by us, not group/world-writable, that answers
+    /// `--version` like middleman.
+    #[cfg(unix)]
+    pub fn safe_to_exec(p: &std::path::Path) -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(p)?;
+        anyhow::ensure!(m.file_type().is_file(), "not a regular file");
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        anyhow::ensure!(m.uid() == me, "owned by another user");
+        anyhow::ensure!(m.mode() & 0o022 == 0, "group- or world-writable");
+        crate::upgrade::binary_version(p)?;
+        Ok(())
+    }
+
+    /// Replace this process with `path` (same args), passing the session. Returns only on
+    /// failure.
+    #[cfg(unix)]
+    pub fn exec(
+        path: &std::path::Path,
+        session: Option<(String, Value)>,
+        generation: u64,
+    ) -> std::io::Error {
+        use std::os::unix::process::CommandExt;
+        let mut c = std::process::Command::new(path);
+        c.args(std::env::args_os().skip(1))
+            .env(super::RESUMED_ENV, "1")
+            .env(super::GENERATION_ENV, generation.to_string())
+            .env(super::TOOLS_ENV, super::tools_digest());
+        match session {
+            Some((proto, client)) => {
+                c.env(super::PROTOCOL_ENV, proto)
+                    .env(super::CLIENT_ENV, client.to_string());
+            }
+            None => {
+                c.env_remove(super::PROTOCOL_ENV)
+                    .env_remove(super::CLIENT_ENV);
+            }
+        }
+        c.exec()
+    }
+
+    #[cfg(not(unix))]
+    pub fn exec(
+        _path: &std::path::Path,
+        _session: Option<(String, Value)>,
+        _generation: u64,
+    ) -> std::io::Error {
+        std::io::Error::other("re-exec is not supported here")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_list_change_detection() {
+        assert!(!tools_changed(None));
+        assert!(!tools_changed(Some(&tools_digest())));
+        assert!(tools_changed(Some("an older list")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_safety_checks() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("middleman");
+        std::fs::write(&f, "#!/bin/sh\necho middleman 9.9.9\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        reexec::safe_to_exec(&f).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(reexec::safe_to_exec(&f).is_err(), "group-writable");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let l = d.path().join("link");
+        std::os::unix::fs::symlink(&f, &l).unwrap();
+        assert!(reexec::safe_to_exec(&l).is_err(), "a symlink");
+        std::fs::write(&f, "#!/bin/sh\nexit 3\n").unwrap();
+        assert!(reexec::safe_to_exec(&f).is_err(), "--version fails");
+    }
 
     #[tokio::test]
     async fn capped_reader_rejects_long_lines_and_continues() {
