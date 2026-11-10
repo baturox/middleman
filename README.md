@@ -1,7 +1,7 @@
 # middleman
 
 [![Release](https://img.shields.io/github/v/release/baturox/middleman)](https://github.com/baturox/middleman/releases/latest)
-[![CI](https://github.com/baturox/middleman/actions/workflows/ci.yml/badge.svg)](https://github.com/baturox/middleman/actions/workflows/ci.yml)
+[![CI](https://github.com/baturox/middleman/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/baturox/middleman/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange)
 
