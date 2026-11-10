@@ -618,6 +618,8 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 pub fn render_html(r: &UsageReport, by_day: &UsageReport) -> String {
@@ -664,9 +666,9 @@ pub fn render_html(r: &UsageReport, by_day: &UsageReport) -> String {
         .map(|t| {
             format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.2}</td></tr>",
-                t.day,
+                esc(&t.day),
                 esc(&t.project),
-                t.session,
+                esc(&t.session),
                 t.messages,
                 k(t.peak_context),
                 t.total_usd
@@ -755,6 +757,11 @@ mod tests {
             20_000,
         )];
         std::fs::write(proj.join("s1/subagents/agent-a.jsonl"), sub.join("\n")).unwrap();
+    }
+
+    #[test]
+    fn html_escape_covers_attribute_chars() {
+        assert_eq!(esc("<s\"'&>"), "&lt;s&quot;&#39;&amp;&gt;");
     }
 
     #[test]
