@@ -218,6 +218,18 @@ impl Server {
         }
     }
 
+    /// After a call that spent money, refresh the provider-limits cache the status line shows
+    /// (free GETs; skipped while another refresh holds the lock).
+    fn refresh_limits_in_background(&self) {
+        let cfg = self.pipeline.config().clone();
+        if let Some(lock) = crate::limits::try_lock(&cfg.state_dir()) {
+            tokio::spawn(async move {
+                let _ = crate::limits::refresh(&cfg).await;
+                drop(lock);
+            });
+        }
+    }
+
     pub async fn handle(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
         match method {
             "initialize" => {
@@ -269,7 +281,12 @@ impl Server {
                         // only; the server keeps serving
                         let p = self.pipeline.clone();
                         match tokio::spawn(async move { p.run(req).await }).await {
-                            Ok(out) => Ok(delegate_result(&out)),
+                            Ok(out) => {
+                                if !out.attempts.is_empty() {
+                                    self.refresh_limits_in_background();
+                                }
+                                Ok(delegate_result(&out))
+                            }
                             Err(_) => Ok(panic_result("delegate_task")),
                         }
                     }

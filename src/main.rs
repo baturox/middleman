@@ -144,6 +144,9 @@ enum Cmd {
         /// Also write a single-file HTML dashboard to this path
         #[arg(long)]
         html: Option<PathBuf>,
+        /// Compare the ledger's cost with the provider's own usage counters (free GETs)
+        #[arg(long)]
+        reconcile: bool,
     },
     /// Claude Code spend from local transcripts (~/.claude/projects), totals only
     Usage {
@@ -253,6 +256,15 @@ enum ProviderCmd {
     },
     /// Check a provider's key with a free request
     Test { name: String },
+    /// Fetch balances and key limits (free GETs) into the cache the status line shows
+    Refresh {
+        /// Print nothing (the status line starts it this way in the background)
+        #[arg(long)]
+        quiet: bool,
+        /// Started by the status line: release its refresh lock when done
+        #[arg(long, hide = true)]
+        from_statusline: bool,
+    },
     /// Replace a provider's stored key
     Rotate {
         name: String,
@@ -775,6 +787,64 @@ fn provider_list(cfg_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `provider refresh`: fetch limits into the status line's cache.
+async fn provider_refresh(cfg_path: &Path, quiet: bool, from_statusline: bool) -> Result<ExitCode> {
+    let cfg = match load(cfg_path) {
+        Ok(c) => c,
+        Err(e) => {
+            if from_statusline {
+                // the status line took the lock in the default state dir only if it could
+                // read the config, so there is nothing to release here
+                return Ok(ExitCode::from(1));
+            }
+            return Err(e);
+        }
+    };
+    let state = cfg.state_dir();
+    let res = middleman::limits::refresh(&cfg).await;
+    if from_statusline {
+        middleman::limits::release_lock(&state);
+    }
+    let c = res?;
+    if !quiet {
+        if c.providers.is_empty() {
+            say!("no enabled provider has a balance or limits endpoint");
+        }
+        for (name, l) in &c.providers {
+            let name = clean(name, 24);
+            let mut parts = vec![];
+            if let Some(b) = l.balance_usd {
+                parts.push(format!("balance ${b:.4}"));
+            }
+            if let Some(k) = &l.key {
+                if let Some(x) = k.limit_usd {
+                    parts.push(format!("key limit ${x:.2}"));
+                }
+                if let Some(x) = k.remaining_usd() {
+                    parts.push(format!("key remaining ${x:.4}"));
+                }
+                if let Some(x) = k.usage_daily_usd {
+                    parts.push(format!("used today ${x:.4}"));
+                }
+                if let Some(x) = k.usage_usd {
+                    parts.push(format!("used all-time ${x:.4}"));
+                }
+            }
+            if let Some(e) = &l.error {
+                parts.push(format!("error: {e}"));
+            }
+            let mark = if l.error.is_some() && l.left_usd().is_none() {
+                "✗"
+            } else {
+                "✓"
+            };
+            say!("{mark} {name}: {}", parts.join(", "));
+        }
+        say!("cache: {}", pretty(&middleman::limits::cache_path(&state)));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 async fn provider_test(cfg_path: &Path, name: &str) -> Result<ExitCode> {
     let cfg = load(cfg_path)?;
     let p = cfg.providers.get(name).with_context(|| {
@@ -1073,6 +1143,10 @@ async fn real_main() -> Result<ExitCode> {
                     Ok(ExitCode::SUCCESS)
                 }
                 ProviderCmd::Test { name } => provider_test(&cfg_path, &name).await,
+                ProviderCmd::Refresh {
+                    quiet,
+                    from_statusline,
+                } => provider_refresh(&cfg_path, quiet, from_statusline).await,
                 ProviderCmd::Remove { name, yes } => {
                     provider_remove(&cfg_path, &name, yes)?;
                     Ok(ExitCode::SUCCESS)
@@ -1356,12 +1430,27 @@ async fn real_main() -> Result<ExitCode> {
             by,
             json,
             html,
+            reconcile,
         } => {
             let since = middleman::report::parse_since(&since)?;
             let by = middleman::report::By::parse(&by)
                 .context("--by must be model, provider, task, day or project")?;
             let l = middleman::ledger::Ledger::new(&cfg.state_dir())?;
             let es = l.entries()?;
+            if reconcile {
+                let r = middleman::reconcile::run(&cfg, &es, since).await;
+                if json {
+                    say!("{}", serde_json::to_string_pretty(&r)?);
+                } else {
+                    say!("{}", middleman::reconcile::render_text(&r).trim_end());
+                }
+                let bad = r.checks.iter().any(|c| !c.matches);
+                return Ok(if bad {
+                    ExitCode::from(4)
+                } else {
+                    ExitCode::SUCCESS
+                });
+            }
             if let Some(path) = html {
                 std::fs::write(&path, middleman::report::render_html(&es, since))?;
                 say!("wrote {}", path.display());
