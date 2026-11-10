@@ -98,6 +98,9 @@ pub struct DelegateRequest {
     /// Caller's estimate of the output size; overrides the heuristic in the break-even gate.
     #[serde(default)]
     pub expected_output_tokens: Option<u64>,
+    /// MCP result with every detail (plan, attempts, notes). Default: a compact result.
+    #[serde(default)]
+    pub verbose: bool,
     /// routing.mode = "confirm": the id from the dry run, approved by the user with
     /// `middleman approve <id>`.
     #[serde(default)]
@@ -153,6 +156,7 @@ impl DelegateRequest {
             output_path: None,
             overwrite: false,
             expected_output_tokens: None,
+            verbose: false,
             approval_id: None,
             call_chars: None,
             session_id: None,
@@ -241,6 +245,9 @@ pub struct DelegateOutcome {
     /// routing.mode = "confirm" dry runs: the one-time approval token to show the user.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_id: Option<String>,
+    /// The caller asked for the full MCP result (`verbose: true`).
+    #[serde(skip)]
+    pub verbose: bool,
 }
 
 impl DelegateOutcome {
@@ -273,6 +280,7 @@ impl DelegateOutcome {
             sanitized_payload: None,
             risk: None,
             approval_id: None,
+            verbose: false,
         }
     }
 }
@@ -771,6 +779,7 @@ impl Pipeline {
             via_hook: req.via_hook,
         };
         let mut out = DelegateOutcome::new(&request_id, req.dry_run, write_mode);
+        out.verbose = req.verbose;
         out.needs_confirmation = needs_confirmation;
         let mut rec = AuditRecord {
             request_id: request_id.clone(),

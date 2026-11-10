@@ -486,6 +486,40 @@ async fn file_mode_writes_to_disk_and_returns_only_a_summary() {
         !js.contains("class AcmeInvoice"),
         "summary must not echo the code"
     );
+    // the MCP result Claude re-reads every turn: compact by default (well under 200 tokens)
+    let chars = middleman::mcp::server::result_chars(&out);
+    let res = middleman::mcp::server::delegate_result(&out);
+    let compact: serde_json::Value =
+        serde_json::from_str(res["content"][1]["text"].as_str().unwrap()).unwrap();
+    println!("compact result ({chars} chars): {}", res["content"]);
+    assert!(chars < 600, "{chars}: {res}");
+    assert_eq!(compact["status"], "ok");
+    assert_eq!(compact["risk"], "low");
+    assert!(compact["path"]
+        .as_str()
+        .unwrap()
+        .ends_with("tests/test_invoice.py"));
+    assert!(compact["lines"].as_u64().unwrap() > 0 && compact.get("net_usd").is_some());
+    for absent in [
+        "plan",
+        "attempts",
+        "redactions",
+        "note",
+        "request_id",
+        "dry_run",
+    ] {
+        assert!(compact.get(absent).is_none(), "{absent}");
+    }
+    let mut v = out.clone();
+    v.verbose = true;
+    let full = middleman::mcp::server::result_chars(&v);
+    assert!(full > 2 * chars, "verbose {full} vs compact {chars}");
+    assert!(
+        middleman::mcp::server::delegate_result(&v)["content"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"plan\"")
+    );
 
     // second run: existing file is staged with a patch, not overwritten
     let mut r = req(TaskKind::WriteTests, "src/invoice.py");

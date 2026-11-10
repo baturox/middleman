@@ -53,7 +53,8 @@ pub fn tools() -> Value {
                     "write_mode": {"type": "string", "enum": ["file","inline"], "description": "file (default for write_tests/boilerplate/snippet/refactor_small/docstring): result goes to disk, only a summary comes back. inline: result returned as text (only for summaries/explanations you read)"},
                     "output_path": {"type": "string", "description": "file mode target, absolute or relative to the first root (default .middleman/out/...)"},
                     "overwrite": {"type": "boolean", "description": "replace an existing output_path instead of staging .middleman.new + .middleman.patch (only if the user config sets [output] allow_overwrite = true; never for high-risk output)"},
-                    "expected_output_tokens": {"type": "integer", "minimum": 0, "description": "your estimate of the output size; used by the break-even gate"}
+                    "expected_output_tokens": {"type": "integer", "minimum": 0, "description": "your estimate of the output size; used by the break-even gate"},
+                    "verbose": {"type": "boolean", "description": "full result (plan, attempts, notes, savings breakdown). Default: a compact result"}
                 },
                 "required": ["task_kind","instructions","declared_sensitivity"],
                 "additionalProperties": false
@@ -75,14 +76,103 @@ fn tool_result(v: &Value, is_error: bool) -> Value {
     })
 }
 
-/// The `delegate_task` tool result exactly as Claude receives it.
+/// The `delegate_task` tool result exactly as Claude receives it. Claude re-reads it on every
+/// later turn, so by default it is compact: the summary line plus the non-empty essentials.
+/// `verbose: true` returns the whole outcome.
 pub fn delegate_result(out: &DelegateOutcome) -> Value {
-    let v = serde_json::to_value(out).unwrap_or_else(|_| json!({}));
-    let mut r = tool_result(&v, out.status == Status::Error);
-    if let Some(c) = r["content"].as_array_mut() {
-        c.insert(0, json!({"type": "text", "text": summary_line(out)}));
+    if out.verbose {
+        let v = serde_json::to_value(out).unwrap_or_else(|_| json!({}));
+        let mut r = tool_result(&v, out.status == Status::Error);
+        if let Some(c) = r["content"].as_array_mut() {
+            c.insert(0, json!({"type": "text", "text": summary_line(out)}));
+        }
+        return r;
     }
-    r
+    json!({
+        "content": [
+            {"type": "text", "text": summary_line(out)},
+            {"type": "text", "text": serde_json::to_string(&compact(out)).unwrap_or_default()},
+        ],
+        "isError": out.status == Status::Error,
+    })
+}
+
+/// The essentials of an outcome, empty fields left out.
+pub fn compact(o: &DelegateOutcome) -> Value {
+    let clean = |s: &str, n: usize| crate::fsutil::clean(s, n);
+    let mut m = serde_json::Map::new();
+    let mut put = |k: &str, v: Value| {
+        m.insert(k.into(), v);
+    };
+    put("status", json!(o.status));
+    if let Some(w) = &o.written {
+        put("path", json!(w.path));
+        put("lines", json!(w.lines));
+        if let Some(sp) = &w.staged_path {
+            put("staged", json!(sp));
+        }
+        if let Some(pp) = &w.patch_path {
+            put("patch", json!(pp));
+        }
+    }
+    if let Some(r) = &o.risk {
+        put("risk", json!(r.level));
+        if !r.findings.is_empty() {
+            let f: Vec<String> = r.findings.iter().take(5).map(|x| clean(x, 100)).collect();
+            put("risk_findings", json!(f));
+        }
+    }
+    if o.cost_usd > 0.0 {
+        put("cost_usd", json!((o.cost_usd * 1e6).round() / 1e6));
+    }
+    if let Some(s) = &o.savings {
+        put("net_usd", json!((s.net_savings_usd * 1e4).round() / 1e4));
+    }
+    if let Some(x) = o.block_reason.as_deref() {
+        put("reason", json!(clean(x, 300)));
+    }
+    if let Some(x) = o.error.as_deref() {
+        put("error", json!(clean(x, 300)));
+    }
+    if o.needs_confirmation {
+        put("needs_confirmation", json!(true));
+    }
+    if let Some(a) = &o.approval_id {
+        put("approval_id", json!(a));
+    }
+    if o.dry_run {
+        put("dry_run", json!(true));
+        if let (Some(p), Some(mo)) = (&o.provider, &o.model) {
+            put("model", json!(format!("{p}/{mo}")));
+        }
+        if let Some(sp) = &o.sanitized_payload {
+            put("sanitized_payload", json!(sp));
+        }
+    }
+    if let Some(x) = &o.output {
+        put("output", json!(x));
+    }
+    let warnings: Vec<String> = o
+        .warnings
+        .iter()
+        .filter(|w| !w.starts_with("dry run:"))
+        .take(3)
+        // the confirm-mode instruction must survive whole
+        .map(|w| {
+            clean(
+                w,
+                if w.starts_with("routing.mode") {
+                    400
+                } else {
+                    160
+                },
+            )
+        })
+        .collect();
+    if !warnings.is_empty() {
+        put("warnings", json!(warnings));
+    }
+    Value::Object(m)
 }
 
 /// Characters of text Claude reads from the `delegate_task` result (every text block).
@@ -117,10 +207,25 @@ pub fn summary_line(o: &DelegateOutcome) -> String {
         .unwrap_or_default();
     match o.status {
         Status::Ok if o.dry_run => {
-            format!("middleman: dry run{via}; nothing was sent (see sanitized_payload and plan)")
+            format!("middleman: dry run{via}; nothing was sent (see sanitized_payload; verbose=true adds the plan)")
         }
         Status::Ok => {
             let what = match &o.written {
+                // the compact result carries the path in its JSON block
+                Some(w) if !o.verbose => format!(
+                    "{} {} lines (see {})",
+                    if w.action == "staged" {
+                        "staged"
+                    } else {
+                        "wrote"
+                    },
+                    w.lines,
+                    if w.action == "staged" {
+                        "staged, patch"
+                    } else {
+                        "path"
+                    }
+                ),
                 Some(w) => format!(
                     "{} {} ({} lines)",
                     match w.action.as_str() {
