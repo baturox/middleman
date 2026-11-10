@@ -29,21 +29,47 @@ pub struct LedgerEntry {
     pub model: String,
     pub trust: String,
     pub effective_sensitivity: String,
-    /// ok | blocked | error | escalated | do_it_yourself
+    /// Request outcome on the closing line: ok | blocked | do_it_yourself | error | dry_run.
+    /// Attempt lines that did not answer: escalated (another candidate followed) | failed.
     pub status: String,
+    /// The one line per request that carries the Claude-side overhead and the outcome
+    /// (`None` on lines written before v3: inferred by `upgrade`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closing: Option<bool>,
     pub block_reason_category: Option<String>,
     pub redactions: BTreeMap<String, usize>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cost_usd: f64,
-    /// balance | usage | estimate
+    /// provider (billed cost reported in the response) | balance (balance delta, no other
+    /// call in flight) | usage (tokens x catalog price) | estimate (worst case or none)
     pub cost_source: String,
+    /// Tokens x catalog price, kept for comparison when another source won.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_cost_usd: Option<f64>,
     pub latency_ms: Option<u64>,
     pub write_mode: String,
     pub output_bytes: Option<u64>,
     pub claude_model: String,
+    /// session (the status line's model.id) | config (economics.claude_model)
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub price_basis: String,
+    /// Claude tokens of the restored output (Claude's tokenizer ratio), i.e. output avoided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_output_tokens: Option<u64>,
+    /// Overhead terms (closing lines): tool-call tokens, context re-read, tool-result tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    /// session (live, from the status line) | config (assumed_context_tokens)
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub context_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_tokens: Option<u64>,
     pub claude_equiv_usd: f64,
     pub claude_overhead_usd: f64,
+    /// Always `claude_equiv_usd - claude_overhead_usd - cost_usd` (enforced on write and read).
     pub net_savings_usd: f64,
     /// passed | failed | skipped
     pub validation: String,
@@ -67,24 +93,64 @@ impl LedgerEntry {
     pub fn sanitized(mut self) -> Self {
         let fin = |v: f64| if v.is_finite() { v } else { 0.0 };
         self.cost_usd = fin(self.cost_usd).max(0.0);
-        self.claude_equiv_usd = fin(self.claude_equiv_usd);
-        self.claude_overhead_usd = fin(self.claude_overhead_usd);
-        self.net_savings_usd = fin(self.net_savings_usd);
+        self.claude_equiv_usd = fin(self.claude_equiv_usd).max(0.0);
+        self.claude_overhead_usd = fin(self.claude_overhead_usd).max(0.0);
+        // one identity for every line, so per-line and per-request sums always agree
+        self.net_savings_usd = self.claude_equiv_usd - self.claude_overhead_usd - self.cost_usd;
+        self.catalog_cost_usd = self.catalog_cost_usd.map(fin);
         self.input_tokens = self.input_tokens.map(|t| t.min(MAX_TOKENS));
         self.output_tokens = self.output_tokens.map(|t| t.min(MAX_TOKENS));
+        self.claude_output_tokens = self.claude_output_tokens.map(|t| t.min(MAX_TOKENS));
+        self.context_tokens = self.context_tokens.map(|t| t.min(MAX_TOKENS));
         self
     }
 
-    /// Normalize v1 values.
-    pub(crate) fn upgrade(mut self) -> Self {
+    /// Normalize older lines (v1 cost source names; v2 lines without `closing`).
+    pub fn upgrade(mut self) -> Self {
         if self.cost_source == "tokens" {
             self.cost_source = "usage".into();
         }
         if self.status.is_empty() {
             self.status = "ok".into();
         }
+        if self.closing.is_none() {
+            // v2: ok/blocked/do_it_yourself lines closed a request; the extra "error" line
+            // after a provider error carried the overhead (no latency: nothing was sent)
+            let closing = match self.status.as_str() {
+                "ok" | "blocked" | "do_it_yourself" | "dry_run" => true,
+                "error" => {
+                    self.latency_ms.is_none()
+                        && self.block_reason_category.as_deref() == Some("provider_error")
+                }
+                _ => false,
+            };
+            self.closing = Some(closing);
+        }
         self
     }
+
+    pub fn is_closing(&self) -> bool {
+        self.closing.unwrap_or(false)
+    }
+
+    /// Claude output tokens avoided by this line: the Claude-tokenizer estimate; for lines
+    /// written before it existed, the output size at 3.5 chars/token.
+    pub fn claude_tokens_avoided(&self) -> u64 {
+        if self.status != "ok" {
+            return 0;
+        }
+        self.claude_output_tokens
+            .or_else(|| self.output_bytes.map(|b| (b as f64 / 3.5).ceil() as u64))
+            .or(self.output_tokens)
+            .unwrap_or(0)
+    }
+}
+
+/// One ledger line, upgraded and sanitized (the only way lines are read).
+pub fn parse_line(l: &str) -> Option<LedgerEntry> {
+    serde_json::from_str::<LedgerEntry>(l)
+        .ok()
+        .map(|e| e.upgrade().sanitized())
 }
 
 /// Plausibility bound for provider-reported token counts.
@@ -194,9 +260,9 @@ impl Ledger {
         let mut out = Vec::new();
         let mut bad = 0;
         for l in text.lines().filter(|l| !l.trim().is_empty()) {
-            match serde_json::from_str::<LedgerEntry>(l) {
-                Ok(e) => out.push(e.upgrade().sanitized()),
-                Err(_) => bad += 1,
+            match parse_line(l) {
+                Some(e) => out.push(e),
+                None => bad += 1,
             }
         }
         Ok((out, bad))
@@ -223,10 +289,7 @@ impl Ledger {
         if start > 0 {
             lines.next(); // partial first line
         }
-        lines
-            .filter_map(|l| serde_json::from_str::<LedgerEntry>(l).ok())
-            .map(LedgerEntry::upgrade)
-            .collect()
+        lines.filter_map(parse_line).collect()
     }
 
     pub fn window(&self) -> Result<Window> {

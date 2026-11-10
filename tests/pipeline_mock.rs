@@ -258,13 +258,19 @@ async fn http_500_is_error_with_ledger_and_no_retry() {
     let l = p.ledger().entries().unwrap();
     // the attempt line, then the request-level closing line carrying Claude-side overhead
     assert_eq!(l.len(), 2);
-    assert_eq!(l[0].status, "error");
+    assert_eq!(l[0].status, "failed");
+    assert!(!l[0].is_closing());
     assert!(l[0].latency_ms.is_some());
+    assert_eq!(l[1].status, "error");
+    assert!(l[1].is_closing());
     assert_eq!(
         l[1].block_reason_category.as_deref(),
         Some("provider_error")
     );
     assert!(l[1].net_savings_usd < 0.0);
+    // counted once: one request, one error
+    let a = middleman::report::aggregate(&l);
+    assert_eq!((a.requests, a.errors, a.attempts), (1, 1, 1));
 }
 
 #[tokio::test]

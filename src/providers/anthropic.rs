@@ -36,6 +36,7 @@ pub fn parse(v: &Value) -> Result<Completion, ProviderError> {
         output_tokens: usage
             .and_then(|u| u.get("output_tokens"))
             .and_then(|x| x.as_u64()),
+        cost_usd: None,
         model: v.get("model").and_then(|m| m.as_str()).map(String::from),
         stop_reason: v
             .get("stop_reason")

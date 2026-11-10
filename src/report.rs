@@ -61,6 +61,67 @@ pub fn parse_since(s: &str) -> Result<Option<i64>> {
     Ok(Some(now_unix() - secs))
 }
 
+/// Sums over ledger lines. Money is summed over every line (attempt lines carry their cheap
+/// cost, the closing line carries the Claude-side terms), so a request's escalation steps are
+/// never double counted; outcomes are counted once per request, from its closing line. The
+/// report, `middleman_status` and the status line all aggregate with this.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Agg {
+    /// Closing lines, i.e. requests (dry runs included).
+    pub requests: u64,
+    pub ok: u64,
+    pub blocked: u64,
+    pub do_it_yourself: u64,
+    pub errors: u64,
+    pub dry_runs: u64,
+    /// Requests answered (or abandoned) after more than one candidate.
+    pub escalated: u64,
+    /// Network attempts.
+    pub attempts: u64,
+    pub cheap_spend_usd: f64,
+    pub claude_equiv_usd: f64,
+    pub claude_overhead_usd: f64,
+    pub net_savings_usd: f64,
+    pub claude_output_tokens_avoided: u64,
+}
+
+impl Agg {
+    pub fn add(&mut self, e: &LedgerEntry) {
+        if e.is_closing() {
+            self.requests += 1;
+            match e.status.as_str() {
+                "ok" => self.ok += 1,
+                "blocked" => self.blocked += 1,
+                "do_it_yourself" => self.do_it_yourself += 1,
+                "dry_run" => self.dry_runs += 1,
+                _ => self.errors += 1,
+            }
+            let tried = if e.status == "ok" {
+                e.attempt + 1
+            } else {
+                e.attempt
+            };
+            if tried > 1 {
+                self.escalated += 1;
+            }
+        }
+        if sent(e) {
+            self.attempts += 1;
+        }
+        self.cheap_spend_usd += e.cost_usd;
+        self.claude_equiv_usd += e.claude_equiv_usd;
+        self.claude_overhead_usd += e.claude_overhead_usd;
+        self.net_savings_usd += e.net_savings_usd;
+        self.claude_output_tokens_avoided += e.claude_tokens_avoided();
+    }
+
+    /// Requests that reached the delegation decision (dry runs excluded).
+    pub fn jobs(&self) -> u64 {
+        self.requests - self.dry_runs
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Row {
     pub key: String,
@@ -73,11 +134,13 @@ pub struct Row {
     pub blocked: usize,
     pub do_it_yourself: usize,
     pub errors: usize,
+    pub dry_runs: usize,
     pub cheap_spend_usd: f64,
     pub claude_equiv_usd: f64,
     pub claude_overhead_usd: f64,
+    /// NET: claude_equiv - overhead - cheap spend
     pub net_savings_usd: f64,
-    /// Claude output tokens not written (ok results)
+    /// Claude output tokens not written (ok results, Claude tokenizer estimate)
     pub claude_output_tokens_avoided: u64,
     pub avg_latency_ms: Option<f64>,
 }
@@ -97,51 +160,44 @@ fn sent(e: &LedgerEntry) -> bool {
     e.latency_ms.is_some() || (e.status == "ok" && e.input_tokens.is_some())
 }
 
+pub fn aggregate<'a>(es: impl IntoIterator<Item = &'a LedgerEntry>) -> Agg {
+    let mut a = Agg::default();
+    for e in es {
+        a.add(e);
+    }
+    a
+}
+
 fn row(key: String, es: &[&LedgerEntry]) -> Row {
-    let mut r = Row {
-        key,
-        ..Default::default()
-    };
-    let mut reqs = BTreeSet::new();
-    let mut ok = BTreeSet::new();
-    let mut esc = BTreeSet::new();
+    let a = aggregate(es.iter().copied());
     let mut lat = (0u64, 0u64);
     for e in es {
-        reqs.insert(e.request_id.as_str());
-        match e.status.as_str() {
-            "ok" => {
-                ok.insert(e.request_id.as_str());
-                r.claude_output_tokens_avoided += e.output_tokens.unwrap_or(0);
-            }
-            "blocked" => r.blocked += 1,
-            "do_it_yourself" => r.do_it_yourself += 1,
-            "error" => r.errors += 1,
-            "escalated" => {
-                esc.insert(e.request_id.as_str());
-            }
-            _ => {}
-        }
-        if e.attempt > 0 {
-            esc.insert(e.request_id.as_str());
-        }
-        if sent(e) {
-            r.attempts += 1;
-        }
         if let Some(l) = e.latency_ms {
             lat.0 += l;
             lat.1 += 1;
         }
-        r.cheap_spend_usd += e.cost_usd;
-        r.claude_equiv_usd += e.claude_equiv_usd;
-        r.claude_overhead_usd += e.claude_overhead_usd;
-        r.net_savings_usd += e.net_savings_usd;
     }
-    r.requests = reqs.len();
-    r.ok = ok.len();
-    r.escalated = esc.len();
-    if r.requests > 0 {
-        r.ok_pct = 100.0 * r.ok as f64 / r.requests as f64;
-        r.escalation_pct = 100.0 * r.escalated as f64 / r.requests as f64;
+    let mut r = Row {
+        key,
+        requests: a.requests as usize,
+        attempts: a.attempts as usize,
+        ok: a.ok as usize,
+        escalated: a.escalated as usize,
+        blocked: a.blocked as usize,
+        do_it_yourself: a.do_it_yourself as usize,
+        errors: a.errors as usize,
+        dry_runs: a.dry_runs as usize,
+        cheap_spend_usd: a.cheap_spend_usd,
+        claude_equiv_usd: a.claude_equiv_usd,
+        claude_overhead_usd: a.claude_overhead_usd,
+        net_savings_usd: a.net_savings_usd,
+        claude_output_tokens_avoided: a.claude_output_tokens_avoided,
+        ..Default::default()
+    };
+    let jobs = a.jobs();
+    if jobs > 0 {
+        r.ok_pct = 100.0 * r.ok as f64 / jobs as f64;
+        r.escalation_pct = 100.0 * r.escalated as f64 / jobs as f64;
     }
     if lat.1 > 0 {
         r.avg_latency_ms = Some(lat.0 as f64 / lat.1 as f64);
@@ -257,8 +313,8 @@ pub fn render_text(r: &Report) -> String {
         s.push('\n');
     }
     s.push_str(
-        "net$ = Claude output avoided at API prices - Claude-side overhead (tool call, extra turn, result) - cheap spend.\n\
-         On a Pro/Max subscription the dollars are notional: read tok_avoid as usage-limit headroom.\n",
+        "net$ (saved) = Claude output avoided at API prices - Claude-side overhead (tool call, extra turn re-reading the context, tool result) - cheap spend.\n\
+         Blocked calls and dry runs count their overhead too. On a Pro/Max subscription the dollars are notional: read tok_avoid as usage-limit headroom.\n",
     );
     s
 }
@@ -428,6 +484,7 @@ mod tests {
     use crate::ledger::now_rfc3339;
 
     fn e(req: &str, attempt: u32, status: &str, model: &str, cost: f64, net: f64) -> LedgerEntry {
+        let oh = if status == "escalated" { 0.0 } else { 0.02 };
         LedgerEntry {
             ts: now_rfc3339(),
             request_id: req.into(),
@@ -442,8 +499,8 @@ mod tests {
             task_kind: "write_tests".into(),
             cost_usd: cost,
             net_savings_usd: net,
-            claude_equiv_usd: net.max(0.0) + 0.02,
-            claude_overhead_usd: 0.02,
+            claude_equiv_usd: (net + oh + cost).max(0.0),
+            claude_overhead_usd: oh,
             latency_ms: if model.is_empty() { None } else { Some(1000) },
             output_tokens: Some(2000),
             block_reason_category: (status == "blocked").then(|| "secret".to_string()),
@@ -453,18 +510,21 @@ mod tests {
 
     #[test]
     fn aggregates() {
-        let es = vec![
+        let es: Vec<LedgerEntry> = vec![
             e("a", 0, "escalated", "m1", 0.001, -0.001),
             e("a", 1, "ok", "m2", 0.002, 0.03),
             e("b", 0, "ok", "m1", 0.001, 0.02),
-            e("c", 0, "blocked", "", 0.0, 0.0),
-        ];
+            e("c", 0, "blocked", "", 0.0, -0.02),
+        ]
+        .into_iter()
+        .map(|x| x.upgrade().sanitized())
+        .collect();
         let r = build(&es, None, By::Model);
         assert_eq!(r.total.requests, 3);
         assert_eq!(r.total.ok, 2);
         assert_eq!(r.total.escalated, 1);
         assert_eq!(r.total.blocked, 1);
-        assert!((r.total.net_savings_usd - 0.049).abs() < 1e-9);
+        assert!((r.total.net_savings_usd - 0.029).abs() < 1e-9);
         assert_eq!(r.top_block_reasons, vec![("secret".to_string(), 1)]);
         let text = render_text(&r);
         assert!(text.contains("TOTAL") && text.contains("m2"));

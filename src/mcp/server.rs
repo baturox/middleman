@@ -75,6 +75,29 @@ fn tool_result(v: &Value, is_error: bool) -> Value {
     })
 }
 
+/// The `delegate_task` tool result exactly as Claude receives it.
+pub fn delegate_result(out: &DelegateOutcome) -> Value {
+    let v = serde_json::to_value(out).unwrap_or_else(|_| json!({}));
+    let mut r = tool_result(&v, out.status == Status::Error);
+    if let Some(c) = r["content"].as_array_mut() {
+        c.insert(0, json!({"type": "text", "text": summary_line(out)}));
+    }
+    r
+}
+
+/// Characters of text Claude reads from the `delegate_task` result (every text block).
+pub fn result_chars(out: &DelegateOutcome) -> u64 {
+    delegate_result(out)["content"]
+        .as_array()
+        .map(|c| {
+            c.iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .map(|t| t.chars().count() as u64)
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 /// One human-readable line that starts every `delegate_task` result.
 pub fn summary_line(o: &DelegateOutcome) -> String {
     let clean = |s: &str| crate::fsutil::clean(s, 80);
@@ -224,8 +247,17 @@ impl Server {
                     .unwrap_or_else(|| json!({}));
                 match name {
                     "delegate_task" => {
-                        let req: DelegateRequest = match serde_json::from_value(args) {
-                            Ok(r) => r,
+                        // what Claude emitted for this call (JSON arguments, compact)
+                        let call_chars = serde_json::to_string(&args)
+                            .map(|s| s.chars().count() as u64)
+                            .unwrap_or(0);
+                        let req: DelegateRequest = match serde_json::from_value::<DelegateRequest>(
+                            args,
+                        ) {
+                            Ok(mut r) => {
+                                r.call_chars = Some(call_chars);
+                                r
+                            }
                             Err(e) => {
                                 return Ok(tool_result(
                                     &json!({"status": "error", "error": format!("invalid arguments: {e}")}),
@@ -237,18 +269,7 @@ impl Server {
                         // only; the server keeps serving
                         let p = self.pipeline.clone();
                         match tokio::spawn(async move { p.run(req).await }).await {
-                            Ok(out) => {
-                                let is_err = out.status == Status::Error;
-                                let v = serde_json::to_value(&out).unwrap_or_else(|_| json!({}));
-                                let mut r = tool_result(&v, is_err);
-                                if let Some(c) = r["content"].as_array_mut() {
-                                    c.insert(
-                                        0,
-                                        json!({"type": "text", "text": summary_line(&out)}),
-                                    );
-                                }
-                                Ok(r)
-                            }
+                            Ok(out) => Ok(delegate_result(&out)),
                             Err(_) => Ok(panic_result("delegate_task")),
                         }
                     }

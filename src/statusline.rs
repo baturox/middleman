@@ -209,6 +209,8 @@ mod tests {
             ts: crate::ledger::rfc3339_at(ts),
             status: status.into(),
             net_savings_usd: net,
+            claude_equiv_usd: net.max(0.0),
+            claude_overhead_usd: (-net).max(0.0),
             session_id: session.map(String::from),
             ..Default::default()
         }

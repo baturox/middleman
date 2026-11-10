@@ -28,14 +28,19 @@ default_quality = "cheapest"
 max_attempts = 3
 
 [economics]
-# Main Claude model the savings are measured against: opus-5.5 ($4/$20/cache-read $0.20 per 1M),
-# sonnet-5.5 ($2/$10/$0.10), fable-5.2 ($8/$40/$0.20), haiku-5.5 ($0.10/$0.50). Override with
-# price_in / price_out / price_cache_read.
+# Main Claude model the savings are measured against when the session's model is unknown:
+# opus-5.5 ($4/$20/cache-read $0.20 per 1M), sonnet-5.5 ($2/$10/$0.10), fable-5.2 ($8/$40/$0.20),
+# haiku-5.5 ($0.10/$0.50). Override with price_in / price_out / price_cache_read /
+# price_cache_write (default: input x 1.25 for a 5-minute cache, x 2 for a 1-hour cache).
 claude_model = "opus-5.5"
+follow_session_model = true        # price the session's real model (from the status line)
 min_expected_output_tokens = 800   # never delegate below this
-assumed_context_tokens = 60000     # session context re-read by the extra turn a tool call costs
-call_tokens = 200                  # output tokens Claude spends on the tool call
-summary_tokens = 150               # file-mode tool result size
+assumed_context_tokens = 60000     # context re-read by the extra turn, when the status line has not reported it
+context_max_age_s = 1800           # a status line report older than this is ignored
+call_tokens = 200                  # tool-call size for the hook's break-even estimate
+summary_tokens = 700               # expected file-mode tool result size (the ledger measures the real one)
+chars_per_token_code = 3.5         # Claude tokenizer: characters per token for code and JSON
+chars_per_token_prose = 4.2        # ... and for prose
 enforce_break_even = true          # block (do it yourself) when delegation would not pay
 
 [usage]

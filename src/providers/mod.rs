@@ -23,6 +23,8 @@ pub struct Completion {
     pub text: String,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Billed cost reported by the gateway in the response (OpenRouter `usage.cost`).
+    pub cost_usd: Option<f64>,
     pub model: Option<String>,
     pub stop_reason: Option<String>,
 }
@@ -31,6 +33,44 @@ pub struct Completion {
 pub struct Balance {
     pub usd: f64,
     pub payg: Option<bool>,
+}
+
+/// OpenRouter `GET /key`: the key's own spend limit and usage counters (USD).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct KeyLimits {
+    pub limit_usd: Option<f64>,
+    pub limit_remaining_usd: Option<f64>,
+    /// All-time usage of this key; `usage_daily_usd` is the current UTC day.
+    pub usage_usd: Option<f64>,
+    pub usage_daily_usd: Option<f64>,
+    pub usage_weekly_usd: Option<f64>,
+    pub usage_monthly_usd: Option<f64>,
+    /// `effective_budget.remaining_usd` (workspace/member guardrail), when set.
+    pub budget_remaining_usd: Option<f64>,
+}
+
+impl KeyLimits {
+    pub fn from_json(v: &Value) -> KeyLimits {
+        let d = v.get("data").unwrap_or(v);
+        let f = |p: &str| num(d.pointer(p)).filter(|x| x.is_finite());
+        KeyLimits {
+            limit_usd: f("/limit"),
+            limit_remaining_usd: f("/limit_remaining"),
+            usage_usd: f("/usage"),
+            usage_daily_usd: f("/usage_daily"),
+            usage_weekly_usd: f("/usage_weekly"),
+            usage_monthly_usd: f("/usage_monthly"),
+            budget_remaining_usd: f("/effective_budget/remaining_usd"),
+        }
+    }
+
+    /// The tighter of the key limit and the guardrail budget.
+    pub fn remaining_usd(&self) -> Option<f64> {
+        match (self.limit_remaining_usd, self.budget_remaining_usd) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,10 +376,17 @@ impl Provider {
         req: &Sanitized<OutboundRequest>,
     ) -> Result<Completion, ProviderError> {
         let r = req.get();
-        let (path, body) = match api {
+        let (path, mut body) = match api {
             Api::Anthropic => (anthropic::PATH, anthropic::body(r)),
             Api::Openai => (openai_compat::PATH, openai_compat::body(r)),
         };
+        if api == Api::Openai && self.balance_kind == BalanceKind::Openrouter {
+            // usage accounting: `usage.cost` in the response. OpenRouter now always returns
+            // it and documents this flag as deprecated with no effect; it is kept for
+            // OpenRouter-compatible gateways that still need it (never sent elsewhere: strict
+            // OpenAI-style servers reject unknown parameters).
+            body["usage"] = serde_json::json!({"include": true});
+        }
         let rb = self
             .client
             .post(format!("{}{}", self.base_url, path))
@@ -407,6 +454,23 @@ impl Provider {
                 })
             }
         }
+    }
+
+    /// OpenRouter `GET {base}/key` (free): the key's limit and usage counters.
+    pub async fn key_limits(&self) -> Result<KeyLimits, ProviderError> {
+        if self.balance_kind != BalanceKind::Openrouter {
+            return Err(ProviderError::BadResponse(
+                "provider has no key-limits endpoint".into(),
+            ));
+        }
+        let rb = self.client.get(format!("{}/key", self.base_url));
+        let resp = self
+            .auth(rb, Api::Openai)
+            .send()
+            .await
+            .map_err(|e| self.map_err(e))?;
+        let v = self.read_json(resp).await?;
+        Ok(KeyLimits::from_json(&v))
     }
 
     /// `GET /models`; ids that fail `catalog::valid_model_id` and invalid prices are dropped.

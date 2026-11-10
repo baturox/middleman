@@ -19,7 +19,7 @@ use crate::catalog::Catalog;
 use crate::classify::{Classifier, ClassifyInput, Declared, RuleClassifier};
 use crate::config::{BalanceKind, Config, PiiMode, RoutingMode, SecretsMode, Tier};
 use crate::detect::{self, Category, Detector, Dictionary, Finding, Severity};
-use crate::economics::{self, ClaudePrices, Savings, WriteMode};
+use crate::economics::{self, Breakdown, ClaudePrices, Measured, Savings, WriteMode};
 use crate::egress::{self, OutboundRequest, Sanitized};
 use crate::intake::{self, FileRef, PathPolicy};
 use crate::ledger::{now_rfc3339, Ledger, LedgerEntry};
@@ -102,9 +102,35 @@ pub struct DelegateRequest {
     /// `middleman approve <id>`.
     #[serde(default)]
     pub approval_id: Option<String>,
+    /// Size of the tool-call arguments as Claude sent them (set by the MCP server, never by
+    /// the caller). `None` for direct calls: estimated from the fields, and dry runs are
+    /// then not logged (they were not Claude tool calls).
+    #[serde(skip)]
+    pub call_chars: Option<u64>,
+    /// Claude Code session (never from the caller): default `CLAUDE_CODE_SESSION_ID`.
+    #[serde(skip)]
+    pub session_id: Option<String>,
 }
 
 impl DelegateRequest {
+    /// Characters of the tool-call arguments: measured when known, else estimated from the
+    /// fields (JSON keys and quoting included roughly).
+    pub fn call_chars_or_estimate(&self) -> u64 {
+        if let Some(n) = self.call_chars {
+            return n;
+        }
+        let c = |s: &str| s.chars().count() as u64;
+        c(&self.instructions)
+            + self.files.iter().map(|f| c(&f.path) + 40).sum::<u64>()
+            + self
+                .inputs
+                .iter()
+                .map(|i| c(&i.label) + c(&i.text) + 30)
+                .sum::<u64>()
+            + self.output_path.as_deref().map(c).unwrap_or(0)
+            + 120
+    }
+
     pub fn simple(task_kind: TaskKind, instructions: &str, declared: Declared) -> Self {
         DelegateRequest {
             task_kind,
@@ -123,6 +149,8 @@ impl DelegateRequest {
             overwrite: false,
             expected_output_tokens: None,
             approval_id: None,
+            call_chars: None,
+            session_id: None,
         }
     }
 }
@@ -283,12 +311,47 @@ struct LedgerCtx {
     redactions: BTreeMap<String, usize>,
     write_mode: WriteMode,
     claude_model: String,
+    /// session | config
+    price_basis: &'static str,
     prices: ClaudePrices,
     log: bool,
     session_id: Option<String>,
+    /// Live context of the calling session (status line) or the configured assumption.
+    context_tokens: u64,
+    context_source: &'static str,
+    cache_1h: bool,
+    call_chars: u64,
+    /// The output is prose (Claude tokenizer ratio for prose).
+    prose: bool,
 }
 
 impl LedgerCtx {
+    fn measured(&self, output_chars: u64, result_chars: u64, cheap: f64) -> Measured {
+        Measured {
+            claude_output_chars: output_chars,
+            prose: self.prose,
+            call_chars: self.call_chars,
+            result_chars,
+            context_tokens: self.context_tokens,
+            cache_1h: self.cache_1h,
+            cheap_cost_usd: cheap,
+        }
+    }
+
+    /// Mark `e` as the request's closing line with the Claude-side terms of `b`.
+    fn close(&self, e: &mut LedgerEntry, b: &Breakdown) {
+        e.closing = Some(true);
+        e.price_basis = self.price_basis.into();
+        e.claude_output_tokens = (b.claude_output_tokens > 0).then_some(b.claude_output_tokens);
+        e.call_tokens = Some(b.call_tokens);
+        e.context_tokens = Some(b.context_tokens);
+        e.context_source = self.context_source.into();
+        e.result_tokens = Some(b.result_tokens);
+        e.claude_equiv_usd = b.claude_equiv_usd;
+        e.claude_overhead_usd = b.claude_overhead_usd;
+        e.net_savings_usd = b.claude_equiv_usd - b.claude_overhead_usd - e.cost_usd;
+    }
+
     fn base(&self, attempt: u32, status: &str) -> LedgerEntry {
         LedgerEntry {
             ts: now_rfc3339(),
@@ -306,6 +369,7 @@ impl LedgerCtx {
             claude_model: self.claude_model.clone(),
             validation: "skipped".into(),
             session_id: self.session_id.clone(),
+            closing: Some(false),
             ..Default::default()
         }
     }
@@ -533,13 +597,12 @@ impl Pipeline {
         out: &mut DelegateOutcome,
     ) {
         let mut e = ctx.base(attempt, status);
-        e.block_reason_category = Some(category.into());
-        let oh = self
-            .cfg
-            .economics
-            .overhead_usd(&ctx.prices, self.cfg.economics.summary_tokens);
-        e.claude_overhead_usd = oh;
-        e.net_savings_usd = -oh;
+        e.block_reason_category = (status != "dry_run").then(|| category.into());
+        let b = self.cfg.economics.breakdown(
+            &ctx.prices,
+            &ctx.measured(0, crate::mcp::server::result_chars(out), 0.0),
+        );
+        ctx.close(&mut e, &b);
         e.cost_source = "estimate".into();
         self.ledger_write(ctx, &e, out);
     }
@@ -624,11 +687,38 @@ impl Pipeline {
             .write_mode
             .unwrap_or_else(|| economics::default_write_mode(req.task_kind));
         let econ = &self.cfg.economics;
-        let prices = econ.prices().unwrap_or(ClaudePrices {
-            in_per_1m: 0.0,
-            out_per_1m: 0.0,
-            cache_read_per_1m: 0.0,
+        let session_id = req
+            .session_id
+            .as_deref()
+            .map(crate::statusline::safe_id)
+            .filter(|s| !s.is_empty())
+            .or_else(crate::statusline::session_from_env);
+        // live session facts from the status line (context size, model, cache TTL)
+        let live = session_id.as_deref().and_then(|s| {
+            crate::session::lookup(
+                &self.cfg.state_dir(),
+                s,
+                crate::ledger::now_unix(),
+                econ.context_max_age_s,
+            )
         });
+        let session_preset = live
+            .as_ref()
+            .filter(|_| econ.follow_session_model)
+            .and_then(|l| economics::preset_for_model_id(&l.model_id));
+        let (claude_model, price_basis) = match session_preset {
+            Some(p) => (p.to_string(), "session"),
+            None => (econ.claude_model.clone(), "config"),
+        };
+        let prices = econ.prices_for(&claude_model).unwrap_or(ClaudePrices::ZERO);
+        let (context_tokens, context_source) = match live.as_ref().filter(|l| l.context_tokens > 0)
+        {
+            Some(l) => (l.context_tokens, "session"),
+            None => (econ.assumed_context_tokens, "config"),
+        };
+        let cache_1h = live
+            .as_ref()
+            .is_some_and(|l| l.cache_ttl.as_deref() == Some("1h"));
         let quality = req.quality.unwrap_or(self.cfg.routing.default_quality);
         let mut ctx = LedgerCtx {
             request_id: request_id.clone(),
@@ -639,10 +729,17 @@ impl Pipeline {
             sensitivity: String::new(),
             redactions: BTreeMap::new(),
             write_mode,
-            claude_model: econ.claude_model.clone(),
+            claude_model: claude_model.clone(),
+            price_basis,
             prices,
-            log: !req.dry_run,
-            session_id: crate::statusline::session_from_env(),
+            // a dry run is logged only when Claude made it (it cost a tool call)
+            log: !req.dry_run || req.call_chars.is_some(),
+            session_id,
+            context_tokens,
+            context_source,
+            cache_1h,
+            call_chars: req.call_chars_or_estimate(),
+            prose: !routing::is_code_kind(req.task_kind),
         };
         let mut out = DelegateOutcome::new(&request_id, req.dry_run, write_mode);
         out.needs_confirmation = needs_confirmation;
@@ -855,14 +952,24 @@ impl Pipeline {
             .expected_output_tokens
             .unwrap_or_else(|| economics::expected_output_tokens(req.task_kind, content_tokens))
             .min(max_tokens as u64);
-        let threshold = econ.threshold_tokens(&prices, write_mode);
+        let call_tokens =
+            econ.claude_tokens(ctx.call_chars, false) + economics::TOOL_USE_FRAMING_TOKENS;
+        let threshold = econ
+            .min_expected_output_tokens
+            .max(econ.break_even_tokens_with(
+                &prices,
+                write_mode,
+                call_tokens,
+                context_tokens,
+                cache_1h,
+            ));
         out.expected_output_tokens = Some(expected);
         out.break_even_tokens = Some(threshold);
         if expected < threshold {
             let msg = format!(
-                "below break-even: expected ~{expected} output tokens < {threshold} ({} mode, {} prices); delegating would cost more Claude tokens than it saves",
+                "below break-even: expected ~{expected} output tokens < {threshold} ({} mode, {claude_model} prices, {}k context); delegating would cost more Claude tokens than it saves",
                 write_mode.as_str(),
-                econ.claude_model
+                context_tokens / 1000
             );
             if econ.enforce_break_even {
                 return self.finish_blocked(
@@ -947,6 +1054,11 @@ impl Pipeline {
             }
             rec.provider = out.provider.clone();
             rec.model = out.model.clone();
+            if req.call_chars.is_some() {
+                // the dry run was a Claude tool call: its overhead is real
+                let attempt = out.attempts.len() as u32;
+                self.ledger_close(&ctx, attempt, "dry_run", "dry_run", &mut out);
+            }
             return self.finish(out, rec, "dry_run");
         }
         if plan.candidates.is_empty() {
@@ -972,7 +1084,7 @@ impl Pipeline {
         for (idx, cand) in plan.candidates.iter().enumerate() {
             let attempt_no = idx as u32;
             let more = idx + 1 < n_cand;
-            let mut line = ctx.base(attempt_no, if more { "escalated" } else { "error" });
+            let mut line = ctx.base(attempt_no, if more { "escalated" } else { "failed" });
             line.chain_step = cand.step.clone();
             line.provider = cand.provider.clone();
             line.model = cand.model.clone();
@@ -1031,14 +1143,15 @@ impl Pipeline {
             rec.sent = true;
             rec.sanitized_system = Some(sealed.get().system.clone());
             rec.sanitized_user = Some(sealed.get().user.clone());
-            let (result, cost, src, latency) =
-                self.send_once(&provider, &sealed, cand, before).await;
+            let sent = self.send_once(&provider, &sealed, cand, before).await;
+            let (result, cost, src, latency) = (sent.result, sent.cost, sent.source, sent.latency);
             window.day_usd += cost;
             window.week_usd += cost;
             out.cost_usd += cost;
             rec.cost_source = Some(src.into());
             line.cost_usd = cost;
             line.cost_source = src.into();
+            line.catalog_cost_usd = sent.catalog_cost;
             line.latency_ms = Some(latency);
             line.net_savings_usd = -cost;
             let completion = match result {
@@ -1079,62 +1192,67 @@ impl Pipeline {
             rec.provider = out.provider.clone();
             rec.model = out.model.clone();
 
-            // record the spend before touching the untrusted response: if anything below
-            // fails, the ledger already has this attempt's cost
-            let n_out = completion
-                .output_tokens
-                .unwrap_or_else(|| budget::estimate_tokens(completion.text.len()));
-            let s = econ.savings(&prices, write_mode, n_out, cost);
-            out.savings = Some(s);
             line.status = "ok".into();
             line.validation = "passed".into();
             line.write_mode = write_mode.as_str().into();
-            line.claude_equiv_usd = s.claude_equiv_usd;
-            line.claude_overhead_usd = s.claude_overhead_usd;
-            line.net_savings_usd = s.net_savings_usd;
             line.block_reason_category = None;
             line.output_bytes = Some(completion.text.len() as u64);
-            self.ledger_write(&ctx, &line, &mut out);
 
-            // 9 response scan + restore + file write
-            let file_mode = output_target.is_some();
-            let (restored, risk) =
-                self.finish_response(&mut out, &vault, &sealed, &completion.text, file_mode);
-            let nonce = uuid::Uuid::new_v4().simple().to_string();
-            if let Some(target) = &output_target {
-                let content = output::extract_content(&restored);
-                let mut opts = WriteOpts {
-                    overwrite: req.overwrite && self.cfg.output.allow_overwrite,
-                    stage_only: risk.is_high(),
-                };
-                if req.overwrite && !self.cfg.output.allow_overwrite {
-                    out.warnings.push("overwrite=true ignored: set [output] allow_overwrite = true in the user config to allow it; staged instead".into());
-                }
-                if risk.is_high() {
-                    opts.overwrite = false;
-                }
-                match output::write_output_with(&self.paths, target, &content, opts) {
-                    Ok(w) => {
-                        out.written = Some(w);
-                        out.note = Some(if risk.is_high() {
-                            FILE_NOTE_HIGH_RISK.into()
-                        } else {
-                            FILE_NOTE.into()
-                        });
+            // 9 response scan + restore + file write. A panic in here must not lose this
+            // attempt's spend: it is caught and the line is written either way.
+            let processed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.process_answer(
+                    &mut out,
+                    &vault,
+                    &sealed,
+                    &completion.text,
+                    &output_target,
+                    &req,
+                )
+            }));
+            match processed {
+                Ok(claude_chars) => {
+                    out.status = Status::Ok;
+                    // the result Claude reads includes the savings numbers themselves, whose
+                    // printed length depends on the result size: iterate to a fixed point
+                    out.savings = Some(Savings::default());
+                    let mut result_chars = crate::mcp::server::result_chars(&out);
+                    let mut b = Breakdown::default();
+                    for _ in 0..4 {
+                        b = econ.breakdown(
+                            &prices,
+                            &ctx.measured(claude_chars, result_chars, out.cost_usd),
+                        );
+                        out.savings = Some(b.summary());
+                        let again = crate::mcp::server::result_chars(&out);
+                        if again == result_chars {
+                            break;
+                        }
+                        result_chars = again;
                     }
-                    Err(e) => {
-                        out.warnings.push(format!(
-                            "file write failed ({e}); output returned inline instead (the ledger line still says file mode)"
-                        ));
-                        out.output = Some(wrap_untrusted(&restored, &nonce));
-                    }
+                    ctx.close(&mut line, &b);
+                    self.ledger_write(&ctx, &line, &mut out);
+                    return self.finish(out, rec, "ok");
                 }
-            } else {
-                out.output = Some(wrap_untrusted(&restored, &nonce));
+                Err(_) => {
+                    out.status = Status::Error;
+                    out.output = None;
+                    out.written = None;
+                    out.error = Some(
+                        "internal error while processing the answer; nothing was written (the spend is recorded)"
+                            .into(),
+                    );
+                    let b = econ.breakdown(
+                        &prices,
+                        &ctx.measured(0, crate::mcp::server::result_chars(&out), 0.0),
+                    );
+                    line.status = "error".into();
+                    line.block_reason_category = Some("internal".into());
+                    ctx.close(&mut line, &b);
+                    self.ledger_write(&ctx, &line, &mut out);
+                    return self.finish(out, rec, "error");
+                }
             }
-            out.risk = Some(risk);
-            out.status = Status::Ok;
-            return self.finish(out, rec, "ok");
         }
         // every candidate failed
         match (&last_provider_error, plan.terminal_claude) {
@@ -1153,37 +1271,113 @@ impl Pipeline {
         }
     }
 
-    /// One provider call (no retries) + cost reconciliation. Returns (result, cost, source, ms).
+    /// Step 9 for an accepted answer: scan + restore, then write the file (file mode) or wrap
+    /// it (inline). Returns the characters of the content Claude would otherwise have
+    /// written: the file content in file mode, the restored answer inline.
+    fn process_answer(
+        &self,
+        out: &mut DelegateOutcome,
+        vault: &Vault,
+        sealed: &Sanitized<OutboundRequest>,
+        raw: &str,
+        output_target: &Option<String>,
+        req: &DelegateRequest,
+    ) -> u64 {
+        let file_mode = output_target.is_some();
+        let (restored, risk) = self.finish_response(out, vault, sealed, raw, file_mode);
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let claude_chars;
+        if let Some(target) = output_target {
+            let content = output::extract_content(&restored);
+            claude_chars = content.chars().count() as u64;
+            let mut opts = WriteOpts {
+                overwrite: req.overwrite && self.cfg.output.allow_overwrite,
+                stage_only: risk.is_high(),
+            };
+            if req.overwrite && !self.cfg.output.allow_overwrite {
+                out.warnings.push("overwrite=true ignored: set [output] allow_overwrite = true in the user config to allow it; staged instead".into());
+            }
+            if risk.is_high() {
+                opts.overwrite = false;
+            }
+            match output::write_output_with(&self.paths, target, &content, opts) {
+                Ok(w) => {
+                    out.written = Some(w);
+                    out.note = Some(if risk.is_high() {
+                        FILE_NOTE_HIGH_RISK.into()
+                    } else {
+                        FILE_NOTE.into()
+                    });
+                }
+                Err(e) => {
+                    out.warnings.push(format!(
+                        "file write failed ({e}); output returned inline instead (the ledger line still says file mode)"
+                    ));
+                    out.output = Some(wrap_untrusted(&restored, &nonce));
+                }
+            }
+        } else {
+            claude_chars = restored.chars().count() as u64;
+            out.output = Some(wrap_untrusted(&restored, &nonce));
+        }
+        out.risk = Some(risk);
+        claude_chars
+    }
+
+    /// One provider call (no retries) + cost reconciliation, in order of trust:
+    /// 1. `provider`: the billed cost the response reports (OpenRouter `usage.cost`);
+    /// 2. `balance`: balance before - after, only when no other call was in flight;
+    /// 3. `usage`: reported tokens x catalog price;
+    /// 4. `estimate`: the worst case when the call may have been billed, else 0.
     async fn send_once(
         &self,
         provider: &Provider,
         sealed: &Sanitized<OutboundRequest>,
         cand: &Candidate,
         before: Option<f64>,
-    ) -> (Result<Completion, ProviderError>, f64, &'static str, u64) {
+    ) -> Sent {
+        let guard = crate::inflight::InFlight::begin(&self.cfg.state_dir());
         let t0 = Instant::now();
         let result = provider.complete(sealed).await;
         let latency = t0.elapsed().as_millis() as u64;
-        let (before, after) = if provider.balance_kind() != BalanceKind::None {
-            (before, provider.balance().await.ok().map(|b| b.usd))
-        } else {
-            (None, None)
-        };
-        let (token_cost, token_src) = match &result {
+        let has_balance = provider.balance_kind() != BalanceKind::None;
+        let catalog_cost = match &result {
             Ok(c) => match (c.input_tokens, c.output_tokens) {
-                (Some(i), Some(o)) => (Some(budget::cost(cand.prices, i, o)), "usage"),
-                _ => (Some(cand.worst_usd), "estimate"),
+                (Some(i), Some(o)) => Some(budget::cost(cand.prices, i, o)),
+                _ => None,
             },
-            Err(e) if e.maybe_billed() => (Some(cand.worst_usd), "estimate"),
-            Err(_) => (None, "estimate"),
+            Err(_) => None,
         };
-        let (cost, src) = budget::reconcile(before, after, token_cost);
-        let src = if src == "balance" {
-            "balance"
+        let reported = result.as_ref().ok().and_then(|c| c.cost_usd);
+        let (cost, source) = if let Some(c) = reported {
+            (c, "provider")
         } else {
-            token_src
+            let after = if has_balance {
+                provider.balance().await.ok().map(|b| b.usd)
+            } else {
+                None
+            };
+            let alone = !crate::inflight::overlapped(&guard);
+            let delta = before
+                .zip(after)
+                .map(|(b, a)| b - a)
+                .filter(|d| alone && d.is_finite() && *d > 1e-9);
+            match (delta, catalog_cost, &result) {
+                (Some(d), _, _) => (d, "balance"),
+                (None, Some(c), _) => (c, "usage"),
+                (None, None, Ok(_)) => (cand.worst_usd, "estimate"),
+                (None, None, Err(e)) if e.maybe_billed() => (cand.worst_usd, "estimate"),
+                (None, None, Err(_)) => (0.0, "estimate"),
+            }
         };
-        (result, cost, src, latency)
+        drop(guard);
+        Sent {
+            result,
+            cost: if cost.is_finite() { cost.max(0.0) } else { 0.0 },
+            source,
+            catalog_cost,
+            latency,
+        }
     }
 
     /// Step 9: scan the untrusted response and restore surrogates. Returns the restored text
@@ -1295,8 +1489,8 @@ impl Pipeline {
         let savings = match &entries {
             Ok(es) => {
                 let now = crate::ledger::now_unix();
-                let sum = |since: i64| {
-                    let t = report::build(es, Some(since), report::By::Day).total;
+                let sum = |since: Option<i64>| {
+                    let t = report::build(es, since, report::By::Day).total;
                     json!({
                         "requests": t.requests,
                         "ok": t.ok,
@@ -1309,8 +1503,10 @@ impl Pipeline {
                     })
                 };
                 json!({
-                    "today": sum(now - now.rem_euclid(86_400)),
-                    "last_7d": sum(now - 7 * 86_400),
+                    "today": sum(Some(now - now.rem_euclid(86_400))),
+                    "last_7d": sum(Some(now - 7 * 86_400)),
+                    "all_time": sum(None),
+                    "note": "net_savings_usd is NET: Claude-equivalent - Claude-side overhead - cheap spend",
                     "claude_model": self.cfg.economics.claude_model,
                 })
             }
@@ -1374,6 +1570,14 @@ pub fn wrap_untrusted(restored: &str, nonce: &str) -> String {
         safe.replace(nonce, "[nonce]")
     };
     format!("<untrusted_output_{nonce}>\n{safe}\n</untrusted_output_{nonce}>\n{UNTRUSTED_NOTE}")
+}
+
+struct Sent {
+    result: Result<Completion, ProviderError>,
+    cost: f64,
+    source: &'static str,
+    catalog_cost: Option<f64>,
+    latency: u64,
 }
 
 fn attempt(c: &Candidate, result: String, cost: f64) -> Attempt {

@@ -19,6 +19,17 @@ pub fn body(r: &OutboundRequest) -> Value {
     })
 }
 
+/// The billed cost the gateway reports (`usage.cost`, OpenRouter usage accounting, in USD
+/// credits). Values outside 0..=100 USD per request are treated as absent.
+pub fn billed_cost(v: &Value) -> Option<f64> {
+    let c = match v {
+        Value::Number(n) => n.as_f64()?,
+        Value::String(s) => s.trim().parse().ok()?,
+        _ => return None,
+    };
+    (c.is_finite() && (0.0..=100.0).contains(&c)).then_some(c)
+}
+
 pub fn parse(v: &Value) -> Result<Completion, ProviderError> {
     let choice = v
         .get("choices")
@@ -40,6 +51,7 @@ pub fn parse(v: &Value) -> Result<Completion, ProviderError> {
         output_tokens: usage
             .and_then(|u| u.get("completion_tokens"))
             .and_then(|x| x.as_u64()),
+        cost_usd: usage.and_then(|u| u.get("cost")).and_then(billed_cost),
         model: v.get("model").and_then(|m| m.as_str()).map(String::from),
         stop_reason: choice
             .get("finish_reason")
