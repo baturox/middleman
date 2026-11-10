@@ -1,7 +1,9 @@
 //! Usage ledger (v2): JSONL, one line per delegation attempt (escalation steps share
 //! `request_id` with an increasing `attempt`), blocked requests included with cost 0.
 //! One `write` per line, O_APPEND, 0600. Old v1 lines are read tolerantly (missing fields
-//! default; v1 `cost_source = "tokens"` reads as `usage`).
+//! default; v1 `cost_source = "tokens"` reads as `usage`). Non-finite numbers are never
+//! written; an unparseable line is skipped (counted and warned about) rather than locking
+//! out every future delegation.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -56,6 +58,19 @@ impl LedgerEntry {
             .unwrap_or_else(|_| now_unix())
     }
 
+    /// Clamp numbers before writing: costs finite and >= 0, other money fields finite,
+    /// token counts within plausible bounds.
+    pub fn sanitized(mut self) -> Self {
+        let fin = |v: f64| if v.is_finite() { v } else { 0.0 };
+        self.cost_usd = fin(self.cost_usd).max(0.0);
+        self.claude_equiv_usd = fin(self.claude_equiv_usd);
+        self.claude_overhead_usd = fin(self.claude_overhead_usd);
+        self.net_savings_usd = fin(self.net_savings_usd);
+        self.input_tokens = self.input_tokens.map(|t| t.min(MAX_TOKENS));
+        self.output_tokens = self.output_tokens.map(|t| t.min(MAX_TOKENS));
+        self
+    }
+
     /// Normalize v1 values.
     fn upgrade(mut self) -> Self {
         if self.cost_source == "tokens" {
@@ -67,6 +82,9 @@ impl LedgerEntry {
         self
     }
 }
+
+/// Plausibility bound for provider-reported token counts.
+pub const MAX_TOKENS: u64 = 10_000_000;
 
 pub fn now_unix() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
@@ -116,6 +134,22 @@ pub fn append_jsonl<T: Serialize>(path: &Path, rec: &T) -> Result<()> {
     Ok(())
 }
 
+/// Create/truncate a private (0600) file with `bytes`, refusing to follow a symlink.
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts
+        .open(path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    f.write_all(bytes)?;
+    Ok(())
+}
+
 pub struct Ledger {
     path: PathBuf,
 }
@@ -133,24 +167,35 @@ impl Ledger {
     }
 
     pub fn append(&self, e: &LedgerEntry) -> Result<()> {
-        append_jsonl(&self.path, e)
+        append_jsonl(&self.path, &e.clone().sanitized())
     }
 
-    /// Unparseable lines are an error: a corrupted ledger must not under-count spend.
+    /// Parsed entries; corrupt lines are skipped with a warning (see `entries_checked`).
     pub fn entries(&self) -> Result<Vec<LedgerEntry>> {
-        let text = match std::fs::read_to_string(&self.path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        let (v, bad) = self.entries_checked()?;
+        if bad > 0 {
+            tracing::warn!(corrupt_lines = bad, "ledger: skipped corrupt lines");
+        }
+        Ok(v)
+    }
+
+    /// (entries, number of corrupt lines skipped). Values are re-sanitized on read so an old
+    /// negative or absurd line cannot raise the allowance.
+    pub fn entries_checked(&self) -> Result<(Vec<LedgerEntry>, usize)> {
+        let text = match std::fs::read(&self.path) {
+            Ok(t) => String::from_utf8_lossy(&t).into_owned(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((vec![], 0)),
             Err(e) => return Err(e).context("cannot read ledger"),
         };
-        text.lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| {
-                serde_json::from_str::<LedgerEntry>(l)
-                    .map(LedgerEntry::upgrade)
-                    .context("corrupt ledger line")
-            })
-            .collect()
+        let mut out = Vec::new();
+        let mut bad = 0;
+        for l in text.lines().filter(|l| !l.trim().is_empty()) {
+            match serde_json::from_str::<LedgerEntry>(l) {
+                Ok(e) => out.push(e.upgrade().sanitized()),
+                Err(_) => bad += 1,
+            }
+        }
+        Ok((out, bad))
     }
 
     pub fn window(&self) -> Result<Window> {
@@ -178,6 +223,29 @@ pub fn window_at(entries: &[LedgerEntry], now: i64) -> Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupt_and_non_finite_lines_do_not_lock_out() {
+        let d = tempfile::tempdir().unwrap();
+        let l = Ledger::new(d.path()).unwrap();
+        let mut bad = e(now_unix(), f64::NAN);
+        bad.input_tokens = Some(u64::MAX);
+        l.append(&bad).unwrap();
+        l.append(&e(now_unix(), -1000.0)).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(l.path())
+            .and_then(|mut f| f.write_all(b"{\"cost_usd\":null}\nnot json\n"))
+            .unwrap();
+        l.append(&e(now_unix(), 0.25)).unwrap();
+        let raw = std::fs::read_to_string(l.path()).unwrap();
+        assert!(!raw.contains("NaN") && !raw.contains("-1000"));
+        let (es, skipped) = l.entries_checked().unwrap();
+        assert_eq!((es.len(), skipped), (3, 2));
+        assert_eq!(es[0].input_tokens, Some(MAX_TOKENS));
+        let w = l.window().unwrap();
+        assert!((w.day_usd - 0.25).abs() < 1e-12, "{w:?}");
+    }
 
     fn e(ts: i64, cost: f64) -> LedgerEntry {
         LedgerEntry {

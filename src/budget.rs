@@ -16,8 +16,29 @@ pub fn estimate_tokens(chars: usize) -> u64 {
     (chars as u64).div_ceil(3) + 32
 }
 
+/// Highest per-1M-token price accepted from any source (USD). Anything above, negative or
+/// non-finite is treated as "price unknown".
+pub const MAX_PRICE_PER_1M: f64 = 1000.0;
+
+pub fn valid_price(v: f64) -> bool {
+    v.is_finite() && (0.0..=MAX_PRICE_PER_1M).contains(&v)
+}
+
+impl Prices {
+    pub fn is_valid(&self) -> bool {
+        valid_price(self.in_per_1m) && valid_price(self.out_per_1m)
+    }
+}
+
 pub fn cost(p: Prices, input_tokens: u64, output_tokens: u64) -> f64 {
-    input_tokens as f64 * p.in_per_1m / 1e6 + output_tokens as f64 * p.out_per_1m / 1e6
+    let i = input_tokens.min(crate::ledger::MAX_TOKENS) as f64;
+    let o = output_tokens.min(crate::ledger::MAX_TOKENS) as f64;
+    let c = i * p.in_per_1m / 1e6 + o * p.out_per_1m / 1e6;
+    if c.is_finite() {
+        c.max(0.0)
+    } else {
+        0.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -59,6 +80,9 @@ pub fn preflight(
         .filter(|v| v.is_finite() && *v >= 0.0)
         .map(|v| v.min(cfg.per_call_usd))
         .unwrap_or(cfg.per_call_usd);
+    if !worst.is_finite() || worst < 0.0 {
+        return Err(BudgetBlock::PriceUnknown);
+    }
     if worst > cap {
         return Err(BudgetBlock::PerCall { worst, cap });
     }
@@ -76,7 +100,7 @@ pub fn preflight(
             remaining: week_left.max(0.0),
         });
     }
-    let Some(balance) = balance else {
+    let Some(balance) = balance.filter(|b| !b.is_nan()) else {
         return Err(BudgetBlock::BalanceUnknown);
     };
     if balance - worst < cfg.reserve_usd {
@@ -97,12 +121,12 @@ pub fn reconcile(
 ) -> (f64, &'static str) {
     if let (Some(b), Some(a)) = (before, after) {
         let d = b - a;
-        if d > 1e-9 {
+        if d.is_finite() && d > 1e-9 {
             return (d, "balance");
         }
     }
-    match token_cost {
-        Some(c) => (c, "tokens"),
+    match token_cost.filter(|c| c.is_finite()) {
+        Some(c) => (c.max(0.0), "tokens"),
         None => (0.0, "unknown"),
     }
 }
@@ -163,6 +187,30 @@ mod tests {
             preflight(&cfg(), None, 0.01, w, Some(1.005)),
             Err(BudgetBlock::Reserve { .. })
         ));
+    }
+
+    #[test]
+    fn non_finite_or_negative_worst_case_is_refused() {
+        let w = Window::default();
+        for worst in [f64::NAN, f64::INFINITY, -1.0] {
+            assert_eq!(
+                preflight(&cfg(), None, worst, w, Some(5.0)),
+                Err(BudgetBlock::PriceUnknown),
+                "{worst}"
+            );
+        }
+        assert_eq!(
+            preflight(&cfg(), None, 0.01, w, Some(f64::NAN)),
+            Err(BudgetBlock::BalanceUnknown)
+        );
+        assert!(!valid_price(f64::NAN) && !valid_price(-0.1) && !valid_price(1e6));
+        let neg = Prices {
+            in_per_1m: -1e6,
+            out_per_1m: -1e6,
+        };
+        assert_eq!(cost(neg, 100, 100), 0.0);
+        assert_eq!(reconcile(None, None, Some(-5.0)), (0.0, "tokens"));
+        assert_eq!(reconcile(None, None, Some(f64::NAN)), (0.0, "unknown"));
     }
 
     #[test]

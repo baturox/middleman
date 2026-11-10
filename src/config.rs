@@ -117,6 +117,8 @@ pub struct Config {
     pub models: BTreeMap<String, ModelOverride>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderCfg>,
+    #[serde(default)]
+    pub output: OutputCfg,
     /// Where ledger and audit files go. Default `~/.local/state/middleman`.
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
@@ -167,7 +169,16 @@ impl Default for BudgetCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// File-mode output settings.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct OutputCfg {
+    /// Let a call's `overwrite: true` replace an existing file. Off by default: existing files
+    /// are always staged as `.middleman.new` + `.middleman.patch`.
+    pub allow_overwrite: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct PathsCfg {
     pub roots: Vec<PathBuf>,
@@ -177,6 +188,10 @@ pub struct PathsCfg {
     /// Optional allow globs (matched on the root-relative path). Empty = everything under a root.
     #[serde(default)]
     pub allow: Vec<String>,
+    /// Optional allow globs for file-mode writes (root-relative). Empty = anywhere under a
+    /// root that no deny / write-deny glob matches.
+    #[serde(default)]
+    pub write_allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Default)]
@@ -495,10 +510,25 @@ pub fn default_config_path() -> PathBuf {
     expand_tilde(Path::new("~/.config/middleman/config.toml"))
 }
 
-fn is_local_url(u: &str) -> bool {
-    ["http://localhost", "http://127.0.0.1", "http://[::1]"]
-        .iter()
-        .any(|p| u.starts_with(p))
+/// Plain-http URL whose host is exactly `localhost`, `127.0.0.1` or `::1`, without userinfo.
+pub fn is_local_url(u: &str) -> bool {
+    let Ok(url) = url::Url::parse(u) else {
+        return false;
+    };
+    url.scheme() == "http" && url.username().is_empty() && url.password().is_none() && {
+        match url.host() {
+            Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
+            Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
+            None => false,
+        }
+    }
+}
+
+fn is_loopback_ipv4_url(u: &str) -> bool {
+    is_local_url(u)
+        && url::Url::parse(u)
+            .is_ok_and(|x| x.host() == Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST)))
 }
 
 impl Config {
@@ -569,7 +599,13 @@ impl Config {
                 bail!("paths.roots entry is not a directory: {}", r.display());
             }
         }
-        for g in self.paths.deny.iter().chain(self.paths.allow.iter()) {
+        for g in self
+            .paths
+            .deny
+            .iter()
+            .chain(self.paths.allow.iter())
+            .chain(self.paths.write_allow.iter())
+        {
             globset::Glob::new(g).with_context(|| format!("bad glob {g}"))?;
         }
         if let Some(d) = &self.redact.dictionary_file {
@@ -604,14 +640,18 @@ impl Config {
             if name.contains('/') || name == "claude" || name == "auto" {
                 bail!("provider name {name:?} is reserved or contains '/'");
             }
-            let https = p.base_url.starts_with("https://");
+            let parsed = url::Url::parse(&p.base_url).ok();
+            let https = parsed.as_ref().is_some_and(|u| {
+                u.scheme() == "https"
+                    && u.host().is_some()
+                    && u.username().is_empty()
+                    && u.password().is_none()
+            });
             let local_http = is_local_url(&p.base_url);
             if !(https || local_http) {
-                bail!("provider {name}: base_url must be https (http only for localhost)");
+                bail!("provider {name}: base_url must be https without userinfo (http only for localhost)");
             }
-            if local_http
-                && !(p.trust == Trust::Local || p.base_url.starts_with("http://127.0.0.1"))
-            {
+            if local_http && !(p.trust == Trust::Local || is_loopback_ipv4_url(&p.base_url)) {
                 bail!("provider {name}: plain-http base_url requires trust = \"local\"");
             }
             if p.max_sensitivity >= Sensitivity::S3
@@ -647,8 +687,11 @@ impl Config {
                 bail!("models.{k:?}: key must be \"<provider>/<model id>\"");
             }
             for v in [m.price_in, m.price_out].into_iter().flatten() {
-                if !v.is_finite() || v < 0.0 {
-                    bail!("models.{k:?}: prices must be non-negative");
+                if !crate::budget::valid_price(v) {
+                    bail!(
+                        "models.{k:?}: prices must be finite, non-negative and <= {} per 1M",
+                        crate::budget::MAX_PRICE_PER_1M
+                    );
                 }
             }
         }
@@ -933,6 +976,40 @@ task_kinds = ["snippet", "docstring"]
         assert!(Config::from_toml(&t).is_err());
         let t = base(d.path()).replace("api = \"openai\"\n", "preset = \"nope\"\n");
         assert!(Config::from_toml(&t).is_err());
+    }
+
+    #[test]
+    fn local_url_is_exact_host_without_userinfo() {
+        for ok in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://[::1]:8080/v1",
+        ] {
+            assert!(is_local_url(ok), "{ok}");
+        }
+        for bad in [
+            "http://127.0.0.1.attacker.example/v1",
+            "http://localhost.attacker.example/v1",
+            "http://localhost@attacker.example/v1",
+            "http://user:pw@127.0.0.1/v1",
+            "http://attacker.example/v1",
+            "https://localhost/v1",
+        ] {
+            assert!(!is_local_url(bad), "{bad}");
+        }
+        let d = tempfile::tempdir().unwrap();
+        for (url, trust) in [
+            ("http://127.0.0.1.attacker.example/v1", "untrusted"),
+            ("http://127.0.0.1.attacker.example/v1", "local"),
+            ("http://localhost.attacker.example/v1", "local"),
+            ("http://localhost@attacker.example/v1", "local"),
+            ("https://user:pw@api.example.invalid/v1", "untrusted"),
+        ] {
+            let t = base(d.path()).replace("https://example.invalid", url)
+                + &format!("trust = \"{trust}\"\n");
+            let t = t.replace("max_sensitivity = \"S1\"\n", "");
+            assert!(Config::from_toml(&t).is_err(), "{url} {trust}");
+        }
     }
 
     #[test]

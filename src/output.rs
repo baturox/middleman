@@ -1,8 +1,12 @@
-//! File-mode results: middleman writes the restored output to disk (inside roots, deny globs
-//! apply) and Claude gets only a short summary. Existing files are never overwritten unless
-//! `overwrite: true`; otherwise a staged `<path>.middleman.new` and a unified diff
-//! `<path>.middleman.patch` (apply from the root with `patch -p1`) are written.
+//! File-mode results: middleman writes the restored output to disk (inside roots, deny and
+//! write-deny globs apply, symlinks are never followed) and Claude gets only a short summary.
+//! Existing files are never overwritten unless `overwrite` is allowed; otherwise a staged
+//! `<path>.middleman.new` and a unified diff `<path>.middleman.patch` (apply from the root with
+//! `patch -p1`) are written. `stage_only` stages even a new file (risky output: nothing lands
+//! at a path a test runner or importer would pick up).
 
+use std::io::Write;
+use std::path::Path;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -49,11 +53,75 @@ fn io(path: &str, e: std::io::Error) -> IntakeError {
     }
 }
 
+/// Create a new file; fails if anything (including a dangling symlink) is already there.
+fn create_new(path: &Path, content: &str) -> std::io::Result<()> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    o.open(path)?.write_all(content.as_bytes())
+}
+
+/// Replace an existing regular file without following a symlink at the leaf.
+fn replace_existing(path: &Path, content: &str) -> std::io::Result<()> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    o.open(path)?.write_all(content.as_bytes())
+}
+
+/// Staging artifacts are rewritten on each run: remove a previous regular file, then create.
+fn write_artifact(path: &Path, content: &str) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_file() => std::fs::remove_file(path)?,
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "staging path exists and is not a regular file",
+            ))
+        }
+        Err(_) => {}
+    }
+    create_new(path, content)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WriteOpts {
+    /// Replace an existing file (the caller has checked the user's opt-in).
+    pub overwrite: bool,
+    /// Never write the target itself: always `.middleman.new` + `.middleman.patch`.
+    pub stage_only: bool,
+}
+
 pub fn write_output(
     policy: &PathPolicy,
     raw_path: &str,
     content: &str,
     overwrite: bool,
+) -> Result<WriteResult, IntakeError> {
+    write_output_with(
+        policy,
+        raw_path,
+        content,
+        WriteOpts {
+            overwrite,
+            stage_only: false,
+        },
+    )
+}
+
+pub fn write_output_with(
+    policy: &PathPolicy,
+    raw_path: &str,
+    content: &str,
+    opts: WriteOpts,
 ) -> Result<WriteResult, IntakeError> {
     let (target, rel) = policy.check_write(raw_path)?;
     let mut r = WriteResult {
@@ -65,23 +133,36 @@ pub fn write_output(
         lines: content.lines().count(),
         sha256: sha256_hex(content),
     };
-    let exists = target.exists();
-    if !exists || overwrite {
-        if let Some(d) = target.parent() {
-            std::fs::create_dir_all(d).map_err(|e| io(raw_path, e))?;
+    let exists = std::fs::symlink_metadata(&target).is_ok();
+    if let Some(d) = target.parent() {
+        std::fs::create_dir_all(d).map_err(|e| io(raw_path, e))?;
+    }
+    if !opts.stage_only && (!exists || opts.overwrite) {
+        if exists {
+            replace_existing(&target, content).map_err(|e| io(raw_path, e))?;
+        } else {
+            create_new(&target, content).map_err(|e| io(raw_path, e))?;
         }
-        std::fs::write(&target, content).map_err(|e| io(raw_path, e))?;
         r.action = if exists { "overwritten" } else { "created" }.into();
         return Ok(r);
     }
-    let old = std::fs::read_to_string(&target).map_err(|e| io(raw_path, e))?;
+    let old = if exists {
+        std::fs::read_to_string(&target).map_err(|e| io(raw_path, e))?
+    } else {
+        String::new()
+    };
     let staged_raw = format!("{}.middleman.new", target.display());
     let patch_raw = format!("{}.middleman.patch", target.display());
-    let (staged, _) = policy.check_write(&staged_raw)?;
-    let (patch, _) = policy.check_write(&patch_raw)?;
-    std::fs::write(&staged, content).map_err(|e| io(&staged_raw, e))?;
-    let diff = unified_diff(&old, content, &format!("a/{rel}"), &format!("b/{rel}"));
-    std::fs::write(&patch, diff).map_err(|e| io(&patch_raw, e))?;
+    let (staged, _) = policy.check_write_staging(&staged_raw)?;
+    let (patch, _) = policy.check_write_staging(&patch_raw)?;
+    write_artifact(&staged, content).map_err(|e| io(&staged_raw, e))?;
+    let old_label = if exists {
+        format!("a/{rel}")
+    } else {
+        "/dev/null".to_string()
+    };
+    let diff = unified_diff(&old, content, &old_label, &format!("b/{rel}"));
+    write_artifact(&patch, &diff).map_err(|e| io(&patch_raw, e))?;
     r.action = "staged".into();
     r.staged_path = Some(staged.display().to_string());
     r.patch_path = Some(patch.display().to_string());
@@ -221,6 +302,7 @@ mod tests {
             roots: vec![root.clone()],
             deny: vec![],
             allow: vec!["nothing/**".into()],
+            write_allow: vec![],
         })
         .unwrap();
         let r = write_output(&pol, "tests/test_x.py", "x = 1\n", false).unwrap();
@@ -253,5 +335,67 @@ mod tests {
             std::os::unix::fs::symlink(d.path(), root.join("out")).unwrap();
             assert!(write_output(&pol, "out/escape.py", "x", false).is_err());
         }
+    }
+
+    #[test]
+    fn stage_only_never_writes_the_target() {
+        let d = tempfile::tempdir().unwrap();
+        let pol = PathPolicy::new(&PathsCfg {
+            roots: vec![d.path().to_path_buf()],
+            ..Default::default()
+        })
+        .unwrap();
+        let opts = WriteOpts {
+            overwrite: true,
+            stage_only: true,
+        };
+        let r = write_output_with(&pol, "tests/test_new.py", "x = 1\n", opts).unwrap();
+        assert_eq!(r.action, "staged");
+        assert!(!d.path().join("tests/test_new.py").exists());
+        let staged = std::fs::read_to_string(r.staged_path.unwrap()).unwrap();
+        assert_eq!(staged, "x = 1\n");
+        let patch = std::fs::read_to_string(r.patch_path.unwrap()).unwrap();
+        assert!(
+            patch.starts_with("--- /dev/null\n+++ b/tests/test_new.py\n"),
+            "{patch}"
+        );
+        // rerun replaces the previous staged file
+        let r = write_output_with(&pol, "tests/test_new.py", "x = 2\n", opts).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(r.staged_path.unwrap()).unwrap(),
+            "x = 2\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_is_not_followed() {
+        let d = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(d.path()).unwrap();
+        let root = base.join("proj");
+        std::fs::create_dir_all(base.join("victim_home/.ssh")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(
+            "../victim_home/.ssh/authorized_keys",
+            root.join("generated_tests.py"),
+        )
+        .unwrap();
+        let pol = PathPolicy::new(&PathsCfg {
+            roots: vec![root.clone()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(write_output(&pol, "generated_tests.py", "ssh-ed25519 AAAA\n", false).is_err());
+        assert!(write_output(&pol, "generated_tests.py", "ssh-ed25519 AAAA\n", true).is_err());
+        assert!(!base.join("victim_home/.ssh/authorized_keys").exists());
+        // a symlinked staging artifact is not followed either
+        std::fs::write(root.join("t.py"), "old\n").unwrap();
+        std::os::unix::fs::symlink(
+            "../victim_home/.ssh/authorized_keys",
+            root.join("t.py.middleman.new"),
+        )
+        .unwrap();
+        assert!(write_output(&pol, "t.py", "new\n", false).is_err());
+        assert!(!base.join("victim_home/.ssh/authorized_keys").exists());
     }
 }

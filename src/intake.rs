@@ -1,11 +1,15 @@
 //! File intake: middleman reads files itself. Only configured roots are readable; symlinks are
-//! resolved before matching; deny globs always win; size caps; binary / non-UTF-8 rejected.
+//! resolved before matching; deny globs always win (matched case-insensitively: macOS and
+//! Windows file systems are); size caps; binary / non-UTF-8 rejected.
+//!
+//! File-mode writes additionally refuse `WRITE_DENY` (agent / editor / CI / hook / shell
+//! config that would turn a write into code execution) and any symlink on the way.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -49,11 +53,73 @@ pub enum IntakeError {
     BadRange(String),
 }
 
+/// Never written by file mode (in addition to the read deny list): files that configure an
+/// agent, editor, CI, git hooks, test collection or a shell, plus middleman's own artifacts.
+pub const WRITE_DENY: &[&str] = &[
+    "**/.claude/**",
+    "**/.mcp.json",
+    "**/.middleman.toml",
+    "**/CLAUDE.md",
+    "**/CLAUDE.local.md",
+    "**/AGENTS.md",
+    "**/.github/**",
+    "**/.gitlab-ci.yml",
+    "**/.vscode/**",
+    "**/.idea/**",
+    "**/.husky/**",
+    "**/.git/**",
+    "**/.gitmodules",
+    "**/.gitattributes",
+    "**/.gitconfig",
+    "**/conftest.py",
+    "**/sitecustomize.py",
+    "**/usercustomize.py",
+    "**/*.pth",
+    "**/.pre-commit-config.yaml",
+    "**/.envrc",
+    "**/.bashrc",
+    "**/.bash_profile",
+    "**/.bash_login",
+    "**/.bash_logout",
+    "**/.profile",
+    "**/.zshrc",
+    "**/.zshenv",
+    "**/.zprofile",
+    "**/.zlogin",
+    "**/.zlogout",
+    "**/.cshrc",
+    "**/.tcshrc",
+    "**/.kshrc",
+    "**/.config/fish/**",
+];
+
+/// middleman's own staging artifacts (`x.middleman.new`, `x.middleman.patch`): only
+/// middleman itself creates them.
+const ARTIFACT_GLOB: &str = "**/*.middleman.*";
+
 pub struct PathPolicy {
     roots: Vec<PathBuf>,
     deny: GlobSet,
     deny_src: Vec<String>,
+    write_deny: GlobSet,
+    write_deny_src: Vec<String>,
+    artifact: GlobSet,
     allow: Option<GlobSet>,
+    write_allow: Option<GlobSet>,
+}
+
+/// Deny globs match case-insensitively (`.ENV`, `Secrets/`, `prod.PEM`).
+fn build_set_ci(globs: &[String]) -> Result<GlobSet> {
+    let mut b = GlobSetBuilder::new();
+    for g in globs {
+        b.add(
+            GlobBuilder::new(g)
+                .case_insensitive(true)
+                .build()
+                .with_context(|| format!("bad glob {g}"))?,
+        );
+    }
+    Ok(b.build()?)
 }
 
 fn build_set(globs: &[String]) -> Result<GlobSet> {
@@ -62,6 +128,14 @@ fn build_set(globs: &[String]) -> Result<GlobSet> {
         b.add(Glob::new(g).with_context(|| format!("bad glob {g}"))?);
     }
     Ok(b.build()?)
+}
+
+fn present(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok()
+}
+
+fn is_symlink(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 impl PathPolicy {
@@ -78,17 +152,26 @@ impl PathPolicy {
             .map(|s| s.to_string())
             .chain(cfg.deny.iter().cloned())
             .collect();
-        let deny = build_set(&deny_src)?;
-        let allow = if cfg.allow.is_empty() {
-            None
-        } else {
-            Some(build_set(&cfg.allow)?)
+        let deny = build_set_ci(&deny_src)?;
+        let write_deny_src: Vec<String> = WRITE_DENY.iter().map(|s| s.to_string()).collect();
+        let write_deny = build_set_ci(&write_deny_src)?;
+        let artifact = build_set_ci(&[ARTIFACT_GLOB.to_string()])?;
+        let opt = |v: &[String]| -> Result<Option<GlobSet>> {
+            Ok(if v.is_empty() {
+                None
+            } else {
+                Some(build_set(v)?)
+            })
         };
         Ok(PathPolicy {
             roots,
             deny,
             deny_src,
-            allow,
+            write_deny,
+            write_deny_src,
+            artifact,
+            allow: opt(&cfg.allow)?,
+            write_allow: opt(&cfg.write_allow)?,
         })
     }
 
@@ -101,6 +184,18 @@ impl PathPolicy {
             .matches(p)
             .first()
             .map(|&i| self.deny_src[i].clone())
+    }
+
+    /// Read deny, then write deny, then (unless `staging`) the artifact glob.
+    fn write_denied_by(&self, p: &Path, staging: bool) -> Option<String> {
+        self.denied_by(p)
+            .or_else(|| {
+                self.write_deny
+                    .matches(p)
+                    .first()
+                    .map(|&i| self.write_deny_src[i].clone())
+            })
+            .or_else(|| (!staging && self.artifact.is_match(p)).then(|| ARTIFACT_GLOB.to_string()))
     }
 
     /// Resolve `raw` (absolute, or relative to the first root) and enforce policy.
@@ -147,9 +242,24 @@ impl PathPolicy {
 
     /// Write target check: the file may not exist yet. `..` components are rejected, the
     /// deepest existing ancestor is canonicalized (symlinks resolved), the result must be
-    /// inside a root and must not match a deny glob. Allow globs scope reads only.
+    /// inside a root and must not match a deny or write-deny glob (nor `write_allow`, when
+    /// set). The target itself must not be a symlink (dangling or not), and no existing
+    /// component between the root and the target may be one.
     /// Returns (absolute target, root-relative display path).
     pub fn check_write(&self, raw: &str) -> Result<(PathBuf, String), IntakeError> {
+        self.check_write_inner(raw, false)
+    }
+
+    /// `check_write` for middleman's own `.middleman.new` / `.middleman.patch` files.
+    pub fn check_write_staging(&self, raw: &str) -> Result<(PathBuf, String), IntakeError> {
+        self.check_write_inner(raw, true)
+    }
+
+    fn check_write_inner(
+        &self,
+        raw: &str,
+        staging: bool,
+    ) -> Result<(PathBuf, String), IntakeError> {
         let p = Path::new(raw);
         if p.components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -164,13 +274,33 @@ impl PathPolicy {
                 .map(|r| r.join(p))
                 .unwrap_or_else(|| p.to_path_buf())
         };
-        if let Some(rule) = self.denied_by(&joined).or_else(|| self.denied_by(p)) {
-            return Err(IntakeError::Denied {
-                path: raw.to_string(),
-                rule,
-            });
+        let denied = |path: &Path| {
+            self.write_denied_by(path, staging)
+                .map(|rule| IntakeError::Denied {
+                    path: raw.to_string(),
+                    rule,
+                })
+        };
+        if let Some(e) = denied(&joined).or_else(|| denied(p)) {
+            return Err(e);
         }
-        let target = if joined.exists() {
+        let symlink_err = || IntakeError::Io {
+            path: raw.to_string(),
+            reason: "symlinks are not followed for writes".into(),
+        };
+        if is_symlink(&joined) {
+            return Err(symlink_err());
+        }
+        if let Some(r) = self.roots.iter().find(|r| joined.starts_with(r)) {
+            let mut cur = r.clone();
+            for comp in joined.strip_prefix(r).unwrap_or(&joined).components() {
+                cur.push(comp);
+                if is_symlink(&cur) {
+                    return Err(symlink_err());
+                }
+            }
+        }
+        let target = if present(&joined) {
             let c = std::fs::canonicalize(&joined).map_err(|e| IntakeError::Io {
                 path: raw.to_string(),
                 reason: e.kind().to_string(),
@@ -185,7 +315,7 @@ impl PathPolicy {
         } else {
             let mut ancestor = joined.as_path();
             let mut tail = Vec::new();
-            while !ancestor.exists() {
+            while !present(ancestor) {
                 let Some(name) = ancestor.file_name() else {
                     return Err(IntakeError::OutsideRoots(raw.to_string()));
                 };
@@ -210,11 +340,22 @@ impl PathPolicy {
         if rel.as_os_str().is_empty() {
             return Err(IntakeError::OutsideRoots(raw.to_string()));
         }
-        if let Some(rule) = self.denied_by(&target).or_else(|| self.denied_by(&rel)) {
-            return Err(IntakeError::Denied {
-                path: raw.to_string(),
-                rule,
-            });
+        // the canonical prefix has no symlinks by construction; re-check every existing
+        // component below the root (and the leaf) in case one appeared meanwhile
+        let mut cur = root.clone();
+        for comp in rel.components() {
+            cur.push(comp);
+            if is_symlink(&cur) {
+                return Err(symlink_err());
+            }
+        }
+        if let Some(e) = denied(&target).or_else(|| denied(&rel)) {
+            return Err(e);
+        }
+        if let Some(allow) = &self.write_allow {
+            if !staging && !allow.is_match(&rel) {
+                return Err(IntakeError::NotAllowed(raw.to_string()));
+            }
         }
         Ok((target, rel.to_string_lossy().into_owned()))
     }
@@ -293,6 +434,7 @@ mod tests {
             roots: vec![root.to_path_buf()],
             deny: vec!["internal/**".into()],
             allow: vec![],
+            write_allow: vec![],
         })
         .unwrap()
     }
@@ -374,6 +516,100 @@ mod tests {
             p.check("innocent.txt"),
             Err(IntakeError::Denied { .. })
         ));
+    }
+
+    #[test]
+    fn deny_globs_are_case_insensitive() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("proj");
+        std::fs::create_dir_all(root.join("Secrets")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        for f in [
+            "Secrets/db.yaml",
+            "prod.PEM",
+            "b/Credentials.json",
+            "b/ID_RSA",
+            "ok.py",
+        ] {
+            std::fs::write(root.join(f), "x").unwrap();
+        }
+        let p = policy(&root);
+        for bad in [
+            "Secrets/db.yaml",
+            "prod.PEM",
+            "b/Credentials.json",
+            "b/ID_RSA",
+        ] {
+            assert!(
+                matches!(p.check(bad), Err(IntakeError::Denied { .. })),
+                "{bad}"
+            );
+            assert!(p.check_write(bad).is_err(), "{bad}");
+        }
+        assert!(p.check("ok.py").is_ok());
+        assert!(p.check_write(".GIT/hooks/pre-commit").is_err());
+    }
+
+    #[test]
+    fn write_deny_set() {
+        let d = tempfile::tempdir().unwrap();
+        let p = policy(d.path());
+        for bad in [
+            ".claude/settings.local.json",
+            ".claude/settings.json",
+            "sub/.mcp.json",
+            ".middleman.toml",
+            "CLAUDE.md",
+            "pkg/AGENTS.md",
+            "tests/conftest.py",
+            ".github/workflows/x.yml",
+            ".vscode/tasks.json",
+            ".idea/workspace.xml",
+            ".husky/pre-commit",
+            ".gitmodules",
+            ".gitattributes",
+            ".zshrc",
+            ".bashrc",
+            "x.py.middleman.new",
+        ] {
+            assert!(
+                matches!(p.check_write(bad), Err(IntakeError::Denied { .. })),
+                "{bad}"
+            );
+        }
+        assert!(p.check_write("tests/test_x.py").is_ok());
+        assert!(p
+            .check_write_staging("tests/test_x.py.middleman.new")
+            .is_ok());
+        // reads are not affected by the write deny list
+        std::fs::write(d.path().join("CLAUDE.md"), "x").unwrap();
+        assert!(p.check("CLAUDE.md").is_ok());
+        let pw = PathPolicy::new(&PathsCfg {
+            roots: vec![d.path().to_path_buf()],
+            write_allow: vec!["tests/**".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(pw.check_write("tests/test_x.py").is_ok());
+        assert!(matches!(
+            pw.check_write("src/x.py"),
+            Err(IntakeError::NotAllowed(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_write_target_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(d.path()).unwrap();
+        let root = base.join("proj");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink("../victim/authorized_keys", root.join("gen.py")).unwrap();
+        std::os::unix::fs::symlink(root.join("sub"), root.join("linkdir")).unwrap();
+        let p = policy(&root);
+        assert!(p.check_write("gen.py").is_err());
+        assert!(p.check_write("linkdir/x.py").is_err());
+        assert!(p.check_write("sub/x.py").is_ok());
     }
 
     #[test]
