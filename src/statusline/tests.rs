@@ -18,19 +18,43 @@ fn session() -> Value {
     })
 }
 
+/// Every optional part switched on, so the context-line port tests still see cost and cache.
+fn all_on() -> Thresholds {
+    Thresholds {
+        show_cost: true,
+        show_cache: true,
+        show_hint: true,
+        ..Thresholds::default()
+    }
+}
+
 /// The Claude part as context-line renders it for `columns`.
 fn plain(v: &Value, columns: usize) -> String {
-    claude_part(
-        v,
-        claude_level_for(columns),
-        &Thresholds::default(),
-        NOW as f64,
-    )
-    .plain
+    claude_part(v, claude_level_for(columns), &all_on(), NOW as f64).plain
 }
 
 fn ansi(v: &Value) -> String {
-    claude_part(v, 0, &Thresholds::default(), NOW as f64).ansi
+    claude_part(v, 0, &all_on(), NOW as f64).ansi
+}
+
+#[test]
+fn cost_cache_hint_and_limits_are_hidden_by_default() {
+    let mut v = session();
+    v["context_window"]["used_percentage"] = json!(35);
+    v["context_window"]["current_usage"] = json!({"input_tokens": 350_000});
+    v["rate_limits"] = json!({"five_hour": {"used_percentage": 81.6},
+        "seven_day": {"used_percentage": 40}});
+    let t = Thresholds::default();
+    let line = claude_part(&v, 0, &t, NOW as f64).plain;
+    assert_eq!(line, "Opus 5.5 medium │ ████░░░░░░ 35% 350k/1M");
+    assert!(!line.contains('$') && !line.contains("cache") && !line.contains("/compact"));
+    assert_eq!(
+        claude_part(&v, 2, &t, NOW as f64).plain,
+        "Opus 5.5 medium │ 35%"
+    );
+    let on = |k: &str| (k == "MIDDLEMAN_SL_SHOW_COST").then(|| "1".to_string());
+    let o = Opts::from_env(&on);
+    assert!(o.env.show_cost && !o.env.show_cache && !o.env.show_hint);
 }
 
 // ---------------------------------------------------------------- Claude part (context-line port)
@@ -121,6 +145,7 @@ fn context_colour_thresholds_follow_env_overrides() {
         "MIDDLEMAN_SL_COST_WARN" => Some("0.1".to_string()),
         "NO_COLOR" => Some("1".to_string()),
         "COLUMNS" => Some("77".to_string()),
+        "MIDDLEMAN_SL_SHOW_COST" | "MIDDLEMAN_SL_SHOW_HINT" => Some("1".to_string()),
         _ => None,
     };
     let o = Opts::from_env(&env);
@@ -163,10 +188,17 @@ fn formats_numbers() {
 
 #[test]
 fn rate_limit_shows_when_present() {
+    // only context: plan limits are not shown, even when Claude Code sends them
     let mut v = session();
-    v["rate_limits"] = json!({"five_hour": {"used_percentage": 72.4}});
-    assert!(plain(&v, 120).contains("│ 5h 72%"));
-    assert!(!plain(&v, 70).contains("5h"));
+    v["rate_limits"] = json!({"five_hour": {"used_percentage": 72.4},
+        "seven_day": {"used_percentage": 40}});
+    for w in [120, 70, 40] {
+        let l = plain(&v, w);
+        assert!(
+            !l.contains("5h") && !l.contains("week") && !l.contains("72%"),
+            "{l}"
+        );
+    }
 }
 
 #[test]
@@ -301,10 +333,8 @@ fn limits_at(e: &Env, fetched_at: i64, left: f64) {
             balance_usd: Some(20.0),
             key: Some(crate::providers::KeyLimits {
                 limit_remaining_usd: Some(left),
-                ..Default::default()
-            }),
+                }),
             fetched_at,
-            ..Default::default()
         },
     );
     limits::save(&e.state(), &c).unwrap();
@@ -367,7 +397,7 @@ fn full_line_at_three_widths_and_two_line_mode() {
     let mut lines = two.lines();
     assert_eq!(
         lines.next().unwrap(),
-        "Opus 5.5 high │ ██░░░░░░░░ 18% 180k/1M │ ~$1.27 │ cache 47m left (1h)"
+        "Opus 5.5 high │ ██░░░░░░░░ 18% 180k/1M"
     );
     assert_eq!(
         lines.next().unwrap(),
@@ -377,16 +407,25 @@ fn full_line_at_three_widths_and_two_line_mode() {
     let wide = render_no_spawn(&input, &e, now, &opts(200, 1));
     assert_eq!(
         wide,
-        "Opus 5.5 high │ ██░░░░░░░░ 18% 180k/1M │ ~$1.27 │ cache 47m left (1h) │ 🛡 ✓ openrouter $7.42 · 2 jobs (1 blocked, 1 escalated) · 2 agents · saved $0.21 today · $1.84 total"
+        "Opus 5.5 high · ██░░░░░░░░ 18% 180k/1M │ 🛡✓ $7.42 left · saved $0.21 · total $1.84 · 2 jobs · 2 agents"
     );
     let mid = render_no_spawn(&input, &e, now, &opts(120, 1));
     assert!(mid.chars().count() <= 120, "{mid}");
     assert_eq!(
         mid,
-        "Opus 5.5 high │ ██░░░░░░░░ 18% 180k/1M │ ~$1.27 │ cache 47m left (1h) │ 🛡 ✓ $7.42 · 2 jobs · saved $0.21 today"
+        "Opus 5.5 high · ██░░░░░░░░ 18% 180k/1M │ 🛡✓ $7.42 left · saved $0.21 · total $1.84 · 2 jobs · 2 agents"
     );
     let narrow = render_no_spawn(&input, &e, now, &opts(60, 1));
-    assert_eq!(narrow, "Opus 5.5 high │ 18% │ ~$1.27 │ 🛡 ✓ saved $0.21");
+    assert_eq!(narrow, "Opus 5.5 · ctx 18% │ 🛡✓ $7.42 left · saved $0.21");
+    // tiny terminals keep only the numbers that matter, never half a number
+    assert_eq!(
+        render_no_spawn(&input, &e, now, &opts(40, 1)),
+        "Opus · ctx 18% │ 🛡✓ saved $0.21"
+    );
+    for c in [20, 30, 45, 60, 80, 100] {
+        let l = render_no_spawn(&input, &e, now, &opts(c, 1));
+        assert!(l.chars().count() <= c.max(26), "{c}: {l}");
+    }
     let only = render_no_spawn(
         &input,
         &e,
@@ -475,7 +514,7 @@ fn absent_fields_negative_savings_and_errors() {
         out,
         "🛡 middleman ✓ openrouter $7.42 left · 1 job today (1 blocked) · saved -$0.03 today · -$0.03 total"
     );
-    assert!(render_no_spawn("not json", &e, now, &opts(200, 1)).starts_with("Claude │"));
+    assert!(render_no_spawn("not json", &e, now, &opts(200, 1)).starts_with("Claude"));
     let red = render_no_spawn(
         "{}",
         &e,
@@ -491,7 +530,7 @@ fn absent_fields_negative_savings_and_errors() {
     let bad = e.dir.path().join("nope.toml");
     let out = render_with("{}", &bad, now, &opts(200, 1), &mut || Ok(()));
     assert!(
-        out.starts_with("Claude │ ░░░░░░░░░░ 0% 0 │ 🛡 middleman ✗ cannot read config"),
+        out.starts_with("Claude") && out.contains("│ 🛡✗ cannot read config"),
         "{out}"
     );
     // low balance turns red

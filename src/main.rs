@@ -1360,6 +1360,12 @@ async fn real_main() -> Result<ExitCode> {
             }
             if let Some(c) = columns.filter(|c| *c > 0) {
                 o.columns = c;
+            } else if std::env::var_os("COLUMNS").is_none() {
+                // Claude Code doesn't pass COLUMNS: measure the terminal, leaving a small margin
+                // for the status line's own indent so the last number is never cut off.
+                if let Some(c) = middleman::statusline::tty_columns() {
+                    o.columns = c.saturating_sub(4).max(20);
+                }
             }
             o.middleman_only = middleman_only;
             say!("{}", middleman::statusline::run(&cfg_path, &o));

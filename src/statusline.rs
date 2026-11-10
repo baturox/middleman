@@ -60,6 +60,11 @@ pub struct Thresholds {
     pub warn_tokens: f64,
     pub danger_tokens: f64,
     pub cost_warn: f64,
+    /// Opt-in parts (`MIDDLEMAN_SL_SHOW_COST|CACHE|HINT=1`): off by default, because on a
+    /// subscription the session cost is an API-price estimate, not money spent.
+    pub show_cost: bool,
+    pub show_cache: bool,
+    pub show_hint: bool,
 }
 
 impl Default for Thresholds {
@@ -70,6 +75,9 @@ impl Default for Thresholds {
             warn_tokens: 150_000.0,
             danger_tokens: 300_000.0,
             cost_warn: 5.0,
+            show_cost: false,
+            show_cache: false,
+            show_hint: false,
         }
     }
 }
@@ -117,11 +125,14 @@ impl Opts {
     pub fn from_env(get: &dyn Fn(&str) -> Option<String>) -> Opts {
         let d = Thresholds::default();
         let n = |k: &str, dv: f64| env_num(get, k).unwrap_or(dv);
+        let flag =
+            |k: &str| get(&format!("MIDDLEMAN_SL_SHOW_{k}")).is_some_and(|v| v.trim() == "1");
         Opts {
             columns: get("COLUMNS")
                 .and_then(|c| c.trim().parse::<usize>().ok())
                 .filter(|c| *c > 0)
                 .unwrap_or(120),
+            // (the real tty width is applied by the CLI entry point, see `tty_columns`)
             color: get("NO_COLOR").is_none_or(|v| v.is_empty()),
             lines: match get("MIDDLEMAN_SL_LINES").as_deref().map(str::trim) {
                 Some("2") => 2,
@@ -135,6 +146,9 @@ impl Opts {
                 warn_tokens: n("WARN_TOKENS", d.warn_tokens),
                 danger_tokens: n("DANGER_TOKENS", d.danger_tokens),
                 cost_warn: n("COST_WARN", d.cost_warn),
+                show_cost: flag("COST"),
+                show_cache: flag("CACHE"),
+                show_hint: flag("HINT"),
             },
         }
     }
@@ -417,7 +431,14 @@ fn claude_part(v: &Value, level: u8, t: &Thresholds, now: f64) -> T {
             T::paint(&money(u), c)
         })
         .unwrap_or_default();
-    let cache = cache_state(v.get("prompt_cache"), now);
+    // Session cost, cache timer and the /compact hint are opt-in: on a subscription the "cost"
+    // is an API-price estimate, not money spent, and the line is for limits and context.
+    let cost = if t.show_cost { cost } else { T::default() };
+    let cache = if t.show_cache {
+        cache_state(v.get("prompt_cache"), now)
+    } else {
+        None
+    };
     let sep = T::paint(" │ ", C::Dim);
     match level {
         2 => T::join(vec![model, pct_t, cost], &sep),
@@ -440,27 +461,12 @@ fn claude_part(v: &Value, level: u8, t: &Thresholds, now: f64) -> T {
             let c = cache
                 .map(|c| T::paint(&c.text, c.color))
                 .unwrap_or_default();
-            let rl = v
-                .pointer("/rate_limits/five_hour/used_percentage")
-                .and_then(Value::as_f64)
-                .filter(|p| p.is_finite() && (0.0..=1000.0).contains(p))
-                .map(|p| {
-                    let col = if p >= 90.0 {
-                        C::Red
-                    } else if p >= 70.0 {
-                        C::Yellow
-                    } else {
-                        C::Dim
-                    };
-                    T::paint(&format!("5h {}%", p.round()), col)
-                })
-                .unwrap_or_default();
-            let hint = if level_c == Level::Red {
+            let hint = if level_c == Level::Red && t.show_hint {
                 T::paint("/compact or /clear", C::Red)
             } else {
                 T::default()
             };
-            T::join(vec![model, ctx, cost, c, rl, hint], &sep)
+            T::join(vec![model, ctx, cost, c, hint], &sep)
         }
     }
 }
@@ -991,6 +997,159 @@ fn fit(variants: Vec<T>, columns: usize) -> T {
         .unwrap_or_default()
 }
 
+/// Short model name for tight lines: "Opus 5.5" -> "Opus".
+fn short_model(name: &str) -> String {
+    name.split_whitespace()
+        .next()
+        .unwrap_or("Claude")
+        .to_string()
+}
+
+/// One compact line built by priority: each item has a rank (0 = always kept). When the
+/// line is too wide, whole items are dropped from the highest rank down, so numbers are never
+/// cut in half. Separators: " │ " between the Claude and middleman groups, " " inside.
+fn compact(v: &Value, d: &MmData, o: &Opts) -> T {
+    let t = &o.env;
+    let size = count(v.pointer("/context_window/context_window_size"));
+    let used = context_used(v);
+    let up = v.pointer("/context_window/used_percentage");
+    let pct = if up.is_none_or(Value::is_null) {
+        if size > 0.0 {
+            used / size * 100.0
+        } else {
+            0.0
+        }
+    } else {
+        count(up)
+    }
+    .round()
+    .min(100.0);
+    let ctx_c = lc(context_level(pct, used, t));
+    let name = model_name(v.get("model"));
+    let effort = s60(v.pointer("/effort/level"));
+
+    // (rank, group, item); group 0 = Claude, 1 = middleman
+    // kind: 0 normal; 1 = short model (only when the full name is dropped, rank 3);
+    // 2 = bare context % (only when `ctx N% tokens`, rank 6, is dropped)
+    let mut items: Vec<(u8, u8, T, u8)> = vec![];
+    if effort.is_empty() {
+        items.push((3, 0, T::paint(&name, C::BoldCyan), 0));
+    } else {
+        let mut me = T::paint(&name, C::BoldCyan);
+        me.p(&format!(" {effort}"), C::Dim);
+        items.push((7, 0, me, 3));
+        items.push((3, 0, T::paint(&name, C::BoldCyan), 4));
+    }
+    items.push((1, 0, T::paint(&short_model(&name), C::BoldCyan), 1));
+    // Context: a coloured bar with tokens/window when there is room, else just the percentage.
+    let filled = ((pct / 100.0) * 10.0).round().clamp(0.0, 10.0) as usize;
+    let mut ctx = T::paint(&"█".repeat(filled), ctx_c);
+    ctx.p(&"░".repeat(10 - filled), C::Dim)
+        .s(" ")
+        .p(&format!("{pct}%"), ctx_c);
+    let amount = match (used > 0.0, size > 0.0) {
+        (true, true) => format!(" {}/{}", tokens(used), tokens(size)),
+        (true, false) => format!(" {}", tokens(used)),
+        _ => String::new(),
+    };
+    ctx.p(&amount, C::Dim);
+    items.push((5, 0, ctx, 0));
+    items.push((0, 0, T::paint(&format!("ctx {pct}%"), ctx_c), 2));
+    if t.show_cost {
+        if let Some(u) = v
+            .pointer("/cost/total_cost_usd")
+            .and_then(Value::as_f64)
+            .filter(|u| u.is_finite() && *u >= 0.0)
+        {
+            items.push((8, 0, T::paint(&money(u), C::Dim), 0));
+        }
+    }
+
+    match &d.health {
+        Some(Ok(_)) => {
+            items.push((0, 1, T::paint("🛡✓", C::Green), 5));
+            if let Some((left, _)) = d.left {
+                let c = match d.low_balance {
+                    Some(C2::Red) => C::Red,
+                    Some(C2::Yellow) => C::Yellow,
+                    None => C::Dim,
+                };
+                items.push((3, 1, T::paint(&format!("{} left", usd(left)), c), 0));
+            }
+            let mut s = T::raw("saved ");
+            s.push(saved(d.today.net_savings_usd));
+            items.push((0, 1, s, 0));
+            let mut tot = T::raw("total ");
+            tot.push(saved(d.all.net_savings_usd));
+            items.push((5, 1, tot, 0));
+            let n = d.session.map(|s| s.jobs()).unwrap_or(d.today.jobs());
+            if n > 0 {
+                items.push((8, 1, T::raw(&jobs(n)), 0));
+            }
+            if let Some(a) = d.agents.filter(|a| *a > 0) {
+                items.push((
+                    9,
+                    1,
+                    T::raw(&format!("{a} agent{}", if a == 1 { "" } else { "s" })),
+                    0,
+                ));
+            }
+            if let Some(u) = &d.update {
+                items.push((7, 1, T::paint(&format!("↑{u}"), C::Yellow), 0));
+            }
+        }
+        Some(Err(e)) => {
+            items.push((0, 1, T::paint("🛡✗", C::Red), 5));
+            items.push((
+                2,
+                1,
+                T::paint(&clean(e.split(" (").next().unwrap_or(e), 32), C::Red),
+                0,
+            ));
+        }
+        None => {}
+    }
+
+    let build = |max: u8| {
+        let pick = |g: u8| {
+            let parts: Vec<T> = items
+                .iter()
+                .filter(|(r, grp, _, kind)| {
+                    *grp == g
+                        && *r <= max
+                        && match kind {
+                            1 => max < 3,
+                            2 => max < 5,
+                            4 => max < 7,
+                            _ => true,
+                        }
+                })
+                .filter(|(_, _, _, kind)| *kind != 5)
+                .map(|(_, _, t, _)| t.clone())
+                .collect();
+            let body = T::join(parts, &T::paint(" · ", C::Dim));
+            // the shield leads its group without a separator
+            match items
+                .iter()
+                .find(|(_, grp, _, kind)| *grp == g && *kind == 5)
+            {
+                Some((_, _, shield, _)) => T::join(vec![shield.clone(), body], &T::raw(" ")),
+                None => body,
+            }
+        };
+        T::join(vec![pick(0), pick(1)], &T::paint(" │ ", C::Dim))
+    };
+    let mut line = build(0);
+    for max in (0..=9).rev() {
+        let l = build(max);
+        if l.width() <= o.columns {
+            line = l;
+            break;
+        }
+    }
+    line
+}
+
 /// The status line for this stdin payload, with an injectable refresh spawner (the update
 /// check does not start).
 pub fn render_with(
@@ -1028,13 +1187,24 @@ pub fn render_jobs(
         let l2 = fit((0..=3).map(mm).collect(), o.columns);
         return format!("{}\n{}", l1.out(o.color), l2.out(o.color));
     }
-    let sep = T::paint(" │ ", C::Dim);
-    let combos: [(u8, u8); 7] = [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2), (2, 3)];
-    let variants = combos
-        .iter()
-        .map(|&(c, m)| T::join(vec![claude_part(&v, c, &o.env, nowf), mm(m)], &sep))
-        .collect();
-    fit(variants, o.columns).out(o.color)
+    compact(&v, &d, o).out(o.color)
+}
+
+/// Width of the controlling terminal (Claude Code does not set COLUMNS for status line
+/// commands, and stdout is a pipe), via TIOCGWINSZ on /dev/tty. None when there is no tty.
+#[cfg(unix)]
+pub fn tty_columns() -> Option<usize> {
+    use std::os::fd::AsRawFd;
+    let tty = std::fs::File::open("/dev/tty").ok()?;
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: TIOCGWINSZ fills a winsize struct for a valid open fd.
+    let rc = unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
+    (rc == 0 && ws.ws_col > 0).then_some(ws.ws_col as usize)
+}
+
+#[cfg(not(unix))]
+pub fn tty_columns() -> Option<usize> {
+    None
 }
 
 /// The status line for this stdin payload. Never panics on bad input.

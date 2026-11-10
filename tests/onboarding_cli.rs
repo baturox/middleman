@@ -88,7 +88,7 @@ fn onboarding_flow_in_temp_home() {
         .args(["statusline", "--config", &cfg_s])
         .write_stdin(r#"{"model":{"id":"claude-opus-5-5"},"effort":{"level":"high"}}"#));
     assert!(
-        out.starts_with("Opus 5.5 high │ ░░░░░░░░░░ 0% 0 │ 🛡 middleman ✓"),
+        out.starts_with("Opus 5.5 high · ░░░░░░░░░░ 0% │ 🛡✓"),
         "{out}"
     );
 
