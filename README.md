@@ -127,6 +127,50 @@ cargo install --git https://github.com/baturox/middleman --locked
 
 </details>
 
+### Upgrading
+
+```sh
+middleman upgrade --check     # this version, the latest release, a link to its notes (exit 10 = update available)
+middleman upgrade             # shows the release notes, asks, then installs
+middleman upgrade --rollback  # put the previous binary back
+```
+
+`middleman upgrade` downloads the release for this machine over HTTPS (redirects only to GitHub's
+download hosts, 50 MB cap), refuses it unless its SHA-256 matches `SHA256SUMS.txt`, runs
+`gh attestation verify` when the GitHub CLI is installed (`--require-attestation` or
+`MIDDLEMAN_REQUIRE_ATTESTATION=1` makes a failure fatal), extracts only the `middleman` binary,
+checks that it runs and reports the expected version, and only then replaces the old one in a
+single rename. The old binary stays next to it as `middleman.prev`. `--version v0.3.1` picks a
+release, `--yes` skips the question. Rerunning `install.sh` over an existing install does the same
+(and also keeps `middleman.prev`).
+
+Installed with **cargo** or **Homebrew**? `middleman upgrade` leaves that binary alone and prints
+the command to use instead: `cargo install --git https://github.com/baturox/middleman --locked --force`
+or `brew upgrade middleman`, then `middleman setup claude --refresh`.
+
+**What gets migrated.** Older versions wrote Claude Code wiring that the new binary may not match
+(for example 0.2.0 set a 5 s prompt-hook timeout; `cheap:` prompts need 150 s). After an upgrade,
+the new binary runs `middleman setup claude --refresh --yes` (skip it with `--no-wiring`). It only
+updates entries middleman wrote and that still exist, in user and project scope: the MCP server's
+command and arguments, the prompt hook's command and timeout, the status line command, and the
+CLAUDE.md block between its markers. It never adds anything and never touches entries that are
+not middleman's; every file is backed up first (`middleman setup claude --undo` reverts).
+`middleman doctor` tells you when the wiring is outdated.
+
+**Left for you** after an upgrade:
+
+- Run `/mcp` in Claude Code (or restart it) to reconnect: the MCP server that is running is still
+  the old binary.
+- macOS may ask once to let the new binary use the Keychain: choose **Always Allow**. The binary
+  changed, so its code signature did too, and the Keychain asks again before it hands a stored API
+  key to a program it has not seen.
+
+**Update notice.** At most once a day the status line (or `doctor`) starts a background
+`middleman upgrade --check`; when a newer release exists the status line shows `↑ v0.3.1` and
+`doctor` says `update available: run middleman upgrade`. That check is a single unauthenticated GET
+to `api.github.com` (no data about you or your projects, no identifiers, a generic User-Agent).
+Turn it off with `[update] check = false` in the config or `MIDDLEMAN_NO_UPDATE_CHECK=1`.
+
 ## Quick start
 
 Run `middleman init`. It asks four things with arrow-key menus and checks your key before saving:
@@ -255,7 +299,8 @@ Colour thresholds use the same environment variables as context-line:
 `MIDDLEMAN_SL_WARN_PCT` (or `CONTEXT_LINE_WARN_PCT`, default
 40), `_DANGER_PCT` (70), `_WARN_TOKENS` (150000), `_DANGER_TOKENS` (300000), `_COST_WARN` (5).
 `NO_COLOR` turns colours off; `MIDDLEMAN_SL_TOKENS=1` adds Claude output tokens avoided today;
-`MIDDLEMAN_SL_NO_REFRESH=1` stops the background limit refresh.
+`MIDDLEMAN_SL_NO_REFRESH=1` stops the background limit refresh and update check. `↑ v0.3.1` after
+the provider means a newer release is out (see [Upgrading](#upgrading)).
 
 **Already have a status line** (for example context-line)? `setup claude` leaves it alone and says
 how to combine them. Either let middleman print the whole thing (it includes context-line's
@@ -443,7 +488,9 @@ that exact request, for 30 minutes.
 | `middleman report` | What was delegated, to which model, and the net saving (`--html` for a dashboard, `--reconcile` to check the cost against the provider's counters) |
 | `middleman check <files>` | Dry run: shows exactly what *would* be sent, without sending it |
 | `middleman route "<prompt>"` | Shows whether a prompt would be delegated, and why |
-| `middleman doctor` | Health check: config, keys, keychain, providers, Claude Code wiring |
+| `middleman doctor` | Health check: config, keys, keychain, providers, Claude Code wiring (and whether it is outdated), updates |
+| `middleman upgrade` | Install the latest release, verified (`--check`, `--version`, `--rollback`, `--no-wiring`, `--yes`) |
+| `middleman setup claude --refresh` | Bring middleman's existing Claude Code entries up to this version; adds nothing |
 | `middleman dict suggest` | Find company, product and people names in this project (locally) and add the ones you pick to the private dictionary (`--yes`, `--min-confidence`, `--json`) |
 | `middleman models refresh` | Fetch current models and prices from your providers |
 | `middleman approve <id>` | Approve one `confirm`-mode delegation (run it yourself, in a terminal) |
