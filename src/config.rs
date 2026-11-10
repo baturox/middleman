@@ -880,8 +880,11 @@ task_kinds = ["snippet", "docstring"]
             .replace("/abs/path/to/project", &d.path().display().to_string())
             .replace("dictionary_file = ", "# dictionary_file = ");
         let c = Config::from_toml(&t).unwrap();
-        assert_eq!(c.providers["yzlab"].base_url, "https://yapayzekalab.org/v1");
-        assert!(!c.providers["openrouter"].enabled);
+        let or = &c.providers["openrouter"];
+        assert_eq!(or.base_url, "https://openrouter.ai/api/v1");
+        assert!(or.enabled);
+        assert_eq!(or.model.as_deref(), Some("qwen/qwen3.8-flash"));
+        assert!(!c.providers["deepseek"].enabled);
     }
 
     #[test]
