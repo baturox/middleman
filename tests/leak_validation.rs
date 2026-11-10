@@ -1539,7 +1539,16 @@ async fn report_watch_statusline_and_status_show_no_originals() {
     assert!(canaries_in(&watch).is_empty(), "{watch}");
 
     let stdin = json!({"session_id": "s1", "workspace": {"current_dir": p.root}}).to_string();
-    let line = middleman::statusline::render(&stdin, &p.cfg_path, middleman::ledger::now_unix());
+    let line = middleman::statusline::render(
+        &stdin,
+        &p.cfg_path,
+        middleman::ledger::now_unix(),
+        &middleman::statusline::Opts {
+            color: false,
+            lines: 2,
+            ..Default::default()
+        },
+    );
     assert!(line.contains("middleman"), "{line}");
     assert!(canaries_in(&line).is_empty(), "{line}");
 
