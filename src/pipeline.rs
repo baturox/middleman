@@ -285,6 +285,7 @@ struct LedgerCtx {
     claude_model: String,
     prices: ClaudePrices,
     log: bool,
+    session_id: Option<String>,
 }
 
 impl LedgerCtx {
@@ -304,6 +305,7 @@ impl LedgerCtx {
             write_mode: self.write_mode.as_str().into(),
             claude_model: self.claude_model.clone(),
             validation: "skipped".into(),
+            session_id: self.session_id.clone(),
             ..Default::default()
         }
     }
@@ -640,6 +642,7 @@ impl Pipeline {
             claude_model: econ.claude_model.clone(),
             prices,
             log: !req.dry_run,
+            session_id: crate::statusline::session_from_env(),
         };
         let mut out = DelegateOutcome::new(&request_id, req.dry_run, write_mode);
         out.needs_confirmation = needs_confirmation;

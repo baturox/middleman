@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use super::jsonrpc::{self, Incoming};
-use crate::pipeline::{DelegateRequest, Pipeline, Status};
+use crate::pipeline::{DelegateOutcome, DelegateRequest, Pipeline, Status};
 
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const DEFAULT_PROTOCOL: &str = "2025-06-18";
@@ -73,6 +73,69 @@ fn tool_result(v: &Value, is_error: bool) -> Value {
         "content": [{"type": "text", "text": serde_json::to_string_pretty(v).unwrap_or_default()}],
         "isError": is_error,
     })
+}
+
+/// One human-readable line that starts every `delegate_task` result.
+pub fn summary_line(o: &DelegateOutcome) -> String {
+    let clean = |s: &str| crate::fsutil::clean(s, 80);
+    let via = match (&o.provider, &o.model) {
+        (Some(p), Some(m)) => format!(" via {}/{}", clean(p), clean(m)),
+        _ => String::new(),
+    };
+    let net = o
+        .savings
+        .map(|s| {
+            format!(
+                ", net saving {}${:.4}",
+                if s.net_savings_usd < 0.0 { "-" } else { "" },
+                s.net_savings_usd.abs()
+            )
+        })
+        .unwrap_or_default();
+    match o.status {
+        Status::Ok if o.dry_run => {
+            format!("middleman: dry run{via}; nothing was sent (see sanitized_payload and plan)")
+        }
+        Status::Ok => {
+            let what = match &o.written {
+                Some(w) => format!(
+                    "{} {} ({} lines)",
+                    match w.action.as_str() {
+                        "staged" => "staged",
+                        _ => "wrote",
+                    },
+                    clean(w.staged_path.as_deref().unwrap_or(&w.path)),
+                    w.lines
+                ),
+                None => "answer below".into(),
+            };
+            let advice = if o.risk.as_ref().is_some_and(|r| r.level == "high") {
+                "HIGH RISK: read the staged file and the risk findings before running anything"
+            } else {
+                "untrusted output: read the diff first, then run the tests"
+            };
+            format!(
+                "middleman: done{via}; {what}; cost ${:.4}{net}. {advice}.",
+                o.cost_usd
+            )
+        }
+        Status::Blocked => format!(
+            "middleman: blocked ({}); nothing was sent. Do the task yourself.",
+            clean(
+                o.block_reason
+                    .as_deref()
+                    .unwrap_or(if o.needs_confirmation {
+                        "needs confirmation"
+                    } else {
+                        "policy"
+                    })
+            )
+        ),
+        Status::Error => format!(
+            "middleman: error ({}); do the task yourself.",
+            clean(o.error.as_deref().unwrap_or("unknown"))
+        ),
+    }
 }
 
 pub struct Server {
@@ -177,7 +240,14 @@ impl Server {
                             Ok(out) => {
                                 let is_err = out.status == Status::Error;
                                 let v = serde_json::to_value(&out).unwrap_or_else(|_| json!({}));
-                                Ok(tool_result(&v, is_err))
+                                let mut r = tool_result(&v, is_err);
+                                if let Some(c) = r["content"].as_array_mut() {
+                                    c.insert(
+                                        0,
+                                        json!({"type": "text", "text": summary_line(&out)}),
+                                    );
+                                }
+                                Ok(r)
                             }
                             Err(_) => Ok(panic_result("delegate_task")),
                         }

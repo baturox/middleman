@@ -1,3 +1,6 @@
 /target
 .env*
 *.jsonl
+
+# agent worktrees / local Claude Code state
+/.claude/

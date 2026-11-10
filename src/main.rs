@@ -1,21 +1,30 @@
 #![deny(clippy::print_stdout)]
 
-use std::io::{BufRead, Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use middleman::catalog::Catalog;
 use middleman::classify::Declared;
-use middleman::config::{default_config_path, Api, Config, RoutingMode};
+use middleman::claude_setup::{self, SetupOptions};
+use middleman::config::{
+    default_config_path, expand_tilde, Api, Config, KeySource, RoutingMode, Secret,
+};
 use middleman::detect::{Detector, Dictionary};
 use middleman::egress::{self, OutboundRequest};
+use middleman::fsutil::{clean, pretty};
 use middleman::intake::FileRef;
+use middleman::keystore;
 use middleman::mcp::server::Server;
+use middleman::oauth;
+use middleman::onboard;
 use middleman::pipeline::{DelegateRequest, Pipeline};
-use middleman::providers::{presets, ModelInfo, Provider};
+use middleman::providers::presets::{self, Preset};
+use middleman::providers::{ModelInfo, Provider};
 use middleman::pseudo::Vault;
 use middleman::setup::{self, InitOptions, Scope};
 use middleman::TaskKind;
@@ -27,14 +36,22 @@ macro_rules! say {
     }};
 }
 
+/// Prompts, progress and warnings go to stderr so stdout stays clean for scripts.
+macro_rules! note {
+    ($($t:tt)*) => {{
+        let _ = writeln!(std::io::stderr(), $($t)*);
+    }};
+}
+
 #[derive(Parser)]
 #[command(
     name = "middleman",
     version,
-    about = "Sanitizing delegation layer for untrusted LLM providers"
+    about = "Let cheap models do Claude Code's grunt work, without seeing your secrets",
+    after_help = "Start with `middleman init`, then `middleman setup claude`."
 )]
 struct Cli {
-    /// Config file (default ~/.config/middleman/config.toml)
+    /// Config file [default: ~/.config/middleman/config.toml]
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -43,104 +60,68 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run the MCP stdio server
-    Mcp,
-    /// Offline dry run: show exactly what would be sent for these files (no network)
-    Check {
-        files: Vec<String>,
-        #[arg(long, default_value = "snippet")]
-        task_kind: String,
-        #[arg(long, default_value = "internal")]
-        declared: String,
-        #[arg(long, default_value = "Review this code.")]
-        instructions: String,
-    },
-    /// Model catalog: `models` (list, cached) or `models refresh` (fetch /models now)
-    Models {
-        /// "refresh" to re-fetch every enabled provider's /models
-        action: Option<String>,
-        /// Include non-text / unpriced models
-        #[arg(long)]
-        all: bool,
-    },
-    /// Show provider balance
-    Balance {
-        #[arg(long)]
-        provider: Option<String>,
-    },
-    /// Show recent ledger entries and window sums
-    Ledger {
-        #[arg(long, default_value_t = 20)]
-        tail: usize,
-    },
-    /// Probe a gateway: UA acceptance, wire formats, cheapest model, balance latency (~2 tiny calls)
-    Probe {
-        #[arg(long)]
-        provider: Option<String>,
-        #[arg(long)]
-        model: Option<String>,
-        /// Only free GET endpoints; no completions
-        #[arg(long)]
-        no_send: bool,
-    },
-    /// Local prompt classifier. `--hook`: Claude Code UserPromptSubmit hook (stdin JSON, always exit 0)
-    Route {
-        text: Option<String>,
-        #[arg(long)]
-        hook: bool,
-    },
-    /// Write middleman config and print the Claude Code wiring (applies it only with --apply)
+    /// Set up middleman: pick a provider, log in or paste a key, choose scope and routing mode
     Init {
-        /// user (all projects) | project (this repo: .middleman.toml + project-scoped MCP)
+        /// user (all projects) | project (this repo: also writes .middleman.toml)
         #[arg(long)]
         scope: Option<String>,
-        /// Comma-separated presets, e.g. yapayzekalab,openrouter
+        /// Comma-separated presets, e.g. openrouter,deepseek (skips the picker)
         #[arg(long)]
         providers: Option<String>,
         /// auto | confirm | explicit
         #[arg(long)]
         mode: Option<String>,
-        /// Allowed roots (default: current directory)
+        /// Allowed roots [default: current directory]
         #[arg(long)]
         root: Vec<PathBuf>,
-        /// Non-interactive: accept defaults for anything not given
+        /// Non-interactive: accept defaults for anything not given (keys come from env vars)
         #[arg(long)]
         yes: bool,
         /// Overwrite existing middleman config files
         #[arg(long)]
         force: bool,
-        /// Also run `claude mcp add` and merge the hook into Claude Code settings
+        /// Also run `middleman setup claude --yes` at the end
         #[arg(long)]
         apply: bool,
-        /// List presets and which key env vars are present, then exit
+        /// List presets and which key env vars are set, then exit
         #[arg(long)]
         list: bool,
     },
-    /// Claude Code usage from local transcripts (~/.claude/projects), aggregates only
-    Usage {
-        #[arg(long, default_value = "30d")]
-        since: String,
-        /// model | day | project | session | agent
-        #[arg(long, default_value = "model")]
-        by: String,
-        #[arg(long)]
-        json: bool,
-        #[arg(long)]
-        html: Option<PathBuf>,
+    /// Manage provider API keys (stored in the OS keychain, never in the config)
+    Provider {
+        #[command(subcommand)]
+        action: ProviderCmd,
     },
-    /// Quantified first-party cost recommendations + settings.json snippet (prints only)
-    Tune {
-        #[arg(long, default_value = "30d")]
-        since: String,
+    /// Log in with your browser and store the API key it creates (OpenRouter)
+    Login {
+        /// Provider to log in to (only openrouter supports this)
+        provider: String,
+        /// Do not open a browser: print the link and paste the code it shows (SSH, containers)
         #[arg(long)]
-        json: bool,
-        /// Merge the snippet into ~/.claude/settings.json (backup first). Run it yourself.
-        #[arg(long)]
-        apply: bool,
+        no_browser: bool,
+        /// Seconds to wait for the browser
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
     },
-    /// Usage + savings report from the ledger
+    /// Wire middleman into a client
+    Setup {
+        #[command(subcommand)]
+        target: SetupTarget,
+    },
+    /// Print one status line for Claude Code's statusLine (reads its JSON on stdin)
+    Statusline,
+    /// Follow the delegation log live, one readable line per call
+    Watch {
+        /// Show this many past entries first
+        #[arg(long, default_value_t = 10)]
+        tail: usize,
+        /// Print the past entries and exit
+        #[arg(long)]
+        no_follow: bool,
+    },
+    /// Usage and savings report from the delegation log
     Report {
-        /// 7d | 30d | 24h | all
+        /// 24h | 7d | 30d | all
         #[arg(long, default_value = "30d")]
         since: String,
         /// model | provider | task | day | project
@@ -148,16 +129,158 @@ enum Cmd {
         by: String,
         #[arg(long)]
         json: bool,
-        /// Write a single-file HTML dashboard to this path
+        /// Also write a single-file HTML dashboard to this path
         #[arg(long)]
         html: Option<PathBuf>,
     },
-    /// Green/red checklist: config, keys, reachability, balance, catalog, binary, MCP, hook
+    /// Claude Code spend from local transcripts (~/.claude/projects), totals only
+    Usage {
+        /// 24h | 7d | 30d | all
+        #[arg(long, default_value = "30d")]
+        since: String,
+        /// model | day | project | session | agent
+        #[arg(long, default_value = "model")]
+        by: String,
+        #[arg(long)]
+        json: bool,
+        /// Also write a single-file HTML dashboard to this path
+        #[arg(long)]
+        html: Option<PathBuf>,
+    },
+    /// Recommended Claude Code settings, with estimated savings
+    Tune {
+        /// 24h | 7d | 30d | all
+        #[arg(long, default_value = "30d")]
+        since: String,
+        #[arg(long)]
+        json: bool,
+        /// Merge the snippet into ~/.claude/settings.json (a backup is taken first)
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Dry run: show exactly what would be sent for these files (no network)
+    Check {
+        files: Vec<String>,
+        #[arg(long, default_value = "snippet")]
+        task_kind: String,
+        /// public | internal | confidential
+        #[arg(long, default_value = "internal")]
+        declared: String,
+        #[arg(long, default_value = "Review this code.")]
+        instructions: String,
+    },
+    /// Show whether a prompt would be delegated, and why (`--hook`: Claude Code prompt hook)
+    Route {
+        text: Option<String>,
+        /// Run as the UserPromptSubmit hook: JSON on stdin, always exits 0
+        #[arg(long)]
+        hook: bool,
+    },
+    /// List cached models and prices, or `models refresh` to fetch them now
+    Models {
+        /// list | refresh
+        action: Option<String>,
+        /// Include non-text and unpriced models
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show a provider's balance
+    Balance {
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// Show recent raw log entries and today's / 7-day spend
+    Ledger {
+        #[arg(long, default_value_t = 20)]
+        tail: usize,
+    },
+    /// Probe a gateway: User-Agent handling, wire formats, cheapest model (~2 tiny calls)
+    Probe {
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        /// Only free GET requests; no completions
+        #[arg(long)]
+        no_send: bool,
+    },
+    /// Health check: config, keys, keychain, providers, catalog and Claude Code wiring
     Doctor,
     /// Approve a routing.mode=confirm dry run (run this yourself, in a terminal)
     Approve {
         /// The approval_id shown by the dry run
         id: String,
+    },
+    /// Print shell completions (bash, zsh, fish, elvish, powershell)
+    Completions { shell: clap_complete::Shell },
+    /// Run the MCP stdio server (Claude Code starts this for you)
+    Mcp,
+}
+
+#[derive(Subcommand)]
+enum ProviderCmd {
+    /// Add a provider: pick it, log in or paste the key (hidden), validate, store it
+    Add {
+        /// Preset name, e.g. openrouter (omit to pick from a list)
+        name: Option<String>,
+        /// Read the key from stdin instead of prompting (for scripts; never pass it as an argument)
+        #[arg(long)]
+        key_stdin: bool,
+        /// Log in with the browser instead of pasting a key (OpenRouter)
+        #[arg(long)]
+        login: bool,
+        /// Store the key without the free validation request
+        #[arg(long)]
+        no_validate: bool,
+    },
+    /// List configured providers and where each key is stored (never the key)
+    List,
+    /// Check a provider's key with a free request
+    Test { name: String },
+    /// Replace a provider's stored key
+    Rotate {
+        name: String,
+        #[arg(long)]
+        key_stdin: bool,
+        #[arg(long)]
+        login: bool,
+        #[arg(long)]
+        no_validate: bool,
+    },
+    /// Remove a provider and its stored key
+    Remove {
+        name: String,
+        /// Do not ask for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SetupTarget {
+    /// Register the MCP server, allow its tools, add the prompt hook, statusline and CLAUDE.md block
+    Claude {
+        /// user (~/.claude*) | project (.mcp.json, .claude/settings.json, CLAUDE.md here)
+        #[arg(long, default_value = "user")]
+        scope: String,
+        /// Show the changes and exit
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply without asking
+        #[arg(long)]
+        yes: bool,
+        /// Restore the files changed by the last `setup claude`
+        #[arg(long)]
+        undo: bool,
+        #[arg(long)]
+        no_statusline: bool,
+        #[arg(long)]
+        no_hook: bool,
+        #[arg(long)]
+        no_claude_md: bool,
+        /// Do not allow-list the two middleman tools (Claude Code will ask each time)
+        #[arg(long)]
+        no_permissions: bool,
     },
 }
 
@@ -165,7 +288,28 @@ fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+fn home() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn interactive() -> bool {
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+fn theme() -> dialoguer::theme::ColorfulTheme {
+    dialoguer::theme::ColorfulTheme::default()
+}
+
 fn load(cfg_path: &Path) -> Result<Config> {
+    if !cfg_path.exists() {
+        bail!(
+            "no config at {}: run `middleman init` first",
+            pretty(cfg_path)
+        );
+    }
     let (cfg, overlay) = Config::load_with_project(cfg_path, &cwd())?;
     if let Some(p) = overlay {
         tracing::info!("applied project overlay {}", p.display());
@@ -176,13 +320,15 @@ fn load(cfg_path: &Path) -> Result<Config> {
 fn pick_provider(cfg: &Config, name: Option<String>) -> Result<String> {
     match name {
         Some(n) if cfg.providers.contains_key(&n) => Ok(n),
-        Some(n) => bail!("unknown provider {n}"),
+        Some(n) => {
+            bail!("unknown provider {n}: run `middleman provider list` to see configured ones")
+        }
         None => cfg
             .providers
             .iter()
             .find(|(_, p)| p.enabled)
             .map(|(n, _)| n.clone())
-            .context("no enabled providers configured"),
+            .context("no enabled providers: run `middleman provider add openrouter`"),
     }
 }
 
@@ -230,7 +376,7 @@ async fn probe(
     ] {
         match p.status_with_ua("/models", ua.as_deref()).await {
             Ok(s) => say!("  {label:<30} -> HTTP {s}"),
-            Err(e) => say!("  {label:<30} -> error: {e}"),
+            Err(e) => say!("  {label:<30} -> error: {}", clean(&e.to_string(), 200)),
         }
     }
 
@@ -238,7 +384,7 @@ async fn probe(
     let models = match p.models().await {
         Ok(m) => m,
         Err(e) => {
-            say!("  GET /models failed: {e}");
+            say!("  GET /models failed: {}", clean(&e.to_string(), 200));
             vec![]
         }
     };
@@ -251,14 +397,14 @@ async fn probe(
     for m in text.iter().take(12) {
         say!(
             "  {:<40} in ${:>7}/1M out ${:>7}/1M tier={} ctx={} modality={} tags={:?}",
-            m.id,
+            clean(&m.id, 60),
             fmt_price(m.price_in_per_1m),
             fmt_price(m.price_out_per_1m),
-            m.tier.as_deref().unwrap_or("?"),
+            clean(m.tier.as_deref().unwrap_or("?"), 20),
             m.context_length
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "?".into()),
-            m.modality.as_deref().unwrap_or("?"),
+            clean(m.modality.as_deref().unwrap_or("?"), 30),
             middleman::catalog::tags_for(&m.id, m.context_length),
         );
     }
@@ -267,7 +413,7 @@ async fn probe(
     let b0 = p.balance().await;
     match &b0 {
         Ok(b) => say!("  balance_usd={:.4} payg={:?}", b.usd, b.payg),
-        Err(e) => say!("  balance failed: {e}"),
+        Err(e) => say!("  balance failed: {}", clean(&e.to_string(), 200)),
     }
     if no_send {
         return Ok(());
@@ -284,7 +430,10 @@ async fn probe(
         say!("  balance unreadable: refusing to send (fail-closed)");
         return Ok(());
     }
-    say!("\n[wire formats] model={chosen}, max_tokens=8, synthetic prompt only");
+    say!(
+        "\n[wire formats] model={}, max_tokens=8, synthetic prompt only",
+        clean(&chosen, 80)
+    );
     let det = Detector::new(vec![], cfg.public_hosts(), None);
     let vault = Vault::new("");
     let mut prev = b0.as_ref().map(|b| b.usd).ok();
@@ -303,13 +452,13 @@ async fn probe(
                 "  {:?}: OK in {} ms text={:?} model={:?} usage in={:?} out={:?} stop={:?}",
                 api,
                 t0.elapsed().as_millis(),
-                c.text.chars().take(40).collect::<String>(),
-                c.model,
+                clean(&c.text, 40),
+                c.model.as_deref().map(|m| clean(m, 60)),
                 c.input_tokens,
                 c.output_tokens,
-                c.stop_reason
+                c.stop_reason.as_deref().map(|s| clean(s, 20))
             ),
-            Err(e) => say!("  {:?}: FAILED: {e}", api),
+            Err(e) => say!("  {:?}: FAILED: {}", api, clean(&e.to_string(), 200)),
         }
         let now = p.balance().await.ok().map(|b| b.usd);
         say!(
@@ -319,7 +468,7 @@ async fn probe(
         );
         prev = now.or(prev);
     }
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     let late = p.balance().await.ok().map(|b| b.usd);
     say!(
         "\n[balance latency] after +3s: {:?}; total delta since start: {:?}",
@@ -329,50 +478,467 @@ async fn probe(
     Ok(())
 }
 
-/// Hook path: never fails, never blocks, prints nothing on any error.
+/// Hook path: never fails, never blocks. A config that cannot be loaded produces a
+/// "do not delegate" message instead of silently falling back to defaults.
 fn route_hook(cfg_path: &Path) {
     let mut input = String::new();
     let _ = std::io::stdin().take(1 << 20).read_to_string(&mut input);
-    let hook_cwd = serde_json::from_str::<serde_json::Value>(&input)
-        .ok()
+    let parsed = serde_json::from_str::<serde_json::Value>(&input).ok();
+    let hook_cwd = parsed
+        .as_ref()
         .and_then(|v| v.get("cwd").and_then(|c| c.as_str()).map(PathBuf::from))
         .unwrap_or_else(cwd);
-    let cfg = Config::load_with_project(cfg_path, &hook_cwd)
-        .ok()
-        .map(|(c, _)| c);
-    let mode = cfg
+    let has_prompt = parsed
         .as_ref()
-        .map(|c| c.routing.mode)
-        .unwrap_or(RoutingMode::Auto);
+        .and_then(|v| v.get("prompt"))
+        .is_some_and(|p| p.is_string());
+    let cfg = match Config::load_with_project(cfg_path, &hook_cwd) {
+        Ok((c, _)) => c,
+        Err(e) => {
+            if has_prompt {
+                say!(
+                    "{}",
+                    middleman::hook::hook_output_config_error(&format!("{e:#}"))
+                );
+            }
+            return;
+        }
+    };
     let dict = cfg
+        .redact
+        .dictionary_file
         .as_ref()
-        .and_then(|c| c.redact.dictionary_file.as_ref())
         .and_then(|p| Dictionary::load(p).ok());
     if let Some(out) = middleman::hook::hook_output(
         &input,
-        mode,
+        cfg.routing.mode,
         dict.as_ref(),
-        cfg.as_ref().map(|c| &c.economics),
+        Some(&cfg.economics),
     ) {
         say!("{out}");
     }
 }
 
-fn ask(prompt: &str, default: &str) -> String {
-    let _ = write!(std::io::stderr(), "{prompt} [{default}]: ");
-    let _ = std::io::stderr().flush();
-    let mut line = String::new();
-    let _ = std::io::stdin().lock().read_line(&mut line);
-    let t = line.trim();
-    if t.is_empty() {
-        default.to_string()
+// ---------------------------------------------------------------- keys and providers
+
+fn read_key_stdin() -> Result<Secret> {
+    let mut s = zeroize::Zeroizing::new(String::new());
+    std::io::stdin()
+        .take(16 * 1024)
+        .read_to_string(&mut s)
+        .context("cannot read the key from stdin")?;
+    Ok(Secret::new(s.trim()))
+}
+
+fn read_key_hidden(preset: &Preset) -> Result<Secret> {
+    let label = preset.name;
+    let k = dialoguer::Password::with_theme(&theme())
+        .with_prompt(format!("Paste your {label} API key (input is hidden)"))
+        .interact()
+        .context("no key entered")?;
+    let k = zeroize::Zeroizing::new(k);
+    Ok(Secret::new(k.trim()))
+}
+
+async fn browser_login(no_browser: bool, timeout: Duration) -> Result<Secret> {
+    let pk = oauth::pkce()?;
+    let code = if no_browser {
+        let url = oauth::auth_url(None, &pk.challenge, None, "middleman");
+        note!("Open this link, log in to OpenRouter and authorize middleman:\n\n  {url}\n");
+        let c: String = dialoguer::Input::with_theme(&theme())
+            .with_prompt("Paste the code the page shows")
+            .interact_text()
+            .context("no code entered")?;
+        zeroize::Zeroizing::new(c.trim().to_string())
     } else {
-        t.to_string()
+        let cb = oauth::Callback::bind()?;
+        let state = oauth::new_state()?;
+        let url = oauth::auth_url(Some(&cb.url()), &pk.challenge, Some(&state), "middleman");
+        note!("Opening your browser to log in to OpenRouter. If it does not open, visit:\n\n  {url}\n");
+        if open::that_detached(&url).is_err() {
+            note!("(could not open a browser; open the link above yourself)");
+        }
+        note!(
+            "Waiting for the browser (up to {}s; Ctrl-C to cancel)...",
+            timeout.as_secs()
+        );
+        tokio::task::spawn_blocking(move || cb.wait(&state, timeout))
+            .await
+            .context("login listener crashed")??
+    };
+    oauth::exchange(oauth::EXCHANGE_URL, &code, &pk.verifier).await
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum KeyHow {
+    Ask,
+    Stdin,
+    Login,
+}
+
+/// Get a key for `preset`: browser login, stdin, or a hidden prompt. Validates it unless
+/// `no_validate`. Nothing is stored here.
+async fn obtain_key(preset: &Preset, how: KeyHow, no_validate: bool) -> Result<Secret> {
+    let can_login = preset.name == "openrouter";
+    let how = match how {
+        KeyHow::Login if !can_login => bail!(
+            "{} has no browser login; paste the key instead (`middleman provider add {}`)",
+            preset.name,
+            preset.name
+        ),
+        KeyHow::Ask if !interactive() => bail!(
+            "no terminal to ask for the key: pipe it in with `--key-stdin`, or export {}",
+            preset.key_env.unwrap_or("the key variable")
+        ),
+        KeyHow::Ask if can_login => {
+            let i = dialoguer::Select::with_theme(&theme())
+                .with_prompt("How do you want to connect OpenRouter?")
+                .items([
+                    "Log in with my browser (recommended: creates a key for middleman)",
+                    "Paste an existing API key",
+                ])
+                .default(0)
+                .interact()?;
+            if i == 0 {
+                KeyHow::Login
+            } else {
+                KeyHow::Ask
+            }
+        }
+        h => h,
+    };
+    let key = match how {
+        KeyHow::Login => browser_login(false, Duration::from_secs(300)).await?,
+        KeyHow::Stdin => read_key_stdin()?,
+        KeyHow::Ask => read_key_hidden(preset)?,
+    };
+    if how != KeyHow::Login {
+        if let Some(w) = onboard::check_pasted(preset.name, key.expose())? {
+            note!("warning: {w}");
+        }
+    }
+    if !no_validate {
+        note!(
+            "Checking the key with a free request to {}...",
+            preset.base_url
+        );
+        let info = onboard::validate_key(preset.api, preset.base_url, preset.balance, &key).await?;
+        note!("  ok: {}", info.summary());
+    }
+    Ok(key)
+}
+
+fn store(name: &str, key: &Secret) -> Result<KeySource> {
+    let st = keystore::store_key(name, key)?;
+    if let Some(w) = &st.warning {
+        note!("warning: {w}");
+    }
+    note!("Stored the {name} key in {}.", st.location);
+    Ok(st.source)
+}
+
+fn preset_or_bail(name: &str) -> Result<&'static Preset> {
+    presets::find(name).with_context(|| {
+        format!(
+            "unknown provider {name:?}; presets: {}",
+            presets::PRESETS
+                .iter()
+                .map(|p| p.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
+fn pick_preset() -> Result<&'static Preset> {
+    let list: Vec<&'static Preset> = presets::PRESETS.iter().collect();
+    let items: Vec<String> = list
+        .iter()
+        .map(|p| {
+            let host = p
+                .base_url
+                .split("//")
+                .nth(1)
+                .and_then(|h| h.split('/').next())
+                .unwrap_or("");
+            let hint = match p.name {
+                "openrouter" => "  one key for DeepSeek, Qwen, Kimi, GLM, ... (recommended)",
+                "ollama" | "lmstudio" => "  local, no key",
+                "anthropic" => "  first-party Claude API",
+                _ => "",
+            };
+            format!("{:<13} {host}{hint}", p.name)
+        })
+        .collect();
+    let default = list
+        .iter()
+        .position(|p| p.name == "openrouter")
+        .unwrap_or(0);
+    let i = dialoguer::Select::with_theme(&theme())
+        .with_prompt("Pick a provider")
+        .items(&items)
+        .default(default)
+        .interact()?;
+    Ok(list[i])
+}
+
+fn read_config_text(cfg_path: &Path) -> Result<String> {
+    std::fs::read_to_string(cfg_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!(
+                "no config at {}: run `middleman init` first (it sets up a provider too)",
+                pretty(cfg_path)
+            )
+        } else {
+            anyhow::anyhow!("cannot read {}: {e}", pretty(cfg_path))
+        }
+    })
+}
+
+async fn provider_add(
+    cfg_path: &Path,
+    name: Option<String>,
+    how: KeyHow,
+    no_validate: bool,
+    must_exist: bool,
+) -> Result<()> {
+    let text = read_config_text(cfg_path)?;
+    let preset = match name {
+        Some(n) => preset_or_bail(&n)?,
+        None if interactive() => pick_preset()?,
+        None => bail!("name the provider, e.g. `middleman provider add openrouter`"),
+    };
+    if must_exist {
+        let cfg = Config::from_toml(&text)?;
+        if !cfg.providers.contains_key(preset.name) {
+            bail!(
+                "{} is not configured: use `middleman provider add {}`",
+                preset.name,
+                preset.name
+            );
+        }
+    }
+    let source = if preset.key_env.is_none() {
+        note!("{} runs locally and needs no key.", preset.name);
+        None
+    } else {
+        let key = obtain_key(preset, how, no_validate).await?;
+        Some(store(preset.name, &key)?)
+    };
+    let new = onboard::upsert_provider(&text, preset.name, source)?;
+    onboard::write_config(cfg_path, &new)?;
+    note!(
+        "Updated {} ([providers.{}]).",
+        pretty(cfg_path),
+        preset.name
+    );
+    if let Some(env) = preset.key_env {
+        if std::env::var_os(env).is_some() {
+            note!("note: {env} is set in this shell and takes precedence over the stored key.");
+        }
+    }
+    if must_exist {
+        note!("If the old key is no longer needed, revoke it in the provider's dashboard.");
+    } else {
+        note!(
+            "Done. Next: `middleman setup claude` (once), then `middleman provider test {}` any time.",
+            preset.name
+        );
+    }
+    Ok(())
+}
+
+fn provider_list(cfg_path: &Path) -> Result<()> {
+    let cfg = load(cfg_path)?;
+    if cfg.providers.is_empty() {
+        say!("no providers configured: run `middleman provider add openrouter`");
+        return Ok(());
+    }
+    say!("{:<14} {:<8} KEY", "PROVIDER", "ENABLED");
+    for (name, p) in &cfg.providers {
+        let st = p.key_status();
+        say!(
+            "{:<14} {:<8} {} {}",
+            clean(name, 14),
+            if p.enabled { "yes" } else { "no" },
+            if st.ok() { "✓" } else { "✗" },
+            clean(&st.describe(), 120)
+        );
+    }
+    say!("(keys are never shown; env vars take precedence over stored keys)");
+    Ok(())
+}
+
+async fn provider_test(cfg_path: &Path, name: &str) -> Result<ExitCode> {
+    let cfg = load(cfg_path)?;
+    let p = cfg.providers.get(name).with_context(|| {
+        format!("{name} is not configured: run `middleman provider add {name}`")
+    })?;
+    let key = p.resolve_key()?;
+    if !p.needs_key() {
+        let n = Provider::from_cfg(name, p, 20)?.models().await?.len();
+        say!("✓ {name}: reachable, {n} models");
+        return Ok(ExitCode::SUCCESS);
+    }
+    match onboard::validate_key(p.api, &p.base_url, p.balance, &key).await {
+        Ok(info) => {
+            say!(
+                "✓ {name}: key from {} works ({})",
+                p.key_status().describe(),
+                info.summary()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            say!("✗ {name}: {e:#}. Replace it with `middleman provider rotate {name}`.");
+            Ok(ExitCode::from(1))
+        }
     }
 }
 
+fn provider_remove(cfg_path: &Path, name: &str, yes: bool) -> Result<()> {
+    let text = read_config_text(cfg_path)?;
+    if !yes {
+        if !interactive() {
+            bail!("re-run with --yes to remove {name} without a prompt");
+        }
+        let ok = dialoguer::Confirm::with_theme(&theme())
+            .with_prompt(format!("Remove {name} and its stored key?"))
+            .default(false)
+            .interact()?;
+        if !ok {
+            note!("Nothing changed.");
+            return Ok(());
+        }
+    }
+    for s in [keystore::Store::keychain(), keystore::Store::file()] {
+        match s.delete(name) {
+            Ok(true) => note!("Deleted the key from {}.", s.describe(name)),
+            Ok(false) => {}
+            Err(e) if s.source() == KeySource::Keychain => {
+                note!("note: could not check the keychain: {e:#}")
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let (new, removed) = onboard::remove_provider(&text, name)?;
+    if removed {
+        onboard::write_config(cfg_path, &new).with_context(|| {
+            format!(
+                "routes in {} may still name {name}; edit them",
+                pretty(cfg_path)
+            )
+        })?;
+        note!("Removed [providers.{name}] from {}.", pretty(cfg_path));
+    } else {
+        note!("{name} was not in {}.", pretty(cfg_path));
+    }
+    Ok(())
+}
+
+async fn login(cfg_path: &Path, provider: &str, no_browser: bool, timeout: u64) -> Result<()> {
+    if provider != "openrouter" {
+        bail!("only openrouter supports browser login; use `middleman provider add {provider}`");
+    }
+    let preset = preset_or_bail(provider)?;
+    let key = browser_login(no_browser, Duration::from_secs(timeout.max(10))).await?;
+    let info = onboard::validate_key(preset.api, preset.base_url, preset.balance, &key).await?;
+    note!("Logged in: {}", info.summary());
+    let source = store(provider, &key)?;
+    match std::fs::read_to_string(cfg_path) {
+        Ok(text) => {
+            let new = onboard::upsert_provider(&text, provider, Some(source))?;
+            onboard::write_config(cfg_path, &new)?;
+            note!("Updated {}.", pretty(cfg_path));
+        }
+        Err(_) => note!("No config yet: run `middleman init` to finish setting up."),
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- setup claude
+
 #[allow(clippy::too_many_arguments)]
-fn init(
+fn setup_claude(
+    cfg_path: &Path,
+    scope: &str,
+    dry_run: bool,
+    yes: bool,
+    undo: bool,
+    statusline: bool,
+    hook: bool,
+    claude_md: bool,
+    permissions: bool,
+) -> Result<()> {
+    let home = home();
+    if undo {
+        for l in claude_setup::undo(&claude_setup::backups_root(&home))? {
+            say!("{l}");
+        }
+        say!("Restart Claude Code to pick up the change.");
+        return Ok(());
+    }
+    let scope = Scope::parse(scope).context("--scope must be user or project")?;
+    let config_path = std::path::absolute(cfg_path).unwrap_or_else(|_| cfg_path.to_path_buf());
+    if !config_path.exists() {
+        note!(
+            "warning: no config at {} yet; run `middleman init` or the statusline will show ✗",
+            pretty(&config_path)
+        );
+    }
+    let o = SetupOptions {
+        scope,
+        home: home.clone(),
+        project_dir: cwd(),
+        exe: std::env::current_exe().context("cannot find the middleman binary")?,
+        config_path,
+        hook,
+        statusline,
+        claude_md,
+        permissions,
+    };
+    let plan = claude_setup::plan(&o)?;
+    say!("{}", plan.render().trim_end());
+    if plan.is_empty() {
+        return Ok(());
+    }
+    if dry_run {
+        say!("(dry run: nothing was changed)");
+        return Ok(());
+    }
+    if !yes {
+        if !interactive() {
+            bail!("re-run with --yes to apply without a prompt (or --dry-run to only look)");
+        }
+        let ok = dialoguer::Confirm::with_theme(&theme())
+            .with_prompt("Apply these changes? (every file is backed up first)")
+            .default(true)
+            .interact()?;
+        if !ok {
+            say!("Nothing changed.");
+            return Ok(());
+        }
+    }
+    for l in claude_setup::apply(&plan, &claude_setup::backups_root(&home))? {
+        say!("{l}");
+    }
+    say!("Done. Restart Claude Code (or run /mcp) to load middleman; `middleman doctor` checks everything.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------- init
+
+fn parse_mode(m: &str) -> Result<RoutingMode> {
+    Ok(match m {
+        "auto" => RoutingMode::Auto,
+        "confirm" => RoutingMode::Confirm,
+        "explicit" => RoutingMode::Explicit,
+        _ => bail!("mode must be auto, confirm or explicit"),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn init(
     cfg_path: PathBuf,
     scope: Option<String>,
     providers: Option<String>,
@@ -382,96 +948,170 @@ fn init(
     force: bool,
     apply: bool,
 ) -> Result<()> {
-    let keys = setup::detect_keys();
-    let found: Vec<&str> = keys.iter().filter(|k| k.2).map(|k| k.0).collect();
-    let scope = match scope {
-        Some(s) => s,
-        None if yes => "user".into(),
-        None => ask(
-            "Install scope: user (all projects) or project (this repo)?",
-            "user",
-        ),
-    };
-    let scope = Scope::parse(&scope).context("scope must be user|project")?;
-    let default_providers = if found.is_empty() {
-        "yapayzekalab".to_string()
-    } else {
-        found.join(",")
-    };
-    let providers = match providers {
-        Some(p) => p,
-        None if yes => default_providers,
-        None => {
-            let _ = writeln!(
-                std::io::stderr(),
-                "Presets (key env var found = yes/no, values never shown):"
-            );
-            for (name, env, ok) in &keys {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "  {name:<14} {env:<20} {}",
-                    if *ok { "yes" } else { "no" }
-                );
-            }
-            ask("Providers (comma-separated)", &default_providers)
-        }
-    };
-    let mode = match mode {
-        Some(m) => m,
-        None if yes => "auto".into(),
-        None => ask("Routing mode: auto | confirm | explicit", "auto"),
-    };
-    let mode = match mode.as_str() {
-        "auto" => RoutingMode::Auto,
-        "confirm" => RoutingMode::Confirm,
-        "explicit" => RoutingMode::Explicit,
-        _ => bail!("mode must be auto|confirm|explicit"),
-    };
-    let exe = std::env::current_exe()?;
-    let o = InitOptions {
-        scope,
-        providers: providers
+    let ask = !yes && interactive();
+    let mut key_sources = std::collections::BTreeMap::new();
+    let providers: Vec<String> = match providers {
+        Some(p) => p
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect(),
+        None if ask => {
+            let preset = pick_preset()?;
+            if let Some(env) = preset.key_env {
+                let has_env = std::env::var_os(env).is_some_and(|v| !v.is_empty());
+                let use_env = has_env
+                    && dialoguer::Confirm::with_theme(&theme())
+                        .with_prompt(format!(
+                            "{env} is set in this shell. Use it instead of storing a key?"
+                        ))
+                        .default(false)
+                        .interact()?;
+                if !use_env {
+                    let key = obtain_key(preset, KeyHow::Ask, false).await?;
+                    key_sources.insert(preset.name.to_string(), store(preset.name, &key)?);
+                }
+            }
+            vec![preset.name.to_string()]
+        }
+        None => {
+            let found: Vec<String> = setup::detect_keys()
+                .into_iter()
+                .filter(|k| k.2)
+                .map(|k| k.0.to_string())
+                .collect();
+            if found.is_empty() {
+                vec!["openrouter".into()]
+            } else {
+                found
+            }
+        }
+    };
+    for p in &providers {
+        preset_or_bail(p)?;
+    }
+    let scope = match scope {
+        Some(s) => Scope::parse(&s).context("--scope must be user or project")?,
+        None if ask => {
+            let i = dialoguer::Select::with_theme(&theme())
+                .with_prompt("Where should middleman apply?")
+                .items([
+                    "All my projects (user scope)",
+                    "Only this project (writes .middleman.toml here)",
+                ])
+                .default(0)
+                .interact()?;
+            if i == 0 {
+                Scope::User
+            } else {
+                Scope::Project
+            }
+        }
+        None => Scope::User,
+    };
+    let mode = match mode {
+        Some(m) => parse_mode(&m)?,
+        None if ask => {
+            let i = dialoguer::Select::with_theme(&theme())
+                .with_prompt("When may Claude delegate?")
+                .items([
+                    "auto      when it is safe and pays off (recommended)",
+                    "confirm   show me the plan and ask first",
+                    "explicit  only when I start a prompt with `cheap:`",
+                ])
+                .default(0)
+                .interact()?;
+            [
+                RoutingMode::Auto,
+                RoutingMode::Confirm,
+                RoutingMode::Explicit,
+            ][i]
+        }
+        None => RoutingMode::Auto,
+    };
+    let o = InitOptions {
+        scope,
+        providers: providers.clone(),
         mode,
         roots: if root.is_empty() { vec![cwd()] } else { root },
-        config_path: cfg_path,
+        config_path: cfg_path.clone(),
         project_dir: cwd(),
-        exe: exe.clone(),
         force,
+        key_sources: key_sources.clone(),
     };
+    let existed = cfg_path.exists();
     for l in setup::init_write(&o)? {
         say!("{l}");
     }
-    say!(
-        "\nRegister the MCP server ({} scope):\n  {}",
-        scope.as_str(),
-        setup::mcp_add_command(scope, &exe, &o.config_path)
-    );
-    say!(
-        "\nOptional UserPromptSubmit hook (merge into {}):\n{}",
-        setup::settings_path(scope, &o.project_dir).display(),
-        serde_json::to_string_pretty(&setup::hook_snippet(&exe, &o.config_path))?
-    );
-    say!("\nThen run `middleman models refresh` and `middleman doctor`.");
-    if apply {
-        for l in setup::init_apply(&o)? {
-            say!("{l}");
+    if existed && !force {
+        // keep the user's config, but record any key we just stored
+        let mut text = std::fs::read_to_string(&cfg_path)?;
+        for (name, src) in &key_sources {
+            text = onboard::upsert_provider(&text, name, Some(*src))?;
         }
-    } else {
-        say!("(nothing was changed in Claude Code settings; re-run with --apply to do that)");
+        if !key_sources.is_empty() {
+            onboard::write_config(&cfg_path, &text)?;
+            say!("recorded the stored key in {}", pretty(&cfg_path));
+        }
     }
+    for p in &providers {
+        if key_sources.contains_key(p) {
+            continue;
+        }
+        if let Some(env) = preset_or_bail(p)?.key_env {
+            if std::env::var_os(env).is_none() {
+                say!("no key for {p} yet: run `middleman provider add {p}`");
+            }
+        }
+    }
+    let wire = apply
+        || (ask
+            && dialoguer::Confirm::with_theme(&theme())
+                .with_prompt("Connect middleman to Claude Code now? (shows every change first)")
+                .default(true)
+                .interact()?);
+    if wire {
+        say!("");
+        setup_claude(
+            &cfg_path,
+            scope.as_str(),
+            false,
+            apply,
+            false,
+            true,
+            true,
+            true,
+            true,
+        )?;
+    } else {
+        say!("Next: `middleman setup claude` connects it to Claude Code.");
+    }
+    say!("Then `middleman models refresh` fetches current prices, and `middleman doctor` checks it all.");
     Ok(())
 }
 
 async fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse();
-    let cfg_path = cli.config.unwrap_or_else(default_config_path);
+    let cfg_path = cli
+        .config
+        .map(|p| expand_tilde(&p))
+        .unwrap_or_else(default_config_path);
     match cli.cmd {
         Cmd::Route { hook: true, .. } => {
             route_hook(&cfg_path);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Cmd::Statusline => {
+            say!("{}", middleman::statusline::run(&cfg_path));
+            return Ok(ExitCode::SUCCESS);
+        }
+        Cmd::Completions { shell } => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "middleman",
+                &mut std::io::stdout(),
+            );
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Route { text, hook: false } => {
@@ -520,7 +1160,97 @@ async fn real_main() -> Result<ExitCode> {
                 }
                 return Ok(ExitCode::SUCCESS);
             }
-            init(cfg_path, scope, providers, mode, root, yes, force, apply)?;
+            init(cfg_path, scope, providers, mode, root, yes, force, apply).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Cmd::Provider { action } => {
+            return match action {
+                ProviderCmd::Add {
+                    name,
+                    key_stdin,
+                    login,
+                    no_validate,
+                } => {
+                    let how = if login {
+                        KeyHow::Login
+                    } else if key_stdin {
+                        KeyHow::Stdin
+                    } else {
+                        KeyHow::Ask
+                    };
+                    provider_add(&cfg_path, name, how, no_validate, false).await?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                ProviderCmd::Rotate {
+                    name,
+                    key_stdin,
+                    login,
+                    no_validate,
+                } => {
+                    let how = if login {
+                        KeyHow::Login
+                    } else if key_stdin {
+                        KeyHow::Stdin
+                    } else {
+                        KeyHow::Ask
+                    };
+                    provider_add(&cfg_path, Some(name), how, no_validate, true).await?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                ProviderCmd::List => {
+                    provider_list(&cfg_path)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                ProviderCmd::Test { name } => provider_test(&cfg_path, &name).await,
+                ProviderCmd::Remove { name, yes } => {
+                    provider_remove(&cfg_path, &name, yes)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+            };
+        }
+        Cmd::Login {
+            provider,
+            no_browser,
+            timeout,
+        } => {
+            login(&cfg_path, &provider, no_browser, timeout).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Cmd::Setup {
+            target:
+                SetupTarget::Claude {
+                    scope,
+                    dry_run,
+                    yes,
+                    undo,
+                    no_statusline,
+                    no_hook,
+                    no_claude_md,
+                    no_permissions,
+                },
+        } => {
+            setup_claude(
+                &cfg_path,
+                &scope,
+                dry_run,
+                yes,
+                undo,
+                !no_statusline,
+                !no_hook,
+                !no_claude_md,
+                !no_permissions,
+            )?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Cmd::Watch { tail, no_follow } => {
+            let state = Config::load(&cfg_path)
+                .map(|c| c.state_dir())
+                .unwrap_or_else(|_| expand_tilde(Path::new("~/.local/state/middleman")));
+            let path = state.join("ledger.jsonl");
+            tokio::task::spawn_blocking(move || {
+                middleman::watch::run(&path, tail, !no_follow, &mut std::io::stdout())
+            })
+            .await??;
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Usage {
@@ -538,7 +1268,7 @@ async fn real_main() -> Result<ExitCode> {
                 .unwrap_or_default();
             let since = middleman::report::parse_since(&since)?;
             if !["model", "day", "project", "session", "agent"].contains(&by.as_str()) {
-                bail!("--by model|day|project|session|agent");
+                bail!("--by must be model, day, project, session or agent");
             }
             let msgs = middleman::usage::load(&ucfg, since);
             let r = middleman::usage::build(&ucfg, &msgs, since, &by, &ledger);
@@ -572,22 +1302,17 @@ async fn real_main() -> Result<ExitCode> {
                 say!("{}", middleman::tune::render_text(&t));
             }
             if apply {
-                let p = middleman::config::expand_tilde(Path::new("~/.claude/settings.json"));
+                let p = expand_tilde(Path::new("~/.claude/settings.json"));
                 say!("{}", middleman::tune::apply(&p, &t.settings_snippet)?);
             }
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Doctor => {
-            let checks = setup::doctor(&cfg_path, &cwd()).await;
+            let checks = setup::doctor(&cfg_path, &cwd(), &home()).await;
             let mut ok = true;
             for c in &checks {
-                say!(
-                    "{} {:<32} {}",
-                    if c.ok { "[ok]  " } else { "[FAIL]" },
-                    c.name,
-                    c.detail
-                );
-                ok &= c.ok || c.name == "hook installed" || c.name == "MCP registered";
+                say!("{} {:<32} {}", c.label(), c.name, c.detail);
+                ok &= c.ok || c.optional;
             }
             return Ok(if ok {
                 ExitCode::SUCCESS
@@ -620,9 +1345,14 @@ async fn real_main() -> Result<ExitCode> {
             declared,
             instructions,
         } => {
-            let task_kind = TaskKind::parse(&task_kind).context("unknown task kind")?;
+            let task_kind = TaskKind::parse(&task_kind).with_context(|| {
+                format!(
+                    "unknown task kind {task_kind:?}; one of {}",
+                    TaskKind::ALL.map(|k| k.as_str()).join(", ")
+                )
+            })?;
             let declared = Declared::parse(&declared)
-                .context("declared must be public|internal|confidential")?;
+                .context("--declared must be public, internal or confidential")?;
             let pipeline = Pipeline::new_offline(cfg)?;
             let mut req = DelegateRequest::simple(task_kind, &instructions, declared);
             req.files = files
@@ -646,25 +1376,25 @@ async fn real_main() -> Result<ExitCode> {
             let refresh = match action.as_deref() {
                 None | Some("list") => false,
                 Some("refresh") => true,
-                Some(other) => bail!("unknown models action {other} (list|refresh)"),
+                Some(other) => bail!("unknown models action {other:?} (list or refresh)"),
             };
             let pipeline = Pipeline::new(cfg)?;
             let Some(c) = pipeline.catalog(refresh).await else {
-                bail!("no catalog available");
+                bail!("no model catalog yet: run `middleman models refresh`");
             };
             for e in &c.errors {
-                say!("error: {e}");
+                say!("error: {}", clean(e, 300));
             }
             if all {
                 for m in &c.models {
                     say!(
                         "{}/{} in={} out={} ctx={:?} modality={:?}",
-                        m.provider,
-                        m.info.id,
+                        clean(&m.provider, 30),
+                        clean(&m.info.id, 80),
                         fmt_price(m.info.price_in_per_1m),
                         fmt_price(m.info.price_out_per_1m),
                         m.info.context_length,
-                        m.info.modality
+                        m.info.modality.as_deref().map(|s| clean(s, 30))
                     );
                 }
             } else {
@@ -680,14 +1410,14 @@ async fn real_main() -> Result<ExitCode> {
                 for m in v {
                     say!(
                         "{:<14} {:<40} in ${:>7}/1M out ${:>7}/1M ctx={:<8} tags={}{}",
-                        m.provider,
-                        m.id,
+                        clean(&m.provider, 14),
+                        clean(&m.id, 80),
                         fmt_price(m.prices.map(|p| p.in_per_1m)),
                         fmt_price(m.prices.map(|p| p.out_per_1m)),
                         m.context
                             .map(|c| c.to_string())
                             .unwrap_or_else(|| "?".into()),
-                        m.tags.join(","),
+                        clean(&m.tags.join(","), 80),
                         if m.prices.is_none() {
                             "  (price unknown: ineligible)"
                         } else {
@@ -715,20 +1445,20 @@ async fn real_main() -> Result<ExitCode> {
             for x in e.iter().rev().take(tail).rev() {
                 say!(
                     "{} #{} {:<14} {}/{} {} [{}] cost=${:.6} ({}) net=${:.5} tok={:?}/{:?} {}ms {}",
-                    x.ts,
+                    clean(&x.ts, 40),
                     x.attempt,
-                    x.status,
-                    x.provider,
-                    x.model,
-                    x.task_kind,
-                    x.write_mode,
+                    clean(&x.status, 14),
+                    clean(&x.provider, 30),
+                    clean(&x.model, 80),
+                    clean(&x.task_kind, 20),
+                    clean(&x.write_mode, 10),
                     x.cost_usd,
-                    x.cost_source,
+                    clean(&x.cost_source, 10),
                     x.net_savings_usd,
                     x.input_tokens,
                     x.output_tokens,
                     x.latency_ms.unwrap_or(0),
-                    x.block_reason_category.as_deref().unwrap_or("")
+                    clean(x.block_reason_category.as_deref().unwrap_or(""), 40)
                 );
             }
             let w = l.window()?;
@@ -754,7 +1484,7 @@ async fn real_main() -> Result<ExitCode> {
         } => {
             let since = middleman::report::parse_since(&since)?;
             let by = middleman::report::By::parse(&by)
-                .context("--by model|provider|task|day|project")?;
+                .context("--by must be model, provider, task, day or project")?;
             let l = middleman::ledger::Ledger::new(&cfg.state_dir())?;
             let es = l.entries()?;
             if let Some(path) = html {
@@ -770,6 +1500,12 @@ async fn real_main() -> Result<ExitCode> {
         }
         Cmd::Route { .. }
         | Cmd::Init { .. }
+        | Cmd::Provider { .. }
+        | Cmd::Login { .. }
+        | Cmd::Setup { .. }
+        | Cmd::Statusline
+        | Cmd::Watch { .. }
+        | Cmd::Completions { .. }
         | Cmd::Doctor
         | Cmd::Usage { .. }
         | Cmd::Tune { .. } => unreachable!(),

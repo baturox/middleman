@@ -1,6 +1,7 @@
 # CLAUDE.md block for middleman
 
-Paste the block below into `~/.claude/CLAUDE.md` (all projects) or a project's `CLAUDE.md`.
+`middleman setup claude` adds the block below to `~/.claude/CLAUDE.md` (or the project's
+`CLAUDE.md` with `--scope project`). To do it by hand, paste it there yourself.
 
 ```markdown
 ## Delegating to middleman (cheap untrusted models)

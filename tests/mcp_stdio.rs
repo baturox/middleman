@@ -66,14 +66,21 @@ fn mcp_session_over_stdio() {
     assert_eq!(names, vec!["delegate_task", "middleman_status"]);
     assert_eq!(by_id(3)["result"], json!({}));
 
+    let summary = by_id(4)["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(summary.starts_with("middleman: "), "{summary}");
+    assert!(!summary.contains('\n'));
     let dry: Value =
-        serde_json::from_str(by_id(4)["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        serde_json::from_str(by_id(4)["result"]["content"][1]["text"].as_str().unwrap()).unwrap();
     assert_eq!(dry["dry_run"], true);
     let user = dry["sanitized_payload"]["user"].as_str().unwrap();
     assert!(!user.to_lowercase().contains("acme"), "{user}");
 
+    assert!(by_id(5)["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("middleman: blocked ("));
     let blocked: Value =
-        serde_json::from_str(by_id(5)["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        serde_json::from_str(by_id(5)["result"]["content"][1]["text"].as_str().unwrap()).unwrap();
     assert_eq!(blocked["status"], "blocked");
     assert!(!blocked.to_string().contains("AKIA"));
 

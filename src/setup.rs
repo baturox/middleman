@@ -1,16 +1,16 @@
-//! `middleman init` and `middleman doctor`.
+//! `middleman init` (config files) and `middleman doctor`.
 //!
-//! `init` writes middleman's own config files and PRINTS the Claude Code wiring (the
-//! `claude mcp add` command and the UserPromptSubmit hook snippet). It touches Claude Code
-//! settings only with `--apply`, which the user runs themselves.
+//! `init` writes middleman's own config files only. Wiring Claude Code (MCP server, hook,
+//! statusline, CLAUDE.md) is `middleman setup claude` (see `claude_setup`), which `init`
+//! offers to run at the end.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
-use serde_json::{json, Value};
 
-use crate::config::{expand_tilde, BalanceKind, Config, RoutingMode, PROJECT_FILE};
+use crate::config::{BalanceKind, Config, KeySource, RoutingMode, PROJECT_FILE};
 use crate::providers::presets::{self, PRESETS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -42,8 +42,9 @@ pub struct InitOptions {
     pub roots: Vec<PathBuf>,
     pub config_path: PathBuf,
     pub project_dir: PathBuf,
-    pub exe: PathBuf,
     pub force: bool,
+    /// Providers whose key was stored by `init` (written as `key_source`).
+    pub key_sources: BTreeMap<String, KeySource>,
 }
 
 /// Which preset key env vars exist (never their values).
@@ -90,10 +91,16 @@ pub fn render_user_config(o: &InitOptions) -> Result<String> {
             bail!("unknown preset {name} (see `middleman init --list`)");
         };
         s.push_str(&format!("[providers.{name}]\npreset = \"{name}\"\n"));
-        if let Some(k) = p.key_env {
+        if let Some(src) = o.key_sources.get(name) {
+            s.push_str(&format!(
+                "key_source = \"{}\"   # stored by middleman; {} still wins when set\n",
+                src.as_str(),
+                p.key_env.unwrap_or("the env var")
+            ));
+        } else if let Some(k) = p.key_env {
             if std::env::var_os(k).is_none() {
                 s.push_str(&format!(
-                    "# {k} is not set in this environment; either export it or point at a file:\n# key_file = \"/path/to/.env\"\n"
+                    "# no key yet: run `middleman provider add {name}` (stores it in the OS keychain) or export {k}\n"
                 ));
             }
         }
@@ -112,74 +119,6 @@ pub fn render_project_overlay(mode: RoutingMode) -> String {
 [routing]\nmode = \"{}\"\n\n[paths]\ndeny = []\n",
         format!("{mode:?}").to_lowercase()
     )
-}
-
-pub fn mcp_add_command(scope: Scope, exe: &Path, config: &Path) -> String {
-    format!(
-        "claude mcp add middleman --scope {} -- {} mcp --config {}",
-        scope.as_str(),
-        exe.display(),
-        config.display()
-    )
-}
-
-pub fn hook_command(exe: &Path, config: &Path) -> String {
-    format!(
-        "{} route --hook --config {}",
-        exe.display(),
-        config.display()
-    )
-}
-
-pub fn hook_snippet(exe: &Path, config: &Path) -> Value {
-    json!({
-        "hooks": {
-            "UserPromptSubmit": [
-                {"hooks": [{"type": "command", "command": hook_command(exe, config), "timeout": 5}]}
-            ]
-        }
-    })
-}
-
-/// Merge our hook into a Claude Code settings object (idempotent).
-pub fn merge_hook(mut settings: Value, command: &str) -> Value {
-    if !settings.is_object() {
-        settings = json!({});
-    }
-    let hooks = settings
-        .as_object_mut()
-        .expect("object")
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
-    if !hooks.is_object() {
-        *hooks = json!({});
-    }
-    let ups = hooks
-        .as_object_mut()
-        .expect("object")
-        .entry("UserPromptSubmit")
-        .or_insert_with(|| json!([]));
-    if !ups.is_array() {
-        *ups = json!([]);
-    }
-    let arr = ups.as_array_mut().expect("array");
-    let present = arr.iter().any(|g| {
-        g.get("hooks").and_then(|h| h.as_array()).is_some_and(|h| {
-            h.iter()
-                .any(|x| x.get("command").and_then(|c| c.as_str()) == Some(command))
-        })
-    });
-    if !present {
-        arr.push(json!({"hooks": [{"type": "command", "command": command, "timeout": 5}]}));
-    }
-    settings
-}
-
-pub fn settings_path(scope: Scope, project_dir: &Path) -> PathBuf {
-    match scope {
-        Scope::User => expand_tilde(Path::new("~/.claude/settings.json")),
-        Scope::Project => project_dir.join(".claude").join("settings.json"),
-    }
 }
 
 fn write_new(path: &Path, text: &str, force: bool, log: &mut Vec<String>) -> Result<()> {
@@ -213,43 +152,30 @@ pub fn init_write(o: &InitOptions) -> Result<Vec<String>> {
     Ok(log)
 }
 
-/// `--apply`: register the MCP server via the `claude` CLI and merge the hook into settings.
-/// A timestamped backup of the settings file is written first.
-pub fn init_apply(o: &InitOptions) -> Result<Vec<String>> {
-    let mut log = Vec::new();
-    let status = std::process::Command::new("claude")
-        .args(["mcp", "add", "middleman", "--scope", o.scope.as_str(), "--"])
-        .arg(&o.exe)
-        .args(["mcp", "--config"])
-        .arg(&o.config_path)
-        .current_dir(&o.project_dir)
-        .status()
-        .context("cannot run `claude` CLI")?;
-    log.push(format!("claude mcp add -> {status}"));
-    let sp = settings_path(o.scope, &o.project_dir);
-    let cur: Value = match std::fs::read_to_string(&sp) {
-        Ok(t) => {
-            let backup = sp.with_extension(format!("json.bak-{}", crate::ledger::now_unix()));
-            std::fs::write(&backup, &t)?;
-            log.push(format!("backup {}", backup.display()));
-            serde_json::from_str(&t).context("settings file is not valid JSON; not modified")?
-        }
-        Err(_) => json!({}),
-    };
-    let merged = merge_hook(cur, &hook_command(&o.exe, &o.config_path));
-    if let Some(d) = sp.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    std::fs::write(&sp, serde_json::to_string_pretty(&merged)?)?;
-    log.push(format!("hook merged into {}", sp.display()));
-    Ok(log)
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct Check {
     pub name: String,
     pub ok: bool,
     pub detail: String,
+    /// A failed optional check is a warning (exit code stays 0).
+    pub optional: bool,
+}
+
+impl Check {
+    pub fn optional(name: impl Into<String>, ok: bool, detail: impl Into<String>) -> Check {
+        Check {
+            optional: true,
+            ..check(name, ok, detail)
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match (self.ok, self.optional) {
+            (true, _) => "[ok]  ",
+            (false, true) => "[warn]",
+            (false, false) => "[FAIL]",
+        }
+    }
 }
 
 fn check(name: impl Into<String>, ok: bool, detail: impl Into<String>) -> Check {
@@ -257,20 +183,22 @@ fn check(name: impl Into<String>, ok: bool, detail: impl Into<String>) -> Check 
         name: name.into(),
         ok,
         detail: detail.into(),
+        optional: false,
     }
 }
 
-fn file_mentions(path: &Path, needle: &str) -> bool {
-    std::fs::read_to_string(path).is_ok_and(|t| t.contains(needle))
-}
-
 /// Green/red checklist. Network: `GET /models` and balance per enabled provider (free).
-pub async fn doctor(config_path: &Path, cwd: &Path) -> Vec<Check> {
+pub async fn doctor(config_path: &Path, cwd: &Path, home: &Path) -> Vec<Check> {
     let mut out = Vec::new();
     let (cfg, overlay) = match Config::load_with_project(config_path, cwd) {
         Ok(c) => c,
         Err(e) => {
-            out.push(check("config", false, format!("{e:#}")));
+            out.push(check(
+                "config",
+                false,
+                format!("{e:#} (run `middleman init` to create one)"),
+            ));
+            out.extend(crate::claude_setup::wiring_checks(home, cwd));
             return out;
         }
     };
@@ -310,14 +238,15 @@ pub async fn doctor(config_path: &Path, cwd: &Path) -> Vec<Check> {
             out.push(check(format!("provider {name}"), true, "disabled"));
             continue;
         }
-        let key_ok = p.key_present();
+        let status = p.key_status();
+        let key_ok = status.ok();
         out.push(check(
             format!("provider {name}: key"),
             key_ok,
             if key_ok {
-                "present (value not shown)"
+                format!("{} (value not shown)", status.describe())
             } else {
-                "missing"
+                format!("{}; run `middleman provider add {name}`", status.describe())
             },
         ));
         if !key_ok {
@@ -361,6 +290,33 @@ pub async fn doctor(config_path: &Path, cwd: &Path) -> Vec<Check> {
             }
         }
     }
+    let uses_keychain = cfg
+        .providers
+        .values()
+        .any(|p| p.enabled && p.key_source == Some(KeySource::Keychain));
+    match crate::keystore::keychain_status() {
+        Ok(()) => out.push(check(
+            "keychain",
+            true,
+            format!("{} available", crate::keystore::keychain_name()),
+        )),
+        Err(e) => out.push(Check {
+            optional: !uses_keychain,
+            ..check(
+                "keychain",
+                false,
+                format!(
+                    "{}: {e}{}",
+                    crate::keystore::keychain_name(),
+                    if uses_keychain {
+                        ""
+                    } else {
+                        " (keys will be stored in 0600 files instead)"
+                    }
+                ),
+            )
+        }),
+    }
     match crate::catalog::Catalog::load(&cfg) {
         Some(c) => out.push(check(
             "model catalog",
@@ -393,51 +349,13 @@ pub async fn doctor(config_path: &Path, cwd: &Path) -> Vec<Check> {
         )),
         Err(e) => out.push(check("binary", false, e.to_string())),
     }
-    let home_claude_json = expand_tilde(Path::new("~/.claude.json"));
-    let mcp = file_mentions(&home_claude_json, "\"middleman\"")
-        || file_mentions(&cwd.join(".mcp.json"), "\"middleman\"");
-    out.push(check(
-        "MCP registered",
-        mcp,
-        if mcp {
-            "found"
-        } else {
-            "not found; run the `claude mcp add` command from `middleman init`"
-        },
-    ));
-    let hook = [
-        settings_path(Scope::User, cwd),
-        settings_path(Scope::Project, cwd),
-        cwd.join(".claude").join("settings.local.json"),
-    ]
-    .iter()
-    .any(|p| file_mentions(p, "route --hook"));
-    out.push(check(
-        "hook installed",
-        hook,
-        if hook {
-            "found"
-        } else {
-            "not found (optional); see `middleman init` output"
-        },
-    ));
+    out.extend(crate::claude_setup::wiring_checks(home, cwd));
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn merge_hook_is_idempotent_and_preserves() {
-        let s = json!({"model": "x", "hooks": {"PreToolUse": [{"hooks": []}]}});
-        let m = merge_hook(s, "mm route --hook");
-        let m2 = merge_hook(m.clone(), "mm route --hook");
-        assert_eq!(m, m2);
-        assert_eq!(m["model"], "x");
-        assert!(m["hooks"]["PreToolUse"].is_array());
-        assert_eq!(m["hooks"]["UserPromptSubmit"].as_array().unwrap().len(), 1);
-    }
 
     #[test]
     fn init_writes_parseable_config() {
@@ -449,21 +367,22 @@ mod tests {
             roots: vec![d.path().to_path_buf()],
             config_path: d.path().join("cfg/config.toml"),
             project_dir: d.path().to_path_buf(),
-            exe: PathBuf::from("/bin/middleman"),
             force: false,
+            key_sources: [("openrouter".to_string(), KeySource::Keychain)].into(),
         };
         let log = init_write(&o).unwrap();
         assert_eq!(log.len(), 2);
         let c = Config::load(&o.config_path).unwrap();
         assert_eq!(c.routing.mode, RoutingMode::Confirm);
-        assert!(c.providers.contains_key("openrouter"));
+        assert_eq!(
+            c.providers["openrouter"].key_source,
+            Some(KeySource::Keychain)
+        );
         let (c2, f) = Config::load_with_project(&o.config_path, d.path()).unwrap();
         assert!(f.is_some());
         assert_eq!(c2.routing.mode, RoutingMode::Confirm);
         // second run does not overwrite
         let log = init_write(&o).unwrap();
         assert!(log[0].starts_with("exists"));
-        assert!(mcp_add_command(Scope::User, &o.exe, &o.config_path)
-            .starts_with("claude mcp add middleman --scope user -- /bin/middleman mcp --config"));
     }
 }

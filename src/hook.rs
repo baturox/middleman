@@ -1,6 +1,10 @@
 //! `middleman route [--hook]`: a local, no-network prompt classifier for Claude Code's
 //! UserPromptSubmit hook. It only adds context ("looks delegable" / "keep on Claude"); it
 //! never blocks the prompt and the hook path always exits 0.
+//!
+//! Output fields (<https://code.claude.com/docs/en/hooks>): `hookSpecificOutput.additionalContext`
+//! goes to Claude; the top-level `systemMessage` is a short line shown to the user, so they can
+//! see middleman acting in the session.
 
 use std::sync::LazyLock;
 
@@ -65,6 +69,8 @@ pub struct Advice {
     pub expected_output_tokens: Option<u64>,
     pub break_even_tokens: u64,
     pub message: Option<String>,
+    /// Short line for the user (hook `systemMessage`).
+    pub user_message: Option<String>,
 }
 
 pub fn explicit_prefix(prompt: &str) -> bool {
@@ -174,7 +180,7 @@ pub fn advise(
             ))
         } else {
             let mut m = format!(
-                "middleman: this looks delegable (kind={k}, ~{e} output tokens >= break-even {threshold}, est. {est:?}). Use mcp__middleman__delegate_task with file paths (not pasted code), write_mode=file and an output_path, an honest declared_sensitivity; then verify by running the tests, not by re-reading the file"
+                "middleman: this looks delegable (kind={k}, ~{e} output tokens >= break-even {threshold}, est. {est:?}). Use mcp__middleman__delegate_task with file paths (not pasted code), write_mode=file and an output_path, an honest declared_sensitivity; then read the returned diff (and any risk findings) before running the tests"
             );
             if explicit_request {
                 m.push_str("; the user asked explicitly, so pass user_requested=true");
@@ -195,6 +201,22 @@ pub fn advise(
     } else {
         None
     };
+    let user_message = message.as_ref().map(|_| {
+        if !topics.is_empty() {
+            format!("🛡 middleman: keep on Claude (sensitive: {})", topics.join(", "))
+        } else if large {
+            "🛡 middleman: prompt too large to delegate; Claude handles it".into()
+        } else if let (Some(k), true) = (kind, worth_it) {
+            format!(
+                "🛡 middleman: suggested delegating this {k} task (~{} output tokens) to a cheap model",
+                expected.unwrap_or(0)
+            )
+        } else if kind.is_some() {
+            "🛡 middleman: too small to delegate; Claude does it".into()
+        } else {
+            "🛡 middleman: delegation requested; Claude picks the task kind".into()
+        }
+    });
     Advice {
         kind,
         est_sensitivity: est,
@@ -205,6 +227,7 @@ pub fn advise(
         expected_output_tokens: expected,
         break_even_tokens: threshold,
         message,
+        user_message,
     }
 }
 
@@ -219,14 +242,31 @@ pub fn hook_output(
     let prompt = v.get("prompt")?.as_str()?;
     let a = advise(prompt, mode, dict, econ);
     let msg = a.message?;
-    Some(
-        json!({
-            "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
-                "additionalContext": msg,
-            }
-        })
-        .to_string(),
+    Some(render(&msg, a.user_message.as_deref()))
+}
+
+fn render(context: &str, user: Option<&str>) -> String {
+    let mut v = json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    });
+    if let Some(u) = user {
+        v["systemMessage"] = json!(u);
+    }
+    v.to_string()
+}
+
+/// Hook output when the config (user or project overlay) cannot be loaded: tell Claude not
+/// to delegate rather than silently falling back to defaults.
+pub fn hook_output_config_error(err: &str) -> String {
+    let short: String = crate::fsutil::clean(err, 160);
+    render(
+        &format!(
+            "middleman config invalid ({short}); do not delegate anything to middleman in this session. The user can run `middleman doctor`."
+        ),
+        Some("🛡 middleman ✗ config invalid; delegation disabled (run: middleman doctor)"),
     )
 }
 
@@ -307,6 +347,28 @@ mod tests {
         .unwrap();
         let v: Value = serde_json::from_str(&o).unwrap();
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit");
+        assert!(v["systemMessage"]
+            .as_str()
+            .unwrap()
+            .starts_with("🛡 middleman: suggested delegating this write_tests task"));
+        let o = hook_output(
+            r#"{"prompt":"fix the billing export"}"#,
+            RoutingMode::Auto,
+            None,
+            None,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&o).unwrap();
+        assert_eq!(
+            v["systemMessage"],
+            "🛡 middleman: keep on Claude (sensitive: billing)"
+        );
+        let v: Value =
+            serde_json::from_str(&hook_output_config_error("bad \u{1b}[31m overlay")).unwrap();
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(ctx.contains("do not delegate") && !ctx.contains('\u{1b}'));
         assert!(hook_output("not json", RoutingMode::Auto, None, None).is_none());
         assert!(hook_output("{}", RoutingMode::Auto, None, None).is_none());
     }
