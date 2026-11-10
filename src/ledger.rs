@@ -363,7 +363,10 @@ mod tests {
     fn project_id_is_salted_stable_and_names_no_directory() {
         let d = tempfile::tempdir().unwrap();
         let a = project_id(d.path(), Path::new("/w/acme-billing"));
-        assert!(a.starts_with("p-") && a.len() == 10 && !a.contains("acme"), "{a}");
+        assert!(
+            a.starts_with("p-") && a.len() == 10 && !a.contains("acme"),
+            "{a}"
+        );
         assert_eq!(a, project_id(d.path(), Path::new("/w/acme-billing")));
         assert_ne!(a, project_id(d.path(), Path::new("/w/other")));
         // another install (another salt) gives another id

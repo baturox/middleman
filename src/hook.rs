@@ -53,9 +53,24 @@ static KINDS: LazyLock<Vec<(TaskKind, Regex)>> = LazyLock::new(|| {
     ]
 });
 
+/// Topics that keep a prompt on Claude. Whole words only: `auth` means authentication or
+/// authorization (auth, authn, authz, oauth, login...), never author / authority; a token is
+/// sensitive only as a credential (api / access / refresh / bearer token, jwt), not as a
+/// lexer or LLM token. Turkish stems take their suffixes (`şifreyi`, `müşterinin`).
 static SENSITIVE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(auth\w*|login|log in|sign[- ]?in|passwords?|passwd|oauth|jwt|tokens?|credentials?|secrets?|api keys?|private keys?|billing|payments?|invoices?|stripe|checkout|customers?|pii|gdpr|kvkk|ssn|personal data|infra\w*|terraform|kubernetes|k8s|deploy\w*|prod|production|migrations?|encrypt\w*|crypto\w*|[şs]ifre|parola|[öo]deme|fatura|m[üu][şs]teri|kimlik|giri[şs])\b")
-        .expect("static regex")
+    Regex::new(concat!(
+        r"(?i)\b(",
+        r"auth|authn|authz|authenticat\w*|authori[sz]\w*|oauth\d*|login|logins|log ?in|logout|sign[- ]?in|sso|",
+        r"(?:api|access|refresh|auth|bearer|session|id|csrf|personal access)[ _-]?tokens?|bearer|jwts?|",
+        r"passwords?|passwd|credentials?|secrets?|api[ _-]?keys?|private[ _-]?keys?|",
+        r"billing|payments?|invoices?|stripe|checkout (?:page|flow|form|session)s?|customers?|",
+        r"pii|gdpr|kvkk|ssn|personal data|",
+        r"infra|infrastructure|terraform|kubernetes|k8s|deploy|deploys|deployed|deploying|deployments?|prod|production|migrations?|",
+        r"encrypt\w*|decrypt\w*|crypto\w*|",
+        r"[şs]ifre\w*|parola\w*|[öo]deme\w*|fatura\w*|m[üu][şs]teri\w*|kimlik\w*|yetkilendirme\w*|oturum a[çc]\w*|giri[şs] (?:yap|sayfa|ekran)\w*",
+        r")\b"
+    ))
+    .expect("static regex")
 });
 
 #[derive(Debug, Clone, Serialize)]
@@ -320,6 +335,68 @@ mod tests {
                     "{m:?} {p}: {msg}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn sensitive_topics_table() {
+        // (prompt, sensitive?)
+        let table: &[(&str, bool)] = &[
+            // false positives the old keyword list produced
+            ("add the author field to the Book struct", false),
+            ("who authored this module? write a summary", false),
+            (
+                "the authority column is nullable; write tests for it",
+                false,
+            ),
+            ("explain how the tokenizer splits tokens", false),
+            ("count the tokens in this prompt", false),
+            ("write tests for the lexer's next_token()", false),
+            ("summarize the token budget section of the README", false),
+            ("rename `authors` to `contributors` in Cargo.toml", false),
+            (
+                "git checkout the main branch and summarize the changes",
+                false,
+            ),
+            ("write docstrings for the parser module", false),
+            ("translate the README to German", false),
+            ("generate boilerplate for a CLI subcommand", false),
+            ("bu modül için birim test yaz", false),
+            ("README dosyasını özetle", false),
+            ("yazar alanını Book yapısına ekle", false),
+            ("token sayısını hesaplayan fonksiyonu açıkla", false),
+            ("bu fonksiyona giriş parametresi ekle", false),
+            ("dokümantasyona bir giriş bölümü yaz", false),
+            // true positives
+            ("fix the auth middleware", true),
+            ("add OAuth2 login with Google", true),
+            ("write tests for authentication", true),
+            ("check the authorization header handling", true),
+            ("rotate the api token in the config", true),
+            ("the access token expires too early", true),
+            ("store the refresh token in a cookie", true),
+            ("validate the JWT signature", true),
+            ("send a Bearer header", true),
+            ("hash the user passwords with argon2", true),
+            ("write tests for the billing export", true),
+            ("deploy to production on friday", true),
+            ("add a terraform module for the bucket", true),
+            ("encrypt the backups", true),
+            ("şifreyi sıfırlama akışını düzelt", true),
+            ("müşterinin ödeme ekranını düzelt", true),
+            ("fatura PDF'ini oluşturan kodu açıkla", true),
+            ("kimlik doğrulama için test yaz", true),
+            ("giriş sayfasındaki hatayı düzelt", true),
+        ];
+        assert!(table.len() >= 30);
+        for (p, want) in table {
+            let a = adv(p, RoutingMode::Auto);
+            assert_eq!(
+                !a.sensitive_topics.is_empty(),
+                *want,
+                "{p}: {:?}",
+                a.sensitive_topics
+            );
         }
     }
 
