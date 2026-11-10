@@ -120,10 +120,21 @@ impl Catalog {
 
     pub fn save(&self, cfg: &Config) -> Result<()> {
         let dir = cfg.cache_dir();
-        std::fs::create_dir_all(&dir)?;
-        let tmp = dir.join("models.json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(tmp, Self::cache_path(cfg))?;
+        // private, like the state dir: 0700 directory, 0600 file
+        crate::ledger::ensure_private_dir(&dir)?;
+        crate::fsutil::write_atomic(
+            &Self::cache_path(cfg),
+            &serde_json::to_vec_pretty(self)?,
+            Some(0o600),
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                Self::cache_path(cfg),
+                std::fs::Permissions::from_mode(0o600),
+            )?;
+        }
         Ok(())
     }
 

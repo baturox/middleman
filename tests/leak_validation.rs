@@ -5,8 +5,8 @@
 //! ("Zephyrine"), product ("QuasarLedger"), user ("mkaraca"), internal hosts, emails, IPs and
 //! home paths. Requests run through the real pipeline; every byte wiremock receives is checked.
 //!
-//! Tests marked `// LEAK:` document a current leak; each has an `#[ignore]` twin that must pass
-//! once the leak is fixed (`cargo test --test leak_validation -- --ignored`).
+//! The `fixed_*` tests guard leaks found by the first validation run (see the doc) and fixed
+//! since; `RISK` comments mark what is still sent by design.
 //!
 //! No test here talks to a real provider. See docs/LEAK-VALIDATION.md for the results.
 
@@ -612,7 +612,8 @@ async fn canary_never_leaves_for_any_task_kind_in_both_wire_formats() {
             let (_, user) = prompt_of(r);
             // surrogates, not blanks: the provider sees a coherent program
             assert!(user.contains("example.net") && user.contains("198.51.100."));
-            assert!(user.contains("/home/user1/work/"));
+            // a home path is replaced whole, not just `/Users/<name>`
+            assert!(user.contains("/home/user1 ") && !user.contains("/work/"));
         }
     }
 }
@@ -750,22 +751,23 @@ async fn only_requested_files_and_line_ranges_are_sent() {
     assert!(canaries_in_request(&sent[0]).is_empty());
     let (_, user) = prompt_of(&sent[0]);
     let headers: Vec<&str> = user.lines().filter(|l| l.starts_with("--- ")).collect();
+    // file names are pseudonymized: conventional top dir and extension kept
     assert_eq!(
         headers,
         vec![
-            "--- FILE src/egress.rs (from line 18) ---",
-            "--- FILE src/includes.rs (from line 1) ---",
-            "--- FILE src/tenant.rs (from line 5) ---",
+            "--- FILE src/f1.rs (from line 18) ---",
+            "--- FILE src/f2.rs (from line 1) ---",
+            "--- FILE src/f3.rs (from line 5) ---",
             "--- END ---",
         ]
     );
     // the slice is byte-exact and nothing around it came along
     let slice = lines(&egress, 18, 52);
     let start = user
-        .find("--- FILE src/egress.rs (from line 18) ---\n")
+        .find("--- FILE src/f1.rs (from line 18) ---\n")
         .unwrap()
-        + "--- FILE src/egress.rs (from line 18) ---\n".len();
-    let end = user.find("\n\n--- FILE src/includes.rs").unwrap();
+        + "--- FILE src/f1.rs (from line 18) ---\n".len();
+    let end = user.find("\n\n--- FILE src/f2.rs").unwrap();
     assert_eq!(&user[start..end], slice);
     assert!(!user.contains("use crate::pseudo::Vault;")); // line 16
     assert!(!user.contains("pub fn seal(")); // line 54
@@ -825,10 +827,7 @@ async fn company_name_in_a_relative_path_is_pseudonymized() {
     assert!(canaries_in_request(&sent[0]).is_empty());
     let (_, user) = prompt_of(&sent[0]);
     let header = user.lines().find(|l| l.starts_with("--- FILE")).unwrap();
-    assert!(
-        header.ends_with("/billing.rs (from line 1) ---"),
-        "{header}"
-    );
+    assert_eq!(header, "--- FILE d1/f1.rs (from line 1) ---");
 }
 
 /// PASS: an absolute path is sent root-relative; the root (`.../zephyrine-corp/quasarledger`)
@@ -849,29 +848,14 @@ async fn absolute_path_is_sent_root_relative() {
     let sent = posts(&s).await;
     assert!(canaries_in_request(&sent[0]).is_empty());
     let (_, user) = prompt_of(&sent[0]);
-    assert!(user.contains("--- FILE src/egress.rs (from line 18) ---"));
+    assert!(
+        user.contains("--- FILE src/f1.rs (from line 18) ---"),
+        "{user}"
+    );
     assert!(!user.contains("/private/") && !user.contains("/var/") && !user.contains("/tmp"));
 }
 
-// LEAK: directory and file names that are not dictionary terms are sent verbatim in the
-// `--- FILE <path> ---` header. Project layout and module names are visible to the provider.
 #[tokio::test]
-async fn leak_non_dictionary_path_components_are_sent_verbatim() {
-    let (s, _p, pl) = setup("openai").await;
-    assert_ok(
-        &pl.run(request(
-            TaskKind::Docstring,
-            "Add docs.",
-            vec![file("internal-fraud-engine/risk_scoring_v3.rs", None)],
-        ))
-        .await,
-    );
-    let (_, user) = prompt_of(&posts(&s).await[0]);
-    assert!(user.contains("--- FILE internal-fraud-engine/risk_scoring_v3.rs (from line 1) ---"));
-}
-
-#[tokio::test]
-#[ignore = "LEAK (open): path components are not pseudonymized; passes once they are"]
 async fn fixed_path_components_are_pseudonymized() {
     let (s, _p, pl) = setup("openai").await;
     assert_ok(
@@ -1000,34 +984,7 @@ async fn symlinks_parent_paths_and_dot_git_cannot_be_pulled_in() {
     assert!(posts(&s).await.is_empty());
 }
 
-// LEAK (low): `.gitmodules` and a submodule's `.git` pointer file are not on the read deny
-// list (`**/.git/**` only matches below a `.git` directory). When the caller names them they
-// are sent: host names are replaced, the submodule layout and repository paths are not.
 #[tokio::test]
-async fn leak_gitmodules_and_submodule_pointer_are_readable_when_named() {
-    let (s, _p, pl) = setup("openai").await;
-    for f in [".gitmodules", "vendor/sub/.git"] {
-        assert_ok(
-            &pl.run(request(
-                TaskKind::Summarize,
-                "Summarize.",
-                vec![file(f, None)],
-            ))
-            .await,
-        );
-    }
-    let sent = posts(&s).await;
-    assert_eq!(sent.len(), 2);
-    let (_, gm) = prompt_of(&sent[0]);
-    assert!(gm.contains("[submodule \"vendor/sub\"]"));
-    assert!(gm.contains(":platform/shared-protos.git"), "{gm}");
-    assert!(!gm.contains("git.zephyrine.dev"));
-    let (_, ptr) = prompt_of(&sent[1]);
-    assert!(ptr.contains("gitdir: ../../.git/modules/vendor/sub"));
-}
-
-#[tokio::test]
-#[ignore = "LEAK (open): .gitmodules / submodule .git pointer are readable; passes once denied"]
 async fn fixed_gitmodules_and_submodule_pointer_are_denied() {
     let (s, _p, pl) = setup("openai").await;
     for f in [".gitmodules", "vendor/sub/.git"] {
@@ -1115,24 +1072,7 @@ async fn x_title_is_sent_only_when_configured() {
     assert!(canaries_in_request(&sent[0]).is_empty());
 }
 
-// RISK: the default User-Agent names the tool, so the provider (and any TLS-terminating proxy)
-// knows a pseudonymizing delegation layer is in use. It names neither user nor company.
 #[tokio::test]
-async fn risk_default_user_agent_names_the_tool() {
-    let (s, _p, pl) = setup("openai").await;
-    assert_ok(&pl.run(canary_request(TaskKind::Docstring)).await);
-    let ua = posts(&s).await[0]
-        .headers
-        .get("user-agent")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-    assert_eq!(ua, "Mozilla/5.0 (compatible; middleman/0.1)");
-}
-
-#[tokio::test]
-#[ignore = "RISK (open): default User-Agent names the tool; passes once it is generic"]
 async fn fixed_default_user_agent_does_not_name_the_tool() {
     let (s, _p, pl) = setup("openai").await;
     assert_ok(&pl.run(canary_request(TaskKind::Docstring)).await);
@@ -1469,8 +1409,7 @@ async fn mixed_session(pl: &Pipeline) {
 }
 
 /// PASS: state dir 0700, every file in it 0600. The audit log holds sanitized payloads only.
-/// The ledger holds no payload at all; its only project-derived value is the root directory's
-/// base name in `project` (local file, used by `report --by project`).
+/// The ledger holds no payload at all; `project` is a salted hash of the root.
 #[tokio::test]
 async fn state_files_are_private_and_hold_no_originals() {
     let (_s, p, pl) = setup("openai").await;
@@ -1496,8 +1435,9 @@ async fn state_files_are_private_and_hold_no_originals() {
         } else if name == "ledger.jsonl" {
             for line in text.lines() {
                 let mut v: Value = serde_json::from_str(line).unwrap();
-                // RISK (local only): the root directory's base name
-                assert_eq!(v["project"], "quasarledger");
+                // a salted hash of the root, never its base name
+                let id = v["project"].as_str().unwrap().to_string();
+                assert!(id.starts_with("p-") && id.len() == 10, "{id}");
                 v.as_object_mut().unwrap().remove("project");
                 let hits = canaries_in(&v.to_string());
                 assert!(hits.is_empty(), "ledger: {hits:?}");
@@ -1514,8 +1454,7 @@ async fn state_files_are_private_and_hold_no_originals() {
 }
 
 /// PASS: `report`, the HTML dashboard, `watch`, the status line and `middleman_status` show
-/// counts, models and money. The only project-derived text is the `project` label of
-/// `report --by project`.
+/// counts, models and money; `report --by project` shows the hash (or the user's label).
 #[tokio::test]
 async fn report_watch_statusline_and_status_show_no_originals() {
     use middleman::report::{self, By};
@@ -1527,9 +1466,10 @@ async fn report_watch_statusline_and_status_show_no_originals() {
         let t = report::render_text(&report::build(&entries, None, By::parse(by).unwrap()));
         assert!(canaries_in(&t).is_empty(), "report --by {by}: {t}");
     }
+    // the project is a salted hash of its root, not the directory name
     let by_project = report::render_text(&report::build(&entries, None, By::Project));
-    let hits = canaries_in(&by_project);
-    assert!(!hits.is_empty() && hits.iter().all(|h| h.starts_with("skeleton:quasarledger")));
+    assert!(canaries_in(&by_project).is_empty(), "{by_project}");
+    assert!(by_project.contains("p-"), "{by_project}");
     assert!(canaries_in(&report::render_html(&entries, None)).is_empty());
 
     let mut buf = Vec::new();
@@ -1586,22 +1526,7 @@ async fn audit_block_reason_repeats_the_requested_path_locally() {
     assert!(audit.contains("path denied by rule **/.env*: zephyrine/.env"));
 }
 
-// RISK (low): the model catalog cache is world-readable (dir 0755, file 0644). It holds public
-// data only (model ids and list prices), no payloads and no key.
 #[tokio::test]
-async fn risk_catalog_cache_is_world_readable_but_public_data_only() {
-    let (_s, p, pl) = setup("openai").await;
-    mixed_session(&pl).await;
-    let cache = p.dir.path().join("cache");
-    let models = cache.join("models.json");
-    let text = std::fs::read_to_string(&models).unwrap();
-    assert!(canaries_in(&text).is_empty() && !text.contains(FAKE_KEY));
-    assert!(text.contains("qwen-mini"));
-    assert_ne!(mode(&models), 0o600);
-}
-
-#[tokio::test]
-#[ignore = "RISK (open): cache dir/file are not private; passes once they are 0700/0600"]
 async fn fixed_catalog_cache_is_private() {
     let (_s, p, pl) = setup("openai").await;
     mixed_session(&pl).await;
@@ -1675,23 +1600,9 @@ async fn risk_identifiers_comments_and_structure_are_sent_verbatim() {
     assert!(user.contains("Client {") && user.contains("_tenant_id: u64"));
     assert!(user.contains("_region: String") && user.contains("BaseUrl(&self)"));
     assert!(user.contains("Mehmet ")); // a first name that is not in the dictionary
-    assert!(user.contains("/work/")); // the path below the home directory
-}
-
-// LEAK (low): only the host of a URL is replaced. Port, path, repository path and database
-// name are sent verbatim.
-#[tokio::test]
-async fn leak_url_path_port_and_database_name_are_sent_verbatim() {
-    let (s, _p, pl) = setup("openai").await;
-    assert_ok(&pl.run(canary_request(TaskKind::Docstring)).await);
-    let (_, user) = prompt_of(&posts(&s).await[0]);
-    assert!(user.contains(".example.net:8443/v2/charges"), "{user}");
-    assert!(user.contains(".example.net/platform/"), "{user}");
-    assert!(user.contains(":5432/ledger\""), "{user}");
 }
 
 #[tokio::test]
-#[ignore = "LEAK (open): URL path / port / db name are sent; passes once they are replaced"]
 async fn fixed_url_path_port_and_database_name_are_replaced() {
     let (s, _p, pl) = setup("openai").await;
     assert_ok(&pl.run(canary_request(TaskKind::Docstring)).await);
@@ -1701,39 +1612,7 @@ async fn fixed_url_path_port_and_database_name_are_replaced() {
     }
 }
 
-// LEAK: the project root is replaced by `/workspace/app` only when the next character is not
-// `.`, `-` or a word character. A root at the end of a sentence ("the repo is at <root>.")
-// is sent with every directory above it; only `/Users/<name>` (or `/home/<name>`) and
-// dictionary terms inside it are replaced.
 #[tokio::test]
-async fn leak_project_root_before_a_full_stop_is_sent() {
-    let (s, p, pl) = setup_fixed("mmleak-root-b").await;
-    let root = p.root.to_string_lossy().to_string();
-    let tmp_name = p
-        .dir
-        .path()
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
-    let out = pl
-        .run(request(
-            TaskKind::Summarize,
-            &format!("The repo is at {root}. Summarize the file."),
-            vec![file("src/egress.rs", Some((18, 20)))],
-        ))
-        .await;
-    assert_ok(&out);
-    let sent = posts(&s).await;
-    let (_, user) = prompt_of(&sent[0]);
-    assert!(user.contains(&format!("/{tmp_name}/")), "{user}");
-    assert!(!user.contains("The repo is at /workspace/app."));
-    // the dictionary still catches the company and product directory names
-    assert!(canaries_in_request(&sent[0]).is_empty());
-}
-
-#[tokio::test]
-#[ignore = "LEAK (open): root followed by '.' is not replaced; passes once it is"]
 async fn fixed_project_root_before_a_full_stop_is_replaced() {
     let (s, p, pl) = setup_fixed("mmleak-root-c").await;
     let root = p.root.to_string_lossy().to_string();
@@ -1758,4 +1637,71 @@ async fn fixed_project_root_before_a_full_stop_is_replaced() {
         assert!(user.contains("The repo is at /workspace/app."));
     }
     assert!(out.status == Status::Ok || out.status == Status::Blocked);
+}
+
+/// Fixed: an absolute path outside the roots is replaced whole, not only `/Users/<name>`.
+#[tokio::test]
+async fn fixed_absolute_paths_outside_roots_are_replaced_whole() {
+    let (s, _p, pl) = setup("openai").await;
+    let out = pl
+        .run(request(
+            TaskKind::Summarize,
+            "Data sits in /srv/ledgers/eu-west/batch and under /Users/someone/work/accounts/q3. \
+             Logs go to /var/lib/riskapp/logs. Summarize the file.",
+            vec![file("src/egress.rs", Some((18, 20)))],
+        ))
+        .await;
+    assert_ok(&out);
+    let (_, user) = prompt_of(&posts(&s).await[0]);
+    for part in [
+        "ledgers", "eu-west", "someone", "/work/", "accounts", "riskapp",
+    ] {
+        assert!(!user.contains(part), "{part}: {user}");
+    }
+    assert!(
+        user.contains("/srv/p1") && user.contains("/home/user1"),
+        "{user}"
+    );
+    // and they come back in the answer
+    let o = out.output.unwrap();
+    assert!(o.contains("/srv/ledgers/eu-west/batch") && o.contains("/var/lib/riskapp/logs"));
+}
+
+/// Fixed: pseudonymized file paths and whole URLs are restored in the answer, including the
+/// path as an import (`src/f1` without extension).
+#[tokio::test]
+async fn fixed_paths_and_urls_are_restored_in_output() {
+    let (s, _p, pl) = setup("openai").await;
+    let out = pl
+        .run(request(
+            TaskKind::Docstring,
+            "Document internal-fraud-engine/risk_scoring_v3.rs; it is imported as internal-fraud-engine/risk_scoring_v3.",
+            vec![file("internal-fraud-engine/risk_scoring_v3.rs", None)],
+        ))
+        .await;
+    assert_ok(&out);
+    let (_, user) = prompt_of(&posts(&s).await[0]);
+    assert!(
+        !user.contains("risk_scoring") && !user.contains("fraud"),
+        "{user}"
+    );
+    assert!(
+        user.contains("Document d1/f1.rs; it is imported as d1/f1."),
+        "{user}"
+    );
+    let o = out.output.unwrap();
+    assert!(o.contains("--- FILE internal-fraud-engine/risk_scoring_v3.rs (from line 1) ---"));
+    assert!(
+        o.contains("imported as internal-fraud-engine/risk_scoring_v3."),
+        "{o}"
+    );
+
+    let out = pl.run(canary_request(TaskKind::Docstring)).await;
+    assert_ok(&out);
+    let o = out.output.unwrap();
+    assert!(
+        o.contains("https://billing.zephyrine-corp.io:8443/v2/charges"),
+        "{o}"
+    );
+    assert!(o.contains("postgres://ledger_rw@ledger-db-01.prod.zphr.internal:5432/ledger"));
 }

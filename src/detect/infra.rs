@@ -7,8 +7,10 @@ use regex::Regex;
 
 use super::{byte_at, byte_before, is_word_byte, Category, Finding};
 
+/// Group 1: everything after `scheme://` (userinfo, host, port, path, query, fragment);
+/// group 2: the host.
 static URL_HOST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\b[a-z][a-z0-9+.\-]*://(?:[^/\s@"'<>]+@)?(\[[0-9a-f:.]+\]|[^/\s:?#"'<>()\[\]{}`,;]+)"#)
+    Regex::new(r#"(?i)\b[a-z][a-z0-9+.\-]*://((?:[^/\s@"'<>]+@)?(\[[0-9a-f:.]+\]|[^/\s:?#"'<>()\[\]{}`,;]+)[^\s"'<>`]*)"#)
         .expect("static regex")
 });
 static HOST: LazyLock<Regex> = LazyLock::new(|| {
@@ -21,10 +23,29 @@ static IPV4: LazyLock<Regex> = LazyLock::new(|| {
 static IPV6: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)[0-9a-f]{0,4}(?::[0-9a-f]{0,4}){2,7}").expect("static regex")
 });
+/// A home directory and everything below it.
 static HOME: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"/Users/[A-Za-z0-9._\-]+|/home/[A-Za-z0-9._\-]+|[A-Za-z]:\\Users\\[A-Za-z0-9._\-]+")
+    Regex::new(r"/Users/[A-Za-z0-9._\-]+(?:/[A-Za-z0-9._\-~+@%]+)*|/home/[A-Za-z0-9._\-]+(?:/[A-Za-z0-9._\-~+@%]+)*|[A-Za-z]:\\Users\\[A-Za-z0-9._\-]+(?:\\[A-Za-z0-9._\-~+@%]+)*")
         .expect("static regex")
 });
+/// Other absolute filesystem paths (two or more segments under a usual top-level directory).
+/// Route strings such as `/api/v1/users` are not filesystem paths and are left alone.
+static ABS_PATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:^|[\s"'`(=,\[{:])(/(?:var|srv|opt|mnt|media|data|private|Volumes|root|tmp|etc|scratch|work|builds|projects|code|nfs|net|storage|usr/local)(?:/[A-Za-z0-9._\-~+@%]+)+)"#)
+        .expect("static regex")
+});
+/// Absolute paths that say nothing about the machine or the project.
+const GENERIC_PATHS: &[&str] = &[
+    "/etc/hosts",
+    "/etc/passwd",
+    "/etc/shadow",
+    "/etc/resolv.conf",
+    "/etc/os-release",
+    "/var/log",
+    "/var/tmp",
+    "/usr/local/bin",
+    "/usr/local/lib",
+];
 
 /// TLDs accepted for bare hostnames. File-extension-like TLDs (rs, py, md, sh, js...) are
 /// deliberately absent; hosts inside URLs are caught regardless of TLD.
@@ -162,19 +183,32 @@ impl InfraScanner {
     }
 
     pub fn scan(&self, text: &str, out: &mut Vec<Finding>) {
-        // URL hosts (any TLD, including single-label service names)
+        // URLs (any TLD, including single-label service names). With nothing after the host
+        // only the host is replaced; otherwise everything after `scheme://` (userinfo, port,
+        // path, query) goes, so `https://h:8443/v2/charges` becomes `https://svc1.example.net/p1`.
         for c in URL_HOST.captures_iter(text) {
-            let h = c.get(1).unwrap();
+            let whole = c.get(1).unwrap();
+            let h = c.get(2).unwrap();
             let host = h.as_str().trim_end_matches('.');
-            if host.is_empty() || self.keep_host(host) {
+            if host.is_empty() || self.keep_url_host(host) {
                 continue;
             }
-            out.push(Finding::new(
-                Category::Url,
-                "URL host",
-                h.start(),
-                h.start() + host.len(),
-            ));
+            let end = whole.start() + trim_url_end(whole.as_str()).len();
+            let rest_after_host = &text[h.start() + host.len()..end];
+            let has_userinfo = h.start() > whole.start();
+            if rest_after_host.is_empty() && !has_userinfo {
+                if host.parse::<std::net::Ipv4Addr>().is_ok() {
+                    continue; // a bare IP literal: the IPv4 scanner owns it
+                }
+                out.push(Finding::new(
+                    Category::Url,
+                    "URL host",
+                    h.start(),
+                    h.start() + host.len(),
+                ));
+            } else {
+                out.push(Finding::new(Category::Url, "URL", whole.start(), end));
+            }
         }
         // bare hostnames: listed TLDs anywhere; any 2-24 letter TLD for 3+ labels that look
         // like a host (a label with a digit or hyphen) or that sit in a host-like context
@@ -258,27 +292,98 @@ impl InfraScanner {
             }
             out.push(Finding::new(Category::Ipv6, "IPv6", m.start(), m.end()));
         }
-        // configured project roots, then generic home directories
+        // configured project roots, then home directories and other absolute paths (the
+        // whole path, not just its first two segments)
+        let mut root_starts = Vec::new();
         for root in &self.roots {
             let mut from = 0;
             while let Some(i) = text[from..].find(root.as_str()) {
                 let s = from + i;
                 let e = s + root.len();
-                if !byte_at(text, e).is_some_and(|b| is_word_byte(b) || b == b'-' || b == b'.') {
+                // `<root>-old`, `<root>2`, `<root>.bak` name another directory; `<root>.` ends
+                // a sentence
+                let next = byte_at(text, e);
+                let longer = next.is_some_and(|b| is_word_byte(b) || b == b'-')
+                    || (next == Some(b'.')
+                        && byte_at(text, e + 1).is_some_and(|b| is_word_byte(b) || b == b'-'));
+                if !longer && !root_starts.contains(&s) {
                     out.push(Finding::new(Category::Path, "project root", s, e));
+                    root_starts.push(s);
                 }
                 from = e;
             }
         }
         for m in HOME.find_iter(text) {
+            if root_starts.contains(&m.start()) {
+                continue;
+            }
+            let p = m.as_str().trim_end_matches('.');
             out.push(Finding::new(
                 Category::Path,
                 "home directory",
                 m.start(),
-                m.end(),
+                m.start() + p.len(),
+            ));
+        }
+        for c in ABS_PATH.captures_iter(text) {
+            let m = c.get(1).unwrap();
+            let p = m.as_str().trim_end_matches('.');
+            if root_starts.contains(&m.start())
+                || self.roots.iter().any(|r| p.starts_with(r.as_str()))
+                || GENERIC_PATHS.iter().any(|g| p == *g)
+            {
+                continue;
+            }
+            out.push(Finding::new(
+                Category::Path,
+                "absolute path",
+                m.start(),
+                m.start() + p.len(),
             ));
         }
     }
+
+    /// Hosts whose URLs are kept verbatim: reserved, configured public, loopback/doc IPs,
+    /// and bracketed IPv6 literals (the IPv6 scanner handles those).
+    fn keep_url_host(&self, h: &str) -> bool {
+        let l = h.to_ascii_lowercase();
+        if let Ok(ip) = l.parse::<std::net::Ipv4Addr>() {
+            return is_reserved_ipv4(ip.octets());
+        }
+        is_reserved_host(&l) || self.public_hosts.contains(&l) || l.starts_with('[')
+    }
+}
+
+/// Drop trailing sentence punctuation and unbalanced closing brackets from a URL match.
+fn trim_url_end(u: &str) -> &str {
+    let mut s = u;
+    loop {
+        let before = s.len();
+        s = s.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+            if s.ends_with(close) && s.matches(close).count() > s.matches(open).count() {
+                s = &s[..s.len() - 1];
+            }
+        }
+        if s.len() == before {
+            return s;
+        }
+    }
+}
+
+/// The host part of a URL finding's text (`user@host:port/path` -> `host`).
+pub fn url_host(rest: &str) -> &str {
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let after_user = match rest[..auth_end].rfind('@') {
+        Some(i) => i + 1,
+        None => 0,
+    };
+    let r = &rest[after_user..];
+    if r.starts_with('[') {
+        return r.find(']').map(|i| &r[..=i]).unwrap_or(r);
+    }
+    let end = r.find([':', '/', '?', '#']).unwrap_or(r.len());
+    r[..end].trim_end_matches('.')
 }
 
 #[cfg(test)]
@@ -297,10 +402,23 @@ mod tests {
     #[test]
     fn hosts() {
         let r = scan("connect to https://billing.acme-corp.io:8443/v1/x and db.acme.internal");
-        assert!(r.contains(&(Category::Url, "billing.acme-corp.io".into())));
+        assert!(r.contains(&(Category::Url, "billing.acme-corp.io:8443/v1/x".into())));
         assert!(r.contains(&(Category::Host, "db.acme.internal".into())));
         let r = scan("http://billing-svc:8080/health");
+        assert_eq!(r, vec![(Category::Url, "billing-svc:8080/health".into())]);
+        let r = scan("see https://billing-svc.");
         assert_eq!(r, vec![(Category::Url, "billing-svc".into())]);
+        let r = scan("(at https://a.acme.io/x/y), or postgres://rw@db1:5432/ledger.");
+        assert!(
+            r.contains(&(Category::Url, "a.acme.io/x/y".into())),
+            "{r:?}"
+        );
+        assert!(
+            r.contains(&(Category::Url, "rw@db1:5432/ledger".into())),
+            "{r:?}"
+        );
+        assert_eq!(url_host("rw@db1:5432/ledger"), "db1");
+        assert_eq!(url_host("a.acme.io/x?q=1"), "a.acme.io");
     }
 
     #[test]
@@ -359,8 +477,35 @@ mod tests {
 
     #[test]
     fn paths() {
-        let r = scan("open /Users/jane/acme/src/x.rs and /home/bob/.cache");
-        assert!(r.contains(&(Category::Path, "/Users/jane/acme".into())));
-        assert!(r.contains(&(Category::Path, "/home/bob".into())));
+        let r = scan("open /Users/jane/acme/src/x.rs and /home/bob/.cache/acme.");
+        assert!(
+            r.contains(&(Category::Path, "/Users/jane/acme".into())),
+            "{r:?}"
+        );
+        assert!(
+            r.contains(&(Category::Path, "/home/bob/.cache/acme".into())),
+            "{r:?}"
+        );
+        // the root at the end of a sentence; a longer sibling name is not the root
+        let r = scan("the repo is at /Users/jane/acme. Also /Users/jane/acme.bak/x");
+        assert!(
+            r.contains(&(Category::Path, "/Users/jane/acme".into())),
+            "{r:?}"
+        );
+        assert!(
+            r.contains(&(Category::Path, "/Users/jane/acme.bak/x".into())),
+            "{r:?}"
+        );
+        // other absolute filesystem paths go whole; routes and system paths stay
+        let r = scan("data in /srv/zr/ledger/db, see \"/opt/acme/bin/run\" and /etc/hosts");
+        assert!(
+            r.contains(&(Category::Path, "/srv/zr/ledger/db".into())),
+            "{r:?}"
+        );
+        assert!(
+            r.contains(&(Category::Path, "/opt/acme/bin/run".into())),
+            "{r:?}"
+        );
+        assert!(scan("GET \"/api/v1/users\" and /etc/hosts and /usr/bin/env").is_empty());
     }
 }

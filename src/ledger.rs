@@ -20,7 +20,11 @@ pub struct LedgerEntry {
     pub ts: String,
     pub request_id: String,
     pub attempt: u32,
+    /// `p-<8 hex>`: salted hash of the project root (older lines: the root's base name).
     pub project: String,
+    /// The user's own label for the project (`label` in `.middleman.toml`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_label: Option<String>,
     pub task_kind: String,
     pub quality: String,
     pub mode: String,
@@ -176,6 +180,43 @@ pub fn rfc3339_at(unix: i64) -> String {
         .unwrap_or_default()
 }
 
+/// `p-<8 hex>` for a project root: SHA-256 over a per-install random salt (state dir,
+/// 0600) and the path, so the ledger names no directory and the id cannot be guessed back.
+pub fn project_id(state_dir: &Path, root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let salt = project_salt(state_dir).unwrap_or_default();
+    let mut h = Sha256::new();
+    h.update(salt.as_bytes());
+    h.update([0u8]);
+    h.update(root.to_string_lossy().as_bytes());
+    let d = h.finalize();
+    format!(
+        "p-{}",
+        d.iter()
+            .take(4)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    )
+}
+
+fn project_salt(state_dir: &Path) -> Result<String> {
+    let p = state_dir.join("project-salt");
+    if let Ok(s) = std::fs::read_to_string(&p) {
+        if s.trim().len() >= 16 {
+            return Ok(s.trim().to_string());
+        }
+    }
+    ensure_private_dir(state_dir)?;
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
+    let salt: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    crate::fsutil::write_atomic(&p, salt.as_bytes(), Some(0o600))?;
+    // a concurrent first run may have won the race: use what is on disk
+    Ok(std::fs::read_to_string(&p)
+        .map(|s| s.trim().to_string())
+        .unwrap_or(salt))
+}
+
 pub fn ensure_private_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     #[cfg(unix)]
@@ -317,6 +358,24 @@ pub fn window_at(entries: &[LedgerEntry], now: i64) -> Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_id_is_salted_stable_and_names_no_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let a = project_id(d.path(), Path::new("/w/acme-billing"));
+        assert!(a.starts_with("p-") && a.len() == 10 && !a.contains("acme"), "{a}");
+        assert_eq!(a, project_id(d.path(), Path::new("/w/acme-billing")));
+        assert_ne!(a, project_id(d.path(), Path::new("/w/other")));
+        // another install (another salt) gives another id
+        let e = tempfile::tempdir().unwrap();
+        assert_ne!(a, project_id(e.path(), Path::new("/w/acme-billing")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let m = std::fs::metadata(d.path().join("project-salt")).unwrap();
+            assert_eq!(m.permissions().mode() & 0o777, 0o600);
+        }
+    }
 
     #[test]
     fn corrupt_and_non_finite_lines_do_not_lock_out() {

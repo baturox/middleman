@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ClassifyCfg, PiiMode, SecretsMode};
-use crate::detect::{Finding, Severity};
+use crate::detect::{Category, Finding, Severity};
 use crate::TaskKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -82,7 +82,11 @@ impl Classifier for RuleClassifier {
         let mut reasons = Vec::new();
         let mut detected = Sensitivity::S0;
         let mut by_sev: BTreeMap<Severity, usize> = BTreeMap::new();
-        for f in i.findings {
+        for f in i
+            .findings
+            .iter()
+            .filter(|f| f.category != Category::FilePath)
+        {
             *by_sev.entry(f.severity()).or_insert(0) += 1;
         }
         let hard = by_sev.get(&Severity::Hard).copied().unwrap_or(0);

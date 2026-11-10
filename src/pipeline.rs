@@ -304,6 +304,7 @@ impl Payload {
 struct LedgerCtx {
     request_id: String,
     project: String,
+    project_label: Option<String>,
     task_kind: String,
     quality: String,
     mode: String,
@@ -358,6 +359,7 @@ impl LedgerCtx {
             request_id: self.request_id.clone(),
             attempt,
             project: self.project.clone(),
+            project_label: self.project_label.clone(),
             task_kind: self.task_kind.clone(),
             quality: self.quality.clone(),
             mode: self.mode.clone(),
@@ -642,7 +644,7 @@ impl Pipeline {
         self.finish(out, rec, "blocked")
     }
 
-    fn project_label(&self, req: &DelegateRequest) -> String {
+    fn project_id(&self, req: &DelegateRequest) -> String {
         let first = req
             .files
             .first()
@@ -652,8 +654,7 @@ impl Pipeline {
             .as_ref()
             .and_then(|p| self.paths.roots().iter().find(|r| p.starts_with(r)))
             .or_else(|| self.paths.roots().first());
-        root.and_then(|r| r.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
+        root.map(|r| crate::ledger::project_id(&self.cfg.state_dir(), r))
             .unwrap_or_default()
     }
 
@@ -722,7 +723,8 @@ impl Pipeline {
         let quality = req.quality.unwrap_or(self.cfg.routing.default_quality);
         let mut ctx = LedgerCtx {
             request_id: request_id.clone(),
-            project: self.project_label(&req),
+            project: self.project_id(&req),
+            project_label: self.cfg.project_label.clone(),
             task_kind: req.task_kind.to_string(),
             quality: format!("{quality:?}").to_lowercase(),
             mode: format!("{mode:?}").to_lowercase(),
@@ -821,8 +823,17 @@ impl Pipeline {
             return self.finish_blocked(out, rec, &ctx, "too_large", reason);
         }
 
-        // 2 detect
-        let findings = detect::finalize(&payload.text, self.detector.scan(&payload.text));
+        // 2 detect (plus every occurrence of a requested file's path: its header and any
+        // mention in the instructions or inputs)
+        let mut raw_findings = self.detector.scan(&payload.text);
+        for f in &files {
+            file_path_findings(&payload.text, &f.display, &mut raw_findings);
+            let stem = strip_ext(&f.display);
+            if stem != f.display && stem.contains('/') {
+                file_path_findings(&payload.text, &stem, &mut raw_findings);
+            }
+        }
+        let findings = detect::finalize(&payload.text, raw_findings);
         out.redactions = detect::counts(&findings);
         rec.finding_counts = out.redactions.clone();
         ctx.redactions = out.redactions.clone();
@@ -894,6 +905,17 @@ impl Pipeline {
 
         // 5 pseudonymize (safe locally even if policy blocks; dry runs show the result)
         let mut vault = Vault::new(&payload.text);
+        // file paths first, so `src/a.py` and its import form `src/a` map to `src/f1.py` and
+        // `src/f1`
+        for f in &files {
+            let probe = Finding::new(Category::FilePath, pseudo::FILE_PATH, 0, 0);
+            if let Ok(sur) = vault.surrogate_for(&f.display, &probe, self.detector.dictionary()) {
+                let stem = strip_ext(&f.display);
+                if stem != f.display && stem.contains('/') {
+                    vault.assign(&stem, &strip_ext(&sur), self.detector.dictionary());
+                }
+            }
+        }
         let user = match pseudo::apply(
             &payload.text,
             &findings,
@@ -905,6 +927,15 @@ impl Pipeline {
                 return self.finish_blocked(out, rec, &ctx, "pseudonymize", e.to_string());
             }
         };
+        // the model may name a file in Python module form (`src.f1`): restore that too
+        for f in &files {
+            if let Some(sur) = vault.surrogate_of(&f.display).map(String::from) {
+                let (s0, o0) = (strip_ext(&sur), strip_ext(&f.display));
+                if s0.contains('/') && !o0.contains(['-', '.', ' ']) {
+                    vault.add_alias(&s0.replace('/', "."), &o0.replace('/', "."));
+                }
+            }
+        }
         let max_tokens = req
             .max_output_tokens
             .unwrap_or(self.cfg.limits.max_output_tokens)
@@ -1430,7 +1461,10 @@ impl Pipeline {
         }
         let risk = risk::assess(raw_out, sent_user);
         let r = vault.restore_with(raw_out, |pos, sur| {
-            !risk.in_zone(pos) && !(file_mode && sur.starts_with("MM_SECRET_"))
+            // a whole-URL surrogate right after `scheme://` is the URL we sent, echoed back:
+            // restoring it points at the original service, not at a sink the provider chose
+            let echoed_url = URL_SURROGATE.is_match(sur) && raw_out[..pos].ends_with("://");
+            (echoed_url || !risk.in_zone(pos)) && !(file_mode && sur.starts_with("MM_SECRET_"))
         });
         if r.vetoed > 0 {
             out.warnings.push(format!(
@@ -1555,6 +1589,45 @@ impl Pipeline {
         })
     }
 }
+
+/// `src/a.py` -> `src/a` (a dot in a directory name is not an extension).
+fn strip_ext(p: &str) -> String {
+    match p.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !stem.ends_with('/') && !ext.contains('/') => {
+            stem.to_string()
+        }
+        _ => p.to_string(),
+    }
+}
+
+/// A finding for each occurrence of a requested file's root-relative path that is not part
+/// of a longer path or name (`/` before it is fine: `<root>/src/a.rs`).
+fn file_path_findings(text: &str, display: &str, out: &mut Vec<Finding>) {
+    if display.is_empty() {
+        return;
+    }
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(i) = text[from..].find(display) {
+        let s = from + i;
+        let e = s + display.len();
+        let before_ok = s == 0 || !(word(bytes[s - 1]) || bytes[s - 1] == b'.');
+        let after_ok = match bytes.get(e) {
+            None => true,
+            Some(&b) if word(b) => false,
+            Some(&b'.') => !bytes.get(e + 1).is_some_and(|&b| word(b)),
+            Some(_) => true,
+        };
+        if before_ok && after_ok {
+            out.push(Finding::new(Category::FilePath, pseudo::FILE_PATH, s, e));
+        }
+        from = e;
+    }
+}
+
+static URL_SURROGATE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^svc[0-9]+\.example\.net/p[0-9]+$").expect("static regex"));
 
 static WRAPPER_TAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)untrusted[_\-\s]*output").expect("static regex"));

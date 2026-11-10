@@ -72,7 +72,6 @@ chain = ["auto:chat:cheapest", "claude"]
 [providers.openrouter]
 preset = "openrouter"            # OPENROUTER_API_KEY wins when set
 key_source = "keychain"          # else the key `middleman provider add openrouter` stored
-headers = { "X-Title" = "middleman" }
 model = "qwen/qwen3.8-flash"     # default when a chain step names just "openrouter"
 task_kinds = ["write_tests", "boilerplate", "summarize", "docstring", "snippet", "explain", "translate"]
 # max_sensitivity defaults by trust: untrusted=S1, zdr=S2, local/first_party=S3

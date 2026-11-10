@@ -21,12 +21,58 @@ static PROCESS_KEY: LazyLock<[u8; 32]> = LazyLock::new(|| {
     k
 });
 
+/// Label of a requested file's root-relative path (see `Vault::file_path_candidate`).
+pub const FILE_PATH: &str = "file path";
+
+/// Top-level directory names kept in file path surrogates: they say nothing about the project.
+pub const CONVENTIONAL_DIRS: &[&str] = &[
+    "src",
+    "source",
+    "lib",
+    "libs",
+    "app",
+    "apps",
+    "pkg",
+    "pkgs",
+    "packages",
+    "cmd",
+    "internal",
+    "include",
+    "test",
+    "tests",
+    "spec",
+    "specs",
+    "__tests__",
+    "bench",
+    "benches",
+    "examples",
+    "example",
+    "docs",
+    "doc",
+    "scripts",
+    "bin",
+    "tools",
+    "crates",
+    "modules",
+    "components",
+    "server",
+    "client",
+    "web",
+    "api",
+    "core",
+    "common",
+    "shared",
+    "utils",
+    "config",
+    "public",
+];
+
 const SYLLABLES: [&str; 16] = [
     "za", "ve", "lo", "ri", "ta", "no", "ki", "mu", "se", "do", "ra", "li", "fo", "ne", "pa", "tu",
 ];
 
 static SURROGATE_SHAPE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"user[0-9]+@example\.com|svc[0-9]+\.example\.net|198\.51\.100\.[0-9]+|203\.0\.113\.[0-9]+|198\.1[89]\.[0-9]+\.[0-9]+|2001:db8::[0-9a-f]+|MM_(?:SECRET|PHONE|IBAN|TCKN|CARD|IPV4)_[0-9]+|/workspace/app[0-9]*|/home/user[0-9]+")
+    Regex::new(r"user[0-9]+@example\.com|svc[0-9]+\.example\.net|198\.51\.100\.[0-9]+|203\.0\.113\.[0-9]+|198\.1[89]\.[0-9]+\.[0-9]+|2001:db8::[0-9a-f]+|MM_(?:SECRET|PHONE|IBAN|TCKN|CARD|IPV4)_[0-9]+|/workspace/app[0-9]*|/home/user[0-9]+|/srv/p[0-9]+")
         .expect("static regex")
 });
 
@@ -49,6 +95,9 @@ pub struct Vault {
     fwd: HashMap<String, String>,
     rev: HashMap<String, Entry>,
     counters: HashMap<&'static str, usize>,
+    /// Top-level directory -> neutral name for file path surrogates (`billing` -> `d1`).
+    /// Kept apart from `fwd`: a directory name is not an original that must be absent.
+    dirs: HashMap<String, String>,
     corpus_lower: String,
     max_attempts: u32,
 }
@@ -87,6 +136,7 @@ impl Vault {
             fwd: HashMap::new(),
             rev: HashMap::new(),
             counters: HashMap::new(),
+            dirs: HashMap::new(),
             corpus_lower: corpus.to_lowercase(),
             max_attempts: MAX_ATTEMPTS,
         }
@@ -112,6 +162,11 @@ impl Vault {
 
     pub fn surrogates(&self) -> impl Iterator<Item = &str> {
         self.rev.keys().map(|s| s.as_str())
+    }
+
+    /// The surrogate already issued for `original`, if any.
+    pub fn surrogate_of(&self, original: &str) -> Option<&str> {
+        self.fwd.get(original).map(|s| s.as_str())
     }
 
     pub fn is_surrogate(&self, s: &str) -> bool {
@@ -187,6 +242,12 @@ impl Vault {
             }
             return Err(Exhausted("dictionary"));
         }
+        if f.category == Category::Url && f.label == "URL" {
+            return self.url_candidate(original, dict);
+        }
+        if f.category == Category::FilePath {
+            return self.file_path_candidate(original, dict);
+        }
         for _ in 0..self.max_attempts {
             let cand = match f.category {
                 Category::Email => format!("user{}@example.com", self.next_n("email")),
@@ -203,7 +264,11 @@ impl Vault {
                         format!("/workspace/app{n}")
                     }
                 }
+                Category::Path if f.label == "absolute path" => {
+                    format!("/srv/p{}", self.next_n("abs"))
+                }
                 Category::Path => format!("/home/user{}", self.next_n("home")),
+                Category::FilePath => unreachable!(),
                 Category::Secret | Category::HighEntropy | Category::DictionaryEvasion => {
                     format!("MM_SECRET_{}", self.next_n("secret"))
                 }
@@ -218,6 +283,115 @@ impl Vault {
             }
         }
         Err(Exhausted(f.category.as_str()))
+    }
+
+    /// A whole URL after `scheme://`: the host's own surrogate plus a neutral path
+    /// (`billing.acme.io:8443/v2/x` -> `svc1.example.net/p1`). The host is registered too,
+    /// so its bare occurrences elsewhere map to the same `svcN`.
+    fn url_candidate(
+        &mut self,
+        original: &str,
+        dict: Option<&Dictionary>,
+    ) -> Result<String, Exhausted> {
+        let host = crate::detect::infra::url_host(original);
+        let host_sur = if host.is_empty() {
+            format!("svc{}.example.net", self.next_n("host"))
+        } else {
+            let cat = if host.parse::<std::net::Ipv4Addr>().is_ok() {
+                Category::Ipv4
+            } else {
+                Category::Url
+            };
+            let hf = Finding::new(cat, "URL host", 0, host.len());
+            self.surrogate_for(host, &hf, dict)?
+        };
+        for _ in 0..self.max_attempts {
+            let cand = format!("{host_sur}/p{}", self.next_n("urlpath"));
+            if self.usable(&cand, dict) {
+                return Ok(cand);
+            }
+        }
+        Err(Exhausted("url"))
+    }
+
+    /// A root-relative file path: `<top>/f<N>.<ext>`. The top-level directory is kept when it
+    /// is a conventional name (src, tests, ...), else it becomes `d<K>`; deeper directories
+    /// and the file name are dropped; the extension is kept.
+    fn file_path_candidate(
+        &mut self,
+        original: &str,
+        dict: Option<&Dictionary>,
+    ) -> Result<String, Exhausted> {
+        let norm = original.replace('\\', "/");
+        let mut parts: Vec<&str> = norm.split('/').filter(|p| !p.is_empty()).collect();
+        let name = parts.pop().unwrap_or("");
+        let ext = std::path::Path::new(name)
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .filter(|e| e.len() <= 8 && e.chars().all(|c| c.is_ascii_alphanumeric()));
+        let dir = match parts.first() {
+            None => String::new(),
+            Some(top) if CONVENTIONAL_DIRS.contains(&top.to_ascii_lowercase().as_str()) => {
+                format!("{}/", top.to_ascii_lowercase())
+            }
+            Some(top) => {
+                let key = top.to_string();
+                if let Some(d) = self.dirs.get(&key) {
+                    format!("{d}/")
+                } else {
+                    let d = format!("d{}", self.next_n("dir"));
+                    self.dirs.insert(key, d.clone());
+                    format!("{d}/")
+                }
+            }
+        };
+        for _ in 0..self.max_attempts {
+            let n = self.next_n("file");
+            let cand = match &ext {
+                Some(e) => format!("{dir}f{n}.{e}"),
+                None => format!("{dir}f{n}"),
+            };
+            if self.usable(&cand, dict) {
+                return Ok(cand);
+            }
+        }
+        Err(Exhausted("file path"))
+    }
+
+    /// Use `surrogate` for `original` (both directions) when neither is taken and the
+    /// surrogate is usable. Returns whether it was assigned.
+    pub fn assign(&mut self, original: &str, surrogate: &str, dict: Option<&Dictionary>) -> bool {
+        if original == surrogate || self.fwd.contains_key(original) || !self.usable(surrogate, dict)
+        {
+            return false;
+        }
+        self.fwd.insert(original.to_string(), surrogate.to_string());
+        self.rev.insert(
+            surrogate.to_string(),
+            Entry {
+                original: original.to_string(),
+                inner: false,
+            },
+        );
+        true
+    }
+
+    /// Restore-only mapping (never checked by the egress gate): an alias of an existing
+    /// surrogate in another spelling the model may use (`src.f1` for `src/f1.py`).
+    pub fn add_alias(&mut self, surrogate: &str, original: &str) {
+        if surrogate.is_empty() || surrogate == original || self.rev.contains_key(surrogate) {
+            return;
+        }
+        if self.corpus_lower.contains(&surrogate.to_lowercase()) {
+            return;
+        }
+        self.rev.insert(
+            surrogate.to_string(),
+            Entry {
+                original: original.to_string(),
+                inner: false,
+            },
+        );
     }
 
     /// Same original -> same surrogate within this vault.

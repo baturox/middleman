@@ -22,6 +22,9 @@ pub const BUILTIN_DENY: &[&str] = &[
     "**/*credential*",
     "**/secrets/**",
     "**/.git/**",
+    // the file form: a submodule / worktree pointer (`gitdir: ...`)
+    "**/.git",
+    "**/.gitmodules",
     "**/.ssh/**",
     "**/*.tfstate",
     "**/*.tfstate.*",
@@ -64,7 +67,8 @@ pub const DEFAULT_PUBLIC_HOSTS: &[&str] = &[
     "localhost",
 ];
 
-pub const DEFAULT_UA: &str = "Mozilla/5.0 (compatible; middleman/0.1)";
+/// Generic on purpose: a request must not announce the tool (or that it is pseudonymized).
+pub const DEFAULT_UA: &str = "Mozilla/5.0";
 pub const PROJECT_FILE: &str = ".middleman.toml";
 
 /// An API key. Never printed, never serialized; the memory is zeroed on drop.
@@ -99,6 +103,9 @@ pub struct Config {
     /// to the git root of the working directory; dropped when it would be $HOME or `/`).
     #[serde(skip)]
     pub project_root_placeholder: bool,
+    /// `label` from the project overlay.
+    #[serde(skip)]
+    pub project_label: Option<String>,
     #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
@@ -873,6 +880,10 @@ impl Config {
     /// Apply a project overlay. Every field can only make the config stricter; an attempt to
     /// loosen is an error (fail-closed) rather than being silently ignored.
     pub fn tighten(&mut self, o: &ProjectOverlay) -> Result<()> {
+        if let Some(l) = &o.label {
+            let l = crate::fsutil::clean(l.trim(), 40);
+            self.project_label = (!l.is_empty()).then_some(l);
+        }
         fn lower<T: PartialOrd + Copy + fmt::Debug>(
             name: &str,
             cur: &mut T,
@@ -987,6 +998,9 @@ impl Config {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectOverlay {
+    /// Your own name for this project in `report --by project` (the ledger stores it next to
+    /// a salted hash of the root, never the directory name).
+    pub label: Option<String>,
     pub budget: Option<OverlayBudget>,
     pub limits: Option<OverlayLimits>,
     pub paths: Option<OverlayPaths>,

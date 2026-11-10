@@ -34,7 +34,7 @@ impl By {
             By::Provider => e.provider.clone(),
             By::Task => e.task_kind.clone(),
             By::Day => e.ts.chars().take(10).collect(),
-            By::Project => e.project.clone(),
+            By::Project => e.project_label.clone().unwrap_or_else(|| e.project.clone()),
         };
         if k.is_empty() {
             "(none)".into()

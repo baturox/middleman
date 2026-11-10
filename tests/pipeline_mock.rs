@@ -161,17 +161,16 @@ async fn infra_pseudonymized_at_s2() {
         assert!(!body.contains(orig), "{orig} leaked: {body}");
     }
     assert!(body.contains("example.net") && body.contains("198.51.100."));
+    // the whole URL (port and path too) is replaced, not only the host
+    assert!(!body.contains(":8443/v2/charges"), "{body}");
     let o = out.output.unwrap();
-    // surrogates inside URLs are never restored (a URL is a possible exfiltration sink)
-    assert!(!o.contains("https://billing.acme-corp.io"), "{o}");
+    // the echoed URL surrogate right after `https://` is the URL we sent: restored whole.
+    // (A surrogate the provider plants inside a URL of its own is never restored, see
+    // leak_validation::restore_never_fills_originals_into_urls_from_a_hostile_answer.)
     assert!(
-        o.contains("https://svc") && o.contains(".example.net:8443/v2/charges"),
+        o.contains("https://billing.acme-corp.io:8443/v2/charges"),
         "{o}"
     );
-    assert!(out
-        .warnings
-        .iter()
-        .any(|w| w.contains("left unrestored inside URLs")));
     assert!(
         o.contains("jane.doe@acme-corp.io") && o.contains("/Users/janedoe/acme-platform/reports")
     );

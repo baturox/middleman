@@ -26,6 +26,9 @@ pub enum Category {
     Ipv4,
     Ipv6,
     Path,
+    /// A requested file's root-relative path (header and mentions). Replaced like infra, but
+    /// does not raise the sensitivity: every request names its files.
+    FilePath,
     Phone,
     Iban,
     Tckn,
@@ -47,6 +50,7 @@ impl Category {
             Category::Ipv4 => "ipv4",
             Category::Ipv6 => "ipv6",
             Category::Path => "path",
+            Category::FilePath => "file_path",
             Category::Phone => "phone",
             Category::Iban => "iban",
             Category::Tckn => "tckn",
@@ -67,7 +71,8 @@ impl Category {
             | Category::Host
             | Category::Ipv4
             | Category::Ipv6
-            | Category::Path => Severity::Infra,
+            | Category::Path
+            | Category::FilePath => Severity::Infra,
             Category::Dictionary => Severity::Dict,
         }
     }
@@ -248,27 +253,43 @@ pub fn finalize(text: &str, raw: Vec<Finding>) -> Vec<Finding> {
         ) {
             continue; // the dictionary automaton already finds every occurrence
         }
-        let needle = &text[f.start..f.end];
-        let mut from = 0;
-        while let Some(i) = text[from..].find(needle) {
-            let s = from + i;
-            let cand = Finding::new(f.category, f.label, s, s + needle.len());
-            let bounded = !byte_before(text, s).is_some_and(|b| b.is_ascii_alphanumeric())
-                && !byte_at(text, cand.end).is_some_and(|b| b.is_ascii_alphanumeric());
-            if bounded
-                && !kept
-                    .iter()
-                    .chain(extra.iter())
-                    .any(|k: &Finding| k.overlaps(&cand))
-            {
-                extra.push(cand);
+        let mut needles = vec![(&text[f.start..f.end], f.category, f.label)];
+        if f.category == Category::Url && f.label == "URL" {
+            // the host of a whole-URL finding also appears bare (`connect to <host>`)
+            let h = infra::url_host(&text[f.start..f.end]);
+            if h.len() >= 3 && h.parse::<std::net::Ipv4Addr>().is_err() {
+                needles.push((h, Category::Url, "URL host"));
             }
-            from = s + needle.len().max(1);
+        }
+        for (needle, category, label) in needles {
+            cover_occurrences(text, needle, category, label, &kept, &mut extra);
         }
     }
     kept.extend(extra);
     kept.sort_by_key(|f| f.start);
     kept
+}
+
+/// Push a finding for every bounded occurrence of `needle` that overlaps nothing yet.
+fn cover_occurrences(
+    text: &str,
+    needle: &str,
+    category: Category,
+    label: &'static str,
+    kept: &[Finding],
+    extra: &mut Vec<Finding>,
+) {
+    let mut from = 0;
+    while let Some(i) = text[from..].find(needle) {
+        let s = from + i;
+        let cand = Finding::new(category, label, s, s + needle.len());
+        let bounded = !byte_before(text, s).is_some_and(|b| b.is_ascii_alphanumeric())
+            && !byte_at(text, cand.end).is_some_and(|b| b.is_ascii_alphanumeric());
+        if bounded && !kept.iter().chain(extra.iter()).any(|k| k.overlaps(&cand)) {
+            extra.push(cand);
+        }
+        from = s + needle.len().max(1);
+    }
 }
 
 pub fn counts(findings: &[Finding]) -> BTreeMap<String, usize> {
