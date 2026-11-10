@@ -109,24 +109,55 @@ cargo install --git https://github.com/baturox/middleman --locked
 ## Quick start
 
 ```sh
-# 1. Set up: pick providers, user- or project-wide scope, and how much Claude may delegate on its own
-export OPENROUTER_API_KEY=sk-or-...
-middleman init
-middleman models refresh
-
-# 2. See where your money goes, and what to change
-middleman usage --since 30d
-middleman tune
-
-# 3. Connect it to Claude Code
-claude mcp add middleman --scope user -- "$(command -v middleman)" mcp
-
-# 4. Check everything is green
-middleman doctor
+middleman init            # pick OpenRouter, log in with your browser (or paste a key), pick scope and mode
+middleman setup claude    # shows every change to Claude Code's files, asks, backs them up, applies
 ```
 
-Then paste the short block from [`docs/CLAUDE-snippet.md`](docs/CLAUDE-snippet.md) into your
-`CLAUDE.md`, so Claude knows when to delegate.
+That's it. Restart Claude Code and the statusline shows `🛡 middleman ✓ openrouter`.
+
+- `init` stores the key in your OS keychain (macOS Keychain, Windows Credential Manager, Linux
+  Secret Service). You never type it on the command line, so it isn't in your shell history.
+- `setup claude` registers the MCP server, allows its two tools, adds the prompt hook, the
+  statusline and the CLAUDE.md block. `--dry-run` only shows the changes; `--undo` puts the old
+  files back.
+- Later: `middleman models refresh` fetches current prices, `middleman usage` and `middleman tune`
+  show where your Claude Code money goes, and `middleman doctor` checks everything.
+
+<details>
+<summary>Keys: other providers, rotation, scripts</summary>
+
+```sh
+middleman provider add            # pick a provider, paste the key (hidden), it's checked with a free request
+middleman provider list           # where each key is stored (never the key)
+middleman provider test openrouter
+middleman provider rotate openrouter
+middleman provider remove deepseek
+middleman login openrouter --no-browser   # over SSH: open the link anywhere, paste the code back
+pass show openrouter | middleman provider add openrouter --key-stdin   # scripts
+```
+
+Environment variables (`OPENROUTER_API_KEY`, ...) still work and win over a stored key. If no
+keychain is available (e.g. a headless Linux box), the key goes to a private file
+(`~/.config/middleman/keys/<provider>`, mode 0600) and middleman says so.
+
+</details>
+
+## How do I know it's working?
+
+- **Statusline**, at the bottom of Claude Code:
+  `🛡 middleman ✓ openrouter · 3 delegated today (1 this session) · saved $0.21 · 1 blocked`.
+  It shows `✗` and the reason when the config is broken or no key is found.
+- **Hook message**: when you send a prompt, a short line tells you what middleman told Claude,
+  e.g. `🛡 middleman: suggested delegating this write_tests task (~3000 output tokens) to a cheap model`
+  or `🛡 middleman: keep on Claude (sensitive: billing)`.
+- **Tool result**: every `delegate_task` result starts with one line, such as
+  `middleman: done via openrouter/deepseek/deepseek-v4.1-flash; wrote tests/test_dates.py (84 lines); cost $0.0028, net saving $0.0216.`
+- **`middleman watch`** in another terminal prints each delegation as it happens: time, task,
+  model, sensitivity, what was redacted, tokens, cost, net saving, and the reason when blocked.
+- **`middleman report`** sums it all up afterwards.
+
+Each log line records the Claude Code session id when it's known. The MCP server gets the id
+Claude Code started it with, so after `/clear` its calls still carry the earlier id.
 
 ## Saving money: what actually matters
 
@@ -169,7 +200,8 @@ a model whose price it doesn't know.
 
 ```toml
 [providers.openrouter]
-preset = "openrouter"                      # reads OPENROUTER_API_KEY
+preset = "openrouter"
+key_source = "keychain"                    # written by `middleman provider add`; OPENROUTER_API_KEY wins if set
 model  = "qwen/qwen3.8-flash"
 
 # Cheapest suitable model first, then DeepSeek, then give the job back to Claude.
@@ -189,11 +221,16 @@ mode = "auto"        # auto: Claude delegates when safe · confirm: ask first ·
 |---|---|
 | `middleman usage` | Your Claude Code spend from local logs (totals only, never message text) |
 | `middleman tune` | Recommended settings, with estimated savings |
+| `middleman init` | Guided setup: provider, key (browser login or hidden paste), scope, routing mode |
+| `middleman setup claude` | Connect to Claude Code (`--dry-run`, `--undo`, `--scope project`) |
+| `middleman provider add/list/test/rotate/remove` | Manage provider keys in the OS keychain |
+| `middleman watch` | Live view of delegations in another terminal |
 | `middleman report` | What was delegated, to which model, and the net saving (`--html` for a dashboard) |
 | `middleman check <files>` | Dry run: shows exactly what *would* be sent, without sending it |
 | `middleman route "<prompt>"` | Shows whether a prompt would be delegated, and why |
-| `middleman init` / `doctor` | Setup / health check |
+| `middleman doctor` | Health check: config, keys, keychain, providers, Claude Code wiring |
 | `middleman models refresh` | Fetch current models and prices from your providers |
+| `middleman completions <shell>` | Shell completions for bash, zsh, fish, elvish, PowerShell |
 
 <details>
 <summary><b>Privacy details: what is and isn't hidden</b></summary>
@@ -236,20 +273,17 @@ See [`config/middleman.example.toml`](config/middleman.example.toml) for every o
 
 - **Providers:** `preset` fills in the URL, key variable and trust level. Each provider's trust level
   (`untrusted`, `zdr`, `local`, `first_party`) caps how sensitive a job it can receive.
-- **Keys** are read from environment variables or a key file. They're never written into the config,
-  logs or output.
+- **Keys** come from an environment variable, the OS keychain (`key_source = "keychain"`), a
+  private file (`key_source = "file"`) or a `key_file`, in that order. They're never written into
+  the config, logs, the usage log or output, and are wiped from memory after use.
 - **Routes:** each task type has a chain of steps. A step is `auto:<code|chat>:<cheapest|balanced|best>`,
   `<provider>/<model>`, or `claude` (give the job back).
 - **Budget:** per-call, daily and weekly caps, plus a minimum balance to keep. If the balance can't be
   read, the request is refused.
 - **Per-project rules:** a `.middleman.toml` in a repo can only make the rules **stricter**.
 
-Optional prompt hook (local, ~20 ms, never blocks your prompt), merged into `~/.claude/settings.json`:
-
-```json
-{ "hooks": { "UserPromptSubmit": [ { "hooks": [ { "type": "command", "timeout": 5,
-    "command": "~/.local/bin/middleman route --hook" } ] } ] } }
-```
+The prompt hook (local, ~20 ms, never blocks your prompt) is added by `middleman setup claude`.
+It's a `UserPromptSubmit` command hook running `middleman route --hook`.
 
 </details>
 
@@ -267,7 +301,7 @@ Optional prompt hook (local, ~20 ms, never blocks your prompt), merged into `~/.
 Issues and PRs are welcome. Before opening a PR, run:
 
 ```sh
-cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked
 ```
 
 Design notes are in [`PLAN.md`](PLAN.md).
