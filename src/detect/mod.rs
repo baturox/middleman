@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn finding_debug_never_shows_value() {
-        let text = "key = AKIAABCDEFGHIJKLMNOP";
+        let text = concat!("key = AKIA", "ABCDEFGHIJKLMNOP");
         let d = Detector::new(vec![], vec![], None);
         let fs = d.scan(text);
         assert!(!fs.is_empty());

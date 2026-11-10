@@ -45,6 +45,10 @@ pub struct LedgerEntry {
     pub net_savings_usd: f64,
     /// passed | failed | skipped
     pub validation: String,
+    /// Claude Code session that made the call, when known (`CLAUDE_CODE_SESSION_ID` in the
+    /// MCP server's environment: the id at spawn time, so it can lag after `/clear`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 impl LedgerEntry {
@@ -57,7 +61,7 @@ impl LedgerEntry {
     }
 
     /// Normalize v1 values.
-    fn upgrade(mut self) -> Self {
+    pub(crate) fn upgrade(mut self) -> Self {
         if self.cost_source == "tokens" {
             self.cost_source = "usage".into();
         }
@@ -150,6 +154,33 @@ impl Ledger {
                     .map(LedgerEntry::upgrade)
                     .context("corrupt ledger line")
             })
+            .collect()
+    }
+
+    /// Lenient read of at most the last `max_bytes` of the ledger, skipping unparseable
+    /// lines. For display only (statusline, watch); never for budget decisions.
+    pub fn tail_entries(&self, max_bytes: u64) -> Vec<LedgerEntry> {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut f) = std::fs::File::open(&self.path) else {
+            return vec![];
+        };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let start = len.saturating_sub(max_bytes);
+        if f.seek(SeekFrom::Start(start)).is_err() {
+            return vec![];
+        }
+        let mut buf = Vec::new();
+        if f.read_to_end(&mut buf).is_err() {
+            return vec![];
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let mut lines = text.lines();
+        if start > 0 {
+            lines.next(); // partial first line
+        }
+        lines
+            .filter_map(|l| serde_json::from_str::<LedgerEntry>(l).ok())
+            .map(LedgerEntry::upgrade)
             .collect()
     }
 

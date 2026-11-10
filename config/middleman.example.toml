@@ -65,7 +65,8 @@ chain = ["auto:chat:cheapest", "claude"]
 #   deepseek/deepseek-v4.1-flash     0.30  / 1.20    strong at tests and boilerplate
 #   moonshotai/kimi-k3.1-pro         2.00  / 10.00   "best" tier, still cheaper than Opus
 [providers.openrouter]
-preset = "openrouter"            # key from OPENROUTER_API_KEY
+preset = "openrouter"            # OPENROUTER_API_KEY wins when set
+key_source = "keychain"          # else the key `middleman provider add openrouter` stored
 headers = { "X-Title" = "middleman" }
 model = "qwen/qwen3.8-flash"     # default when a chain step names just "openrouter"
 task_kinds = ["write_tests", "boilerplate", "summarize", "docstring", "snippet", "explain", "translate"]

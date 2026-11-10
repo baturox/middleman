@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::classify::{Complexity, Sensitivity};
+pub use crate::keystore::KeySource;
 use crate::providers::presets;
 use crate::TaskKind;
 
@@ -66,13 +67,13 @@ pub const DEFAULT_PUBLIC_HOSTS: &[&str] = &[
 pub const DEFAULT_UA: &str = "Mozilla/5.0 (compatible; middleman/0.1)";
 pub const PROJECT_FILE: &str = ".middleman.toml";
 
-/// An API key. Never printed, never serialized.
+/// An API key. Never printed, never serialized; the memory is zeroed on drop.
 #[derive(Clone)]
-pub struct Secret(String);
+pub struct Secret(zeroize::Zeroizing<String>);
 
 impl Secret {
     pub fn new(s: impl Into<String>) -> Self {
-        Secret(s.into())
+        Secret(zeroize::Zeroizing::new(s.into()))
     }
     pub fn expose(&self) -> &str {
         &self.0
@@ -341,6 +342,7 @@ struct RawProviderCfg {
     key_env: Option<String>,
     key_file: Option<PathBuf>,
     key_var: Option<String>,
+    key_source: Option<KeySource>,
     #[serde(default)]
     headers: BTreeMap<String, String>,
     trust: Option<Trust>,
@@ -357,12 +359,16 @@ struct RawProviderCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "RawProviderCfg")]
 pub struct ProviderCfg {
+    /// The `[providers.<name>]` key (filled in after parsing).
+    pub name: String,
     pub preset: Option<String>,
     pub api: Api,
     pub base_url: String,
     pub key_env: Option<String>,
     pub key_file: Option<PathBuf>,
     pub key_var: Option<String>,
+    /// Stored key: `keychain` (OS credential store) or `file` (0600 file). Env wins.
+    pub key_source: Option<KeySource>,
     pub headers: BTreeMap<String, String>,
     pub trust: Trust,
     pub max_sensitivity: Sensitivity,
@@ -397,6 +403,7 @@ impl TryFrom<RawProviderCfg> for ProviderCfg {
             .or(preset.map(|p| p.trust))
             .unwrap_or(Trust::Untrusted);
         Ok(ProviderCfg {
+            name: String::new(),
             preset: r.preset,
             api,
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -405,6 +412,7 @@ impl TryFrom<RawProviderCfg> for ProviderCfg {
                 .or(preset.and_then(|p| p.key_env.map(String::from))),
             key_file: r.key_file,
             key_var: r.key_var,
+            key_source: r.key_source,
             headers: r.headers,
             trust,
             max_sensitivity: r
@@ -436,15 +444,30 @@ impl ProviderCfg {
         self.trust != Trust::Local
     }
 
-    /// Resolve the API key: env var first, then `<key_var|key_env>=value` inside `key_file`.
-    /// Errors never contain the value. Local providers may have no key.
+    /// Resolve the API key: env var first, then the stored key (`key_source`), then
+    /// `<key_var|key_env>=value` inside `key_file`. Errors never contain the value and say how
+    /// to fix the problem. Local providers may have no key.
     pub fn resolve_key(&self) -> Result<Secret> {
         if let Some(env) = &self.key_env {
             if let Ok(v) = std::env::var(env) {
+                let v = zeroize::Zeroizing::new(v);
                 let v = v.trim();
                 if !v.is_empty() {
                     return Ok(Secret::new(v));
                 }
+            }
+        }
+        if let Some(src) = self.key_source {
+            let store = crate::keystore::Store::for_source(src);
+            match store.get(&self.name)? {
+                Some(k) => return Ok(k),
+                None if self.key_file.is_none() => bail!(
+                    "no API key for provider `{}` in {}: run `middleman provider add {}`",
+                    self.name,
+                    store.describe(&self.name),
+                    self.name
+                ),
+                None => {}
             }
         }
         let var = self.key_var.as_ref().or(self.key_env.as_ref());
@@ -452,6 +475,7 @@ impl ProviderCfg {
             (Some(file), Some(var)) => {
                 let text = std::fs::read_to_string(file)
                     .with_context(|| format!("cannot read key_file {}", file.display()))?;
+                let text = zeroize::Zeroizing::new(text);
                 for line in text.lines() {
                     let line = line.trim();
                     let line = line.strip_prefix("export ").unwrap_or(line);
@@ -469,15 +493,78 @@ impl ProviderCfg {
             }
             _ if !self.needs_key() => Ok(Secret::new("")),
             _ => bail!(
-                "key not found: env {} unset and no key_file",
-                self.key_env.as_deref().unwrap_or("<none>")
+                "no API key for provider `{name}`: run `middleman provider add {name}`{env}",
+                name = self.name,
+                env = self
+                    .key_env
+                    .as_deref()
+                    .map(|e| format!(" (or export {e})"))
+                    .unwrap_or_default()
             ),
         }
     }
 
-    /// Whether a key is resolvable, without exposing it.
-    pub fn key_present(&self) -> bool {
-        self.resolve_key().is_ok()
+    /// Where the key would come from, for status displays. Reads the store (not the value
+    /// out to the caller) only for `key_source` / `key_file`.
+    pub fn key_status(&self) -> KeyStatus {
+        if let Some(env) = &self.key_env {
+            if std::env::var_os(env).is_some_and(|v| !v.is_empty()) {
+                return KeyStatus::Env(env.clone());
+            }
+        }
+        if let Some(src) = self.key_source {
+            let store = crate::keystore::Store::for_source(src);
+            match store.get(&self.name) {
+                Ok(Some(_)) => return KeyStatus::Stored(src, store.describe(&self.name)),
+                Ok(None) if self.key_file.is_none() => {
+                    return KeyStatus::Missing(format!(
+                        "not found in {}",
+                        store.describe(&self.name)
+                    ))
+                }
+                Ok(None) => {}
+                Err(e) => return KeyStatus::Missing(format!("{e:#}")),
+            }
+        }
+        if let Some(f) = &self.key_file {
+            return match self.resolve_key() {
+                Ok(_) => KeyStatus::KeyFile(f.clone()),
+                Err(e) => KeyStatus::Missing(format!("{e:#}")),
+            };
+        }
+        if !self.needs_key() {
+            return KeyStatus::NotNeeded;
+        }
+        KeyStatus::Missing(match &self.key_env {
+            Some(e) => format!("{e} is not set and no key is stored"),
+            None => "no key configured".into(),
+        })
+    }
+}
+
+/// Where a provider's key comes from (never the key itself).
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyStatus {
+    Env(String),
+    Stored(KeySource, String),
+    KeyFile(PathBuf),
+    NotNeeded,
+    Missing(String),
+}
+
+impl KeyStatus {
+    pub fn ok(&self) -> bool {
+        !matches!(self, KeyStatus::Missing(_))
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            KeyStatus::Env(v) => format!("env {v}"),
+            KeyStatus::Stored(_, loc) => loc.clone(),
+            KeyStatus::KeyFile(p) => format!("key_file {}", crate::fsutil::pretty(p)),
+            KeyStatus::NotNeeded => "not needed (local)".into(),
+            KeyStatus::Missing(why) => format!("missing: {why}"),
+        }
     }
 }
 
@@ -550,7 +637,8 @@ impl Config {
         {
             *d = expand_tilde(d);
         }
-        for p in self.providers.values_mut() {
+        for (name, p) in self.providers.iter_mut() {
+            p.name = name.clone();
             if let Some(k) = &p.key_file {
                 p.key_file = Some(expand_tilde(k));
             }
@@ -619,8 +707,12 @@ impl Config {
             {
                 bail!("provider {name}: S3 is only allowed for trust = local | first_party");
             }
-            if p.needs_key() && p.key_env.is_none() && p.key_file.is_none() {
-                bail!("provider {name}: set key_env or key_file (keys are never inline)");
+            if p.needs_key()
+                && p.key_env.is_none()
+                && p.key_file.is_none()
+                && p.key_source.is_none()
+            {
+                bail!("provider {name}: set key_source, key_env or key_file (keys are never inline); `middleman provider add {name}` does this for you");
             }
             if p.key_file.is_some() && p.key_var.is_none() && p.key_env.is_none() {
                 bail!("provider {name}: key_file needs key_var or key_env");

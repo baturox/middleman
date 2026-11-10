@@ -173,27 +173,84 @@ pub fn merge(mut base: Value, snippet: &Value) -> Value {
     }
 }
 
-/// `--apply` (user-run): backup then merge into the settings file.
+/// `--apply` (user-run): backup then merge into the settings file. Only a missing file counts
+/// as `{}`; any other read or parse error aborts without writing. The backup and the rewrite
+/// keep the original file mode (0600 for new files) and the rewrite is atomic.
 pub fn apply(settings: &Path, snippet: &Value) -> Result<String> {
-    let cur: Value = match std::fs::read_to_string(settings) {
+    let (cur, backup) = match std::fs::read_to_string(settings) {
         Ok(t) => {
+            let v: Value = serde_json::from_str(&t)
+                .context("settings file is not valid JSON; not modified")?;
+            if !v.is_object() {
+                anyhow::bail!("settings file is not a JSON object; not modified");
+            }
             let backup = settings.with_extension(format!("json.bak-{}", crate::ledger::now_unix()));
-            std::fs::write(&backup, &t)?;
-            serde_json::from_str(&t).context("settings file is not valid JSON; not modified")?
+            crate::fsutil::write_atomic(&backup, t.as_bytes(), Some(0o600))?;
+            #[cfg(unix)]
+            if let Ok(m) = std::fs::metadata(settings) {
+                std::fs::set_permissions(&backup, m.permissions())?;
+            }
+            (v, Some(backup))
         }
-        Err(_) => json!({}),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (json!({}), None),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("cannot read {}; not modified", settings.display()))
+        }
     };
     let merged = merge(cur, snippet);
-    if let Some(d) = settings.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    std::fs::write(settings, serde_json::to_string_pretty(&merged)?)?;
-    Ok(format!("merged into {}", settings.display()))
+    let mut text = serde_json::to_string_pretty(&merged)?;
+    text.push('\n');
+    crate::fsutil::write_atomic(settings, text.as_bytes(), Some(0o600))?;
+    Ok(match backup {
+        Some(b) => format!(
+            "merged into {} (backup {})",
+            settings.display(),
+            b.display()
+        ),
+        None => format!("merged into {}", settings.display()),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_refuses_bad_json_and_keeps_mode() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.json");
+        std::fs::write(&p, "{oops").unwrap();
+        assert!(apply(&p, &json!({"a": 1})).is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{oops");
+        std::fs::write(&p, r#"{"keep": true}"#).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        apply(&p, &json!({"a": 1})).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v, json!({"keep": true, "a": 1}));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+        let fresh = d.path().join("new/settings.json");
+        apply(&fresh, &json!({"a": 1})).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
 
     #[test]
     fn merge_preserves_existing() {
