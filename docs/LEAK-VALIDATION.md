@@ -190,4 +190,4 @@ itself the secret must be declared `confidential`, which never leaves the machin
   high-entropy token. The request is then refused (fail closed), not leaked.
 - `tests/mcp_stdio.rs` fails when the checkout sits under a `.claude/` directory (for example a
   Claude Code worktree): the write deny rule `**/.claude/**` matches the absolute path, so file
-  mode is refused. It passes in a normal checkout. Not a leak; worth knowing.
+  mode is refused. It should pass in a normal checkout (not re-run there). Not a leak.
