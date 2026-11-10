@@ -62,6 +62,12 @@ pub fn is_free_tier(id: &str) -> bool {
     l.ends_with(":free") || l.ends_with("-free")
 }
 
+/// Variants that cannot answer an ordinary synchronous chat request (e.g. OpenRouter
+/// `:batch` endpoints return 404 there).
+pub fn is_unusable_variant(id: &str) -> bool {
+    id.to_ascii_lowercase().ends_with(":batch")
+}
+
 /// Capability tags from the model id (users can override per model).
 pub fn tags_for(id: &str, context: Option<u64>) -> Vec<String> {
     let l = id.to_ascii_lowercase();
@@ -209,22 +215,34 @@ impl Catalog {
             return None;
         }
         let ov = cfg.models.get(&format!("{provider}/{id}"));
+        let opted_in = ov.and_then(|o| o.enabled) == Some(true);
         match ov.and_then(|o| o.enabled) {
             Some(false) => return None,
             // free tiers typically log/train on prompts: opt-in only
-            None if is_free_tier(id) => return None,
+            None if is_free_tier(id) || is_unusable_variant(id) => return None,
             _ => {}
         }
+        let local = cfg
+            .providers
+            .get(provider)
+            .is_some_and(|p| p.trust == Trust::Local);
         let context = ov
             .and_then(|o| o.context)
             .or(info.and_then(|m| m.context_length));
         let tags = ov
             .and_then(|o| o.tags.clone())
             .unwrap_or_else(|| tags_for(id, context));
+        let prices = Self::price_for(cfg, provider, id, info);
+        // A remote model with $0 output is a preview, promo or non-chat endpoint (e.g. a
+        // summarize/extract API billed on input only), and free endpoints commonly log or train
+        // on prompts: opt-in only, like `:free`.
+        if !local && !opted_in && prices.as_ref().is_some_and(|p| p.out_per_1m == 0.0) {
+            return None;
+        }
         Some(Priced {
             provider: provider.to_string(),
             id: id.to_string(),
-            prices: Self::price_for(cfg, provider, id, info),
+            prices,
             context,
             tags,
         })
@@ -304,6 +322,53 @@ mod tests {
             price_out_per_1m: Some(0.1),
         };
         assert!(Catalog::priced(&cfg, "p", "evil id", Some(&bad)).is_none());
+    }
+
+    /// Regressions from the first live OpenRouter run: a `:batch` variant (404 on chat), a $0
+    /// music model (`->text+audio`) and other $0 endpoints were picked as "cheapest".
+    #[test]
+    fn live_catalog_traps_are_ineligible() {
+        let info = |id: &str, modality: &str, pin: f64, pout: f64| ModelInfo {
+            id: id.into(),
+            tier: None,
+            modality: Some(modality.into()),
+            status: None,
+            context_length: Some(1_000_000),
+            price_in_per_1m: Some(pin),
+            price_out_per_1m: Some(pout),
+        };
+        // output must be text only
+        assert!(!info(
+            "google/lyria-3-clip-preview",
+            "text+image->text+audio",
+            0.0,
+            0.0
+        )
+        .is_text());
+        assert!(!info("x/painter", "text+image->text+image", 0.1, 0.1).is_text());
+        assert!(!info("x/voice", "text+audio->text+audio", 0.1, 0.1).is_text());
+        assert!(info("z-ai/glm-5.3-flash", "text+image+video->text", 0.04, 0.08).is_text());
+        assert!(info("deepseek/deepseek-v4.1-flash", "text->text", 0.3, 1.2).is_text());
+        assert!(info("local-model", "Metin", 0.01, 0.01).is_text());
+
+        let d = tempfile::tempdir().unwrap();
+        let base = format!(
+            "[paths]\nroots = [\"{}\"]\n[providers.p]\napi = \"openai\"\nbase_url = \"https://p.invalid/v1\"\nkey_env = \"MM_NOPE\"\n",
+            d.path().display()
+        );
+        let cfg = Config::from_toml(&base).unwrap();
+        let batch = info("z-ai/glm-5.3-flash:batch", "text->text", 0.037, 0.061);
+        assert!(Catalog::priced(&cfg, "p", &batch.id, Some(&batch)).is_none());
+        let zero = info("scaledown/summarize", "text->text", 0.04, 0.0);
+        assert!(Catalog::priced(&cfg, "p", &zero.id, Some(&zero)).is_none());
+        let normal = info("z-ai/glm-5.3-flash", "text->text", 0.04, 0.08);
+        assert!(Catalog::priced(&cfg, "p", &normal.id, Some(&normal)).is_some());
+        // an explicit per-model opt-in still allows a $0 model
+        let cfg = Config::from_toml(&format!(
+            "{base}[models.\"p/scaledown/summarize\"]\nenabled = true\n"
+        ))
+        .unwrap();
+        assert!(Catalog::priced(&cfg, "p", &zero.id, Some(&zero)).is_some());
     }
 
     #[test]

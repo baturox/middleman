@@ -85,7 +85,13 @@ impl ModelInfo {
         ]
         .iter()
         .any(|t| m.contains(t));
-        let text_modality = text_like && !m.contains("->image") && !m.contains("->audio");
+        // "input->output" (OpenRouter): the output must be text only. `->text+audio` (music
+        // models such as lyria) or `->text+image` are not chat models for our purposes.
+        let output_text_only = match m.split_once("->") {
+            Some((_, out)) => out.trim() == "text",
+            None => true,
+        };
+        let text_modality = text_like && output_text_only;
         text_modality && !bad_id && self.status.as_deref().is_none_or(|s| s != "disabled")
     }
 }
