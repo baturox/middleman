@@ -56,13 +56,11 @@ to **keep it on Claude**, and middleman refuses it if Claude tries anyway.
 
 ## How it works
 
-```mermaid
-flowchart LR
-    A[Claude Code] -->|delegate_task| B[middleman<br/>on your machine]
-    B -->|1. read file<br/>2. remove secrets<br/>3. fake names| C[Cheap model<br/>DeepSeek / Qwen / GLM]
-    C -->|answer| B
-    B -->|4. real names back<br/>5. write file<br/>6. log cost| A
-```
+<p align="center">
+  <img src="docs/architecture.svg" alt="middleman flow: Claude Code sends file paths; middleman reads the files, detects secrets, decides whether it is safe and worth it (if not, Claude does it itself), replaces names with fake ones, sends sanitised text to a cheap OpenRouter model, restores the names, writes the result to a file, logs the cost, and returns a summary to Claude" width="900">
+</p>
+
+<sub>Editable source: [`docs/architecture.drawio`](docs/architecture.drawio) (open it in draw.io)</sub>
 
 - **Fails closed.** If anything is unclear (a possible secret, an unknown price, a broken config),
   nothing is sent and Claude does the job itself.
