@@ -34,6 +34,7 @@ pub mod routing;
 pub mod session;
 pub mod setup;
 pub mod statusline;
+pub mod suggest;
 pub mod transcript;
 pub mod tune;
 pub mod ui;

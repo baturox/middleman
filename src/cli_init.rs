@@ -1035,7 +1035,42 @@ impl Wizard {
         if chosen.is_empty() && kept.is_empty() {
             out!("{}", ui.row("Providers", &ui.dim("none yet")));
         }
+        self.offer_dictionary(project_dir)?;
         self.offer_claude(scope, project_dir).await
+    }
+
+    /// "Protect your company names": offered while the dictionary is empty. Names are the
+    /// one thing only the dictionary hides.
+    fn offer_dictionary(&self, project_dir: &Path) -> Result<()> {
+        let ui = self.ui;
+        let Ok(cfg) = Config::load(&self.cfg_path) else {
+            return Ok(());
+        };
+        let terms = cfg
+            .redact
+            .dictionary_file
+            .as_ref()
+            .map(|p| middleman::suggest::existing_terms(&middleman::config::expand_tilde(p)).len())
+            .unwrap_or(0);
+        if terms > 0 {
+            return Ok(());
+        }
+        out!("\n  {}", ui.bold("Protect your company names"));
+        self.hint("Company, product and people names are hidden only if they are in your private dictionary. middleman can look for them in this project (locally) and let you pick.");
+        if !self.confirm("Scan this project for names now?", true)? {
+            self.hint("Later: middleman dict suggest");
+            return Ok(());
+        }
+        if let Err(e) = crate::dict_suggest(
+            &self.cfg_path,
+            Some(project_dir.to_path_buf()),
+            false,
+            middleman::suggest::Confidence::Medium,
+            false,
+        ) {
+            out!("  {}", ui.warn(&format!("dictionary not updated: {e:#}")));
+        }
+        Ok(())
     }
 
     async fn offer_claude(&self, scope: Scope, project_dir: &Path) -> Result<()> {

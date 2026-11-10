@@ -173,6 +173,9 @@ fn wizard_update_existing_config_adds_a_local_provider() {
     r.send(DOWN);
     r.send("\r"); // Automatic
     r.expect("step 4 of 4 · Done");
+    r.expect("Protect your company names");
+    r.expect("Scan this project for names now?");
+    r.send("n");
     r.expect("Connect to Claude Code now?");
     r.send("n");
     r.finish();
@@ -240,6 +243,9 @@ fn wizard_bad_key_then_good_key_writes_config() {
     r.send("\r"); // Ask me each time (confirm), the default
 
     r.expect("step 4 of 4 · Done");
+    r.expect("Protect your company names");
+    r.expect("Scan this project for names now?");
+    r.send("n");
     r.expect("Connect to Claude Code now?");
     r.send("n");
     r.expect("middleman setup claude");

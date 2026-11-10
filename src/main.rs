@@ -233,6 +233,11 @@ enum Cmd {
     },
     /// Health check: config, keys, keychain, providers, catalog and Claude Code wiring
     Doctor,
+    /// The private dictionary of company, product and people names
+    Dict {
+        #[command(subcommand)]
+        action: DictCmd,
+    },
     /// Approve a routing.mode=confirm dry run (run this yourself, in a terminal)
     Approve {
         /// The approval_id shown by the dry run
@@ -293,6 +298,26 @@ enum ProviderCmd {
         /// Do not ask for confirmation
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DictCmd {
+    /// Find names in this project (locally: files, git config, git log) and add the ones you
+    /// pick to the dictionary
+    Suggest {
+        /// Add every candidate at or above --min-confidence without asking
+        #[arg(long)]
+        yes: bool,
+        /// low | medium | high (with --yes, or the preselection in the picker)
+        #[arg(long, default_value = "medium")]
+        min_confidence: String,
+        /// Project to scan [default: the git root of the current directory]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Print the candidates as JSON and exit (writes nothing)
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -564,6 +589,146 @@ fn route_hook(cfg_path: &Path) {
     ) {
         say!("{out}");
     }
+}
+
+// ---------------------------------------------------------------- dictionary
+
+/// Where the dictionary lives: the configured file, else `dictionary.txt` next to the config.
+fn dictionary_path(cfg_path: &Path, cfg: Option<&Config>) -> PathBuf {
+    cfg.and_then(|c| c.redact.dictionary_file.clone())
+        .map(|p| expand_tilde(&p))
+        .unwrap_or_else(|| {
+            cfg_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join("dictionary.txt")
+        })
+}
+
+/// Set `[redact] dictionary_file` in the user config when it is not set yet.
+fn set_dictionary_file(cfg_path: &Path, dict: &Path) -> Result<bool> {
+    let text = std::fs::read_to_string(cfg_path)?;
+    let mut doc: toml_edit::DocumentMut = text.parse().context("config is not valid TOML")?;
+    let redact = doc
+        .entry("redact")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let Some(t) = redact.as_table_mut() else {
+        bail!("[redact] in {} is not a table", pretty(cfg_path));
+    };
+    if t.contains_key("dictionary_file") {
+        return Ok(false);
+    }
+    t.insert(
+        "dictionary_file",
+        toml_edit::value(dict.to_string_lossy().as_ref()),
+    );
+    onboard::write_config(cfg_path, &doc.to_string())?;
+    Ok(true)
+}
+
+/// `middleman dict suggest`, also the init wizard's "Protect your company names" step.
+/// Writes only after the user picked (or with `yes`).
+pub(crate) fn dict_suggest(
+    cfg_path: &Path,
+    root: Option<PathBuf>,
+    yes: bool,
+    min: middleman::suggest::Confidence,
+    json: bool,
+) -> Result<()> {
+    use middleman::suggest;
+    let ui = middleman::ui::Ui::stderr();
+    let cfg = cfg_path
+        .exists()
+        .then(|| Config::load_with_project(cfg_path, &cwd()).map(|(c, _)| c))
+        .transpose()?;
+    let root = root
+        .map(|r| expand_tilde(&r))
+        .or_else(|| middleman::config::project_root_for(&cwd()))
+        .unwrap_or_else(cwd);
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    let dict = dictionary_path(cfg_path, cfg.as_ref());
+    let public = cfg.as_ref().map(|c| c.public_hosts()).unwrap_or_else(|| {
+        middleman::config::DEFAULT_PUBLIC_HOSTS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    });
+    let cands = suggest::mine(&root, &suggest::existing_terms(&dict), &public);
+    if json {
+        say!("{}", serde_json::to_string_pretty(&cands)?);
+        return Ok(());
+    }
+    note!(
+        "\n  {}\n  {}",
+        ui.bold(&format!("Names found in {}", pretty(&root))),
+        ui.dim("Read locally (files, git config, git log); nothing was sent anywhere.")
+    );
+    if cands.is_empty() {
+        note!(
+            "  No new candidates; the dictionary at {} already covers them.",
+            pretty(&dict)
+        );
+        return Ok(());
+    }
+    let preselect = |c: &suggest::Candidate| c.confidence >= min;
+    let picked: Vec<usize> = if yes {
+        (0..cands.len())
+            .filter(|&i| cands[i].confidence >= min)
+            .collect()
+    } else if interactive() {
+        let items: Vec<String> = cands.iter().map(suggest::describe).collect();
+        let defaults: Vec<bool> = cands.iter().map(preselect).collect();
+        note!(
+            "  {}",
+            ui.dim("Space toggles, Enter confirms. Low-confidence names are not preselected.")
+        );
+        dialoguer::MultiSelect::with_theme(&theme())
+            .with_prompt("Add to the private dictionary")
+            .items(&items)
+            .defaults(&defaults)
+            .interact()?
+    } else {
+        for c in &cands {
+            let mark = if preselect(c) { "[x]" } else { "[ ]" };
+            say!("  {mark} {}", suggest::describe(c));
+        }
+        note!(
+            "\n  Nothing written. Run it in a terminal to pick, or pass --yes (adds {} and above).",
+            min.as_str()
+        );
+        return Ok(());
+    };
+    if yes {
+        for &i in &picked {
+            say!("  [x] {}", suggest::describe(&cands[i]));
+        }
+    }
+    if picked.is_empty() {
+        note!("  Nothing selected; nothing written.");
+        return Ok(());
+    }
+    if cfg.is_none() {
+        bail!(
+            "no config at {}: run `middleman init` first",
+            pretty(cfg_path)
+        );
+    }
+    let chosen: Vec<&suggest::Candidate> = picked.iter().map(|&i| &cands[i]).collect();
+    let n = suggest::append(&dict, &chosen)?;
+    note!(
+        "  {}",
+        ui.ok(&format!("Added {n} line(s) to {}", pretty(&dict)))
+    );
+    if set_dictionary_file(cfg_path, &dict)? {
+        note!(
+            "  {}",
+            ui.ok(&format!(
+                "Set [redact] dictionary_file in {}",
+                pretty(cfg_path)
+            ))
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- keys and providers
@@ -1294,6 +1459,20 @@ async fn real_main() -> Result<ExitCode> {
             }
             return Ok(ExitCode::SUCCESS);
         }
+        Cmd::Dict {
+            action:
+                DictCmd::Suggest {
+                    yes,
+                    min_confidence,
+                    root,
+                    json,
+                },
+        } => {
+            let min = middleman::suggest::Confidence::parse(&min_confidence)
+                .context("--min-confidence must be low, medium or high")?;
+            dict_suggest(&cfg_path, root, yes, min, json)?;
+            return Ok(ExitCode::SUCCESS);
+        }
         Cmd::Doctor => {
             let checks = setup::doctor(&cfg_path, &cwd(), &home()).await;
             let mut ok = true;
@@ -1509,6 +1688,7 @@ async fn real_main() -> Result<ExitCode> {
         | Cmd::Watch { .. }
         | Cmd::Completions { .. }
         | Cmd::Doctor
+        | Cmd::Dict { .. }
         | Cmd::Usage { .. }
         | Cmd::Tune { .. } => unreachable!(),
     }

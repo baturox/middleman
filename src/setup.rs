@@ -266,15 +266,27 @@ pub async fn doctor(config_path: &Path, cwd: &Path, home: &Path) -> Vec<Check> {
             .map(|p| format!("applied {}", p.display()))
             .unwrap_or_else(|| "none".into()),
     ));
+    const EMPTY_DICT: &str =
+        "company and product names are not hidden; run `middleman dict suggest`";
     match &cfg.redact.dictionary_file {
-        Some(p) => match crate::detect::Dictionary::load(p) {
+        Some(p) if !crate::config::expand_tilde(p).exists() => out.push(Check::optional(
+            "dictionary",
+            false,
+            format!("{} does not exist yet: {EMPTY_DICT}", p.display()),
+        )),
+        Some(p) => match crate::detect::Dictionary::load(&crate::config::expand_tilde(p)) {
+            Ok(d) if d.is_empty() => out.push(Check::optional(
+                "dictionary",
+                false,
+                format!("empty: {EMPTY_DICT}"),
+            )),
             Ok(d) => out.push(check("dictionary", true, format!("{} terms", d.len()))),
             Err(e) => out.push(check("dictionary", false, format!("{e:#}"))),
         },
-        None => out.push(check(
+        None => out.push(Check::optional(
             "dictionary",
-            true,
-            "none configured (company names will not be pseudonymized)",
+            false,
+            format!("none configured: {EMPTY_DICT}"),
         )),
     }
     match crate::ledger::ensure_private_dir(&cfg.state_dir()) {
