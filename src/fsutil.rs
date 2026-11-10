@@ -83,8 +83,15 @@ pub fn pretty(path: &Path) -> String {
     path.display().to_string()
 }
 
+/// Zero-width and bidirectional-override characters: invisible, but they can reorder or hide
+/// what a terminal shows.
+fn invisible(c: char) -> bool {
+    matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+}
+
 /// Make an untrusted string (provider model ids, labels, ledger fields) safe to print on a
-/// terminal: control characters and ANSI escapes removed, at most `max` characters.
+/// terminal: control characters, ANSI/OSC escapes and bidi/zero-width characters removed, at
+/// most `max` characters.
 pub fn clean(s: &str, max: usize) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
@@ -92,19 +99,35 @@ pub fn clean(s: &str, max: usize) -> String {
     while let Some(c) = chars.next() {
         if c == '\u{1b}' {
             // skip an escape sequence: ESC [ ... final byte, or ESC + one char
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                for d in chars.by_ref() {
-                    if ('@'..='~').contains(&d) {
-                        break;
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for d in chars.by_ref() {
+                        if ('@'..='~').contains(&d) {
+                            break;
+                        }
                     }
                 }
-            } else {
-                chars.next();
+                // OSC (window title, hyperlinks): up to BEL or ESC \
+                Some(']') => {
+                    chars.next();
+                    while let Some(d) = chars.next() {
+                        if d == '\u{7}' {
+                            break;
+                        }
+                        if d == '\u{1b}' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
             }
             continue;
         }
-        if c.is_control() || ('\u{80}'..='\u{9f}').contains(&c) {
+        if c.is_control() || ('\u{80}'..='\u{9f}').contains(&c) || invisible(c) {
             continue;
         }
         if n == max {
