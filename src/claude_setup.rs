@@ -12,6 +12,10 @@
 //! `preserve_order`). `undo` restores the backups; if a file changed since (Claude Code
 //! rewrites `~/.claude.json` often), it removes only middleman's entries instead.
 
+/// Seconds Claude Code waits for the prompt hook. Ordinary prompts return in milliseconds; a
+/// `cheap:` prompt runs the delegation itself (provider timeout 120 s by default).
+pub const HOOK_TIMEOUT_S: u64 = 150;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -453,8 +457,7 @@ pub fn plan(o: &SetupOptions) -> Result<Plan> {
         }
     }
     if o.hook {
-        let group =
-            json!({"hooks": [{"type": "command", "command": o.hook_command(), "timeout": 5}]});
+        let group = json!({"hooks": [{"type": "command", "command": o.hook_command(), "timeout": HOOK_TIMEOUT_S}]});
         let path = p(&["hooks", "UserPromptSubmit"]);
         let arr = arr_at(&mut st.value, &path, &st.path)?.clone();
         let cmds = |g: &Value| -> Vec<String> {
@@ -468,10 +471,12 @@ pub fn plan(o: &SetupOptions) -> Result<Plan> {
                 })
                 .unwrap_or_default()
         };
-        let want = o.hook_command();
         let human = "add the prompt hook: a local check (~20 ms) that tells Claude when a job \
-                     can be delegated; it never blocks a prompt";
-        if !arr.iter().any(|g| cmds(g).contains(&want)) {
+                     can be delegated; a `cheap:` prompt is run by middleman itself and never \
+                     reaches Claude";
+        // same command and timeout already there: nothing to do (an older entry with the
+        // 5 s timeout is replaced)
+        if !arr.contains(&group) {
             match arr
                 .iter()
                 .position(|g| cmds(g).iter().any(|c| is_our_hook(c)))

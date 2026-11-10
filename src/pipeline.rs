@@ -110,6 +110,11 @@ pub struct DelegateRequest {
     /// Claude Code session (never from the caller): default `CLAUDE_CODE_SESSION_ID`.
     #[serde(skip)]
     pub session_id: Option<String>,
+    /// Typed by the user as a `cheap:` prompt and run by the prompt hook (never from an MCP
+    /// caller). The user's own command counts as approval in confirm and explicit mode, and
+    /// Claude spends nothing on it: the ledger records zero Claude-side overhead.
+    #[serde(skip)]
+    pub via_hook: bool,
 }
 
 impl DelegateRequest {
@@ -151,6 +156,7 @@ impl DelegateRequest {
             approval_id: None,
             call_chars: None,
             session_id: None,
+            via_hook: false,
         }
     }
 }
@@ -324,9 +330,27 @@ struct LedgerCtx {
     call_chars: u64,
     /// The output is prose (Claude tokenizer ratio for prose).
     prose: bool,
+    /// Direct `cheap:` path: no Claude tool call, no extra turn, no result to read.
+    via_hook: bool,
 }
 
 impl LedgerCtx {
+    /// `econ.breakdown`, with the Claude-side overhead removed on the direct path.
+    fn breakdown(&self, econ: &crate::economics::EconomicsCfg, m: &Measured) -> Breakdown {
+        let mut b = econ.breakdown(&self.prices, m);
+        if self.via_hook {
+            b.call_tokens = 0;
+            b.call_usd = 0.0;
+            b.context_tokens = 0;
+            b.turn_usd = 0.0;
+            b.result_tokens = 0;
+            b.result_usd = 0.0;
+            b.claude_overhead_usd = 0.0;
+            b.net_savings_usd = b.claude_equiv_usd - b.cheap_cost_usd;
+        }
+        b
+    }
+
     fn measured(&self, output_chars: u64, result_chars: u64, cheap: f64) -> Measured {
         Measured {
             claude_output_chars: output_chars,
@@ -371,6 +395,7 @@ impl LedgerCtx {
             claude_model: self.claude_model.clone(),
             validation: "skipped".into(),
             session_id: self.session_id.clone(),
+            via: self.via_hook.then(|| "hook".to_string()),
             closing: Some(false),
             ..Default::default()
         }
@@ -600,8 +625,8 @@ impl Pipeline {
     ) {
         let mut e = ctx.base(attempt, status);
         e.block_reason_category = (status != "dry_run").then(|| category.into());
-        let b = self.cfg.economics.breakdown(
-            &ctx.prices,
+        let b = ctx.breakdown(
+            &self.cfg.economics,
             &ctx.measured(0, crate::mcp::server::result_chars(out), 0.0),
         );
         ctx.close(&mut e, &b);
@@ -679,6 +704,7 @@ impl Pipeline {
         let mut needs_confirmation = false;
         if mode == RoutingMode::Confirm
             && !req.dry_run
+            && !req.via_hook
             && !(req.confirmed && req.approval_id.is_some())
         {
             req.dry_run = true;
@@ -742,6 +768,7 @@ impl Pipeline {
             cache_1h,
             call_chars: req.call_chars_or_estimate(),
             prose: !routing::is_code_kind(req.task_kind),
+            via_hook: req.via_hook,
         };
         let mut out = DelegateOutcome::new(&request_id, req.dry_run, write_mode);
         out.needs_confirmation = needs_confirmation;
@@ -752,7 +779,7 @@ impl Pipeline {
             dry_run: req.dry_run,
             ..Default::default()
         };
-        if mode == RoutingMode::Explicit && !req.user_requested && !req.dry_run {
+        if mode == RoutingMode::Explicit && !req.user_requested && !req.via_hook && !req.dry_run {
             let reason = "routing.mode=explicit: delegate only when the user asked (`cheap:` prefix or /delegate); then pass user_requested=true".into();
             return self.finish_blocked(out, rec, &ctx, "mode", reason);
         }
@@ -802,7 +829,7 @@ impl Pipeline {
             write_mode.as_str(),
             req.overwrite
         ));
-        if mode == RoutingMode::Confirm && !req.dry_run {
+        if mode == RoutingMode::Confirm && !req.dry_run && !req.via_hook {
             let id = req.approval_id.as_deref().unwrap_or("");
             if let Err(e) = Approvals::new(&self.cfg.state_dir()).consume(id, &fingerprint) {
                 return self.finish_blocked(
@@ -985,15 +1012,19 @@ impl Pipeline {
             .min(max_tokens as u64);
         let call_tokens =
             econ.claude_tokens(ctx.call_chars, false) + economics::TOOL_USE_FRAMING_TOKENS;
-        let threshold = econ
-            .min_expected_output_tokens
-            .max(econ.break_even_tokens_with(
-                &prices,
-                write_mode,
-                call_tokens,
-                context_tokens,
-                cache_1h,
-            ));
+        // the direct path has no Claude overhead to win back: any output saves
+        let threshold = if req.via_hook {
+            0
+        } else {
+            econ.min_expected_output_tokens
+                .max(econ.break_even_tokens_with(
+                    &prices,
+                    write_mode,
+                    call_tokens,
+                    context_tokens,
+                    cache_1h,
+                ))
+        };
         out.expected_output_tokens = Some(expected);
         out.break_even_tokens = Some(threshold);
         if expected < threshold {
@@ -1250,8 +1281,8 @@ impl Pipeline {
                     let mut result_chars = crate::mcp::server::result_chars(&out);
                     let mut b = Breakdown::default();
                     for _ in 0..4 {
-                        b = econ.breakdown(
-                            &prices,
+                        b = ctx.breakdown(
+                            econ,
                             &ctx.measured(claude_chars, result_chars, out.cost_usd),
                         );
                         out.savings = Some(b.summary());
@@ -1273,8 +1304,8 @@ impl Pipeline {
                         "internal error while processing the answer; nothing was written (the spend is recorded)"
                             .into(),
                     );
-                    let b = econ.breakdown(
-                        &prices,
+                    let b = ctx.breakdown(
+                        econ,
                         &ctx.measured(0, crate::mcp::server::result_chars(&out), 0.0),
                     );
                     line.status = "error".into();

@@ -22,6 +22,9 @@ pub struct LedgerEntry {
     pub attempt: u32,
     /// `p-<8 hex>`: salted hash of the project root (older lines: the root's base name).
     pub project: String,
+    /// `hook`: a `cheap:` prompt run by the prompt hook (no Claude tool call or turn).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     /// The user's own label for the project (`label` in `.middleman.toml`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_label: Option<String>,

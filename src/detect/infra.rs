@@ -330,7 +330,7 @@ impl InfraScanner {
             let p = m.as_str().trim_end_matches('.');
             if root_starts.contains(&m.start())
                 || self.roots.iter().any(|r| p.starts_with(r.as_str()))
-                || GENERIC_PATHS.iter().any(|g| p == *g)
+                || GENERIC_PATHS.contains(&p)
             {
                 continue;
             }

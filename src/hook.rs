@@ -1,6 +1,7 @@
 //! `middleman route [--hook]`: a local, no-network prompt classifier for Claude Code's
-//! UserPromptSubmit hook. It only adds context ("looks delegable" / "keep on Claude"); it
-//! never blocks the prompt and the hook path always exits 0.
+//! UserPromptSubmit hook. It only adds context ("looks delegable" / "keep on Claude") and the
+//! hook path always exits 0. The one exception is a `cheap:` prompt, which the hook runs
+//! itself and blocks (see `crate::direct`).
 //!
 //! Output fields (<https://code.claude.com/docs/en/hooks>): `hookSpecificOutput.additionalContext`
 //! goes to Claude; the top-level `systemMessage` is a short line shown to the user, so they can

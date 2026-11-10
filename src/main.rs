@@ -550,9 +550,11 @@ async fn probe(
     Ok(())
 }
 
-/// Hook path: never fails, never blocks. A config that cannot be loaded produces a
-/// "do not delegate" message instead of silently falling back to defaults.
-fn route_hook(cfg_path: &Path) {
+/// Hook path: never fails. A config that cannot be loaded produces a "do not delegate"
+/// message instead of silently falling back to defaults. A `cheap:` prompt is run here and
+/// blocked, so it never reaches Claude (see `middleman::direct`); every other prompt only
+/// gets advice.
+async fn route_hook(cfg_path: &Path) {
     let mut input = String::new();
     let _ = std::io::stdin().take(1 << 20).read_to_string(&mut input);
     let parsed = serde_json::from_str::<serde_json::Value>(&input).ok();
@@ -581,6 +583,21 @@ fn route_hook(cfg_path: &Path) {
         .dictionary_file
         .as_ref()
         .and_then(|p| Dictionary::load(p).ok());
+    let prompt = parsed
+        .as_ref()
+        .and_then(|v| v.get("prompt"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+    if let Some(body) = middleman::direct::body(prompt) {
+        let session = parsed
+            .as_ref()
+            .and_then(|v| v.get("session_id"))
+            .and_then(|s| s.as_str())
+            .map(String::from);
+        let msg = direct_run(cfg, dict.as_ref(), body, &hook_cwd, session).await;
+        say!("{}", middleman::direct::block_json(&msg));
+        return;
+    }
     if let Some(out) = middleman::hook::hook_output(
         &input,
         cfg.routing.mode,
@@ -589,6 +606,33 @@ fn route_hook(cfg_path: &Path) {
     ) {
         say!("{out}");
     }
+}
+
+/// Run one `cheap:` prompt through the full pipeline. Returns the message for the user.
+async fn direct_run(
+    cfg: Config,
+    dict: Option<&Dictionary>,
+    body: &str,
+    cwd: &Path,
+    session: Option<String>,
+) -> String {
+    use middleman::direct;
+    let advice = middleman::hook::advise(body, cfg.routing.mode, dict, Some(&cfg.economics));
+    if !advice.sensitive_topics.is_empty() {
+        return direct::refused_message(&advice.sensitive_topics);
+    }
+    let root = middleman::config::project_root_for(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    let parsed = match direct::parse(body, &root, cwd) {
+        Ok(p) => p,
+        Err(why) => return direct::usage_message(&why),
+    };
+    let pipeline = match Pipeline::new(cfg) {
+        Ok(p) => p,
+        Err(e) => return direct::usage_message(&format!("middleman could not start: {e:#}")),
+    };
+    let out = pipeline.run(parsed.request(session)).await;
+    direct::outcome_message(&out, &root)
 }
 
 // ---------------------------------------------------------------- dictionary
@@ -1215,7 +1259,7 @@ async fn real_main() -> Result<ExitCode> {
         .unwrap_or_else(default_config_path);
     match cli.cmd {
         Cmd::Route { hook: true, .. } => {
-            route_hook(&cfg_path);
+            route_hook(&cfg_path).await;
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Statusline {

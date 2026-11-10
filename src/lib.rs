@@ -9,6 +9,7 @@ pub mod classify;
 pub mod claude_setup;
 pub mod config;
 pub mod detect;
+pub mod direct;
 pub mod economics;
 pub mod egress;
 pub mod fsutil;

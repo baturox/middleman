@@ -792,7 +792,7 @@ fn identifiers(
 /// camel case; separator forms would otherwise only hit the skeleton pass, which blocks.
 pub fn variants(term: &str) -> Vec<String> {
     let mut words: Vec<String> = vec![];
-    for part in term.split(|c: char| c == '_' || c == '-' || c == ' ' || c == '.') {
+    for part in term.split(['_', '-', ' ', '.']) {
         for s in segments(part) {
             if !s.is_empty() {
                 words.push(s.to_lowercase());
