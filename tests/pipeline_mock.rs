@@ -598,3 +598,21 @@ async fn break_even_gate_and_blocked_calls_are_logged() {
     assert_eq!(l[1].block_reason_category.as_deref(), Some("secret"));
     assert!(l.iter().all(|x| x.cost_usd == 0.0));
 }
+
+#[tokio::test]
+async fn blocked_overhead_scales_with_request_size() {
+    let s = server(&[CHEAP], 10.0).await;
+    let e = env(&format!("{}/v1", s.uri()), "openai", "S1", "");
+    let mut cfg = e.config();
+    cfg.economics.enforce_break_even = true;
+    let p = Pipeline::new(cfg).unwrap();
+    for chars in [200u64, 20_000] {
+        let mut r = req(TaskKind::Snippet, "src/invoice.py");
+        r.call_chars = Some(chars);
+        assert_eq!(p.run(r).await.status, Status::Blocked);
+    }
+    let l = p.ledger().entries().unwrap();
+    assert_eq!(l.len(), 2);
+    assert!(l[1].call_tokens > l[0].call_tokens, "{:?}", (&l[0], &l[1]));
+    assert!(l[1].claude_overhead_usd > l[0].claude_overhead_usd);
+}

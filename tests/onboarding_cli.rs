@@ -82,7 +82,7 @@ fn onboarding_flow_in_temp_home() {
         .write_stdin(r#"{"session_id":"s-1","workspace":{"current_dir":"/"}}"#));
     assert_eq!(
         out.trim(),
-        "🛡 middleman ✓ openrouter · 0 jobs this session · 0 today · saved $0.00 session · $0.00 today · $0.00 total"
+        "🛡 middleman ✓ openrouter · 0 jobs this session · 0 today"
     );
     let (out, _) = run(mm(home)
         .args(["statusline", "--config", &cfg_s])

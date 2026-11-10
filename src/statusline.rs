@@ -489,6 +489,8 @@ fn claude_level_for(columns: usize) -> u8 {
 #[serde(default)]
 pub struct LedgerTotals {
     pub offset: u64,
+    /// Savings baseline these totals were computed against (0 = none); a change restarts them.
+    pub baseline: i64,
     pub all: Agg,
     /// UTC day number (unix / 86400) -> totals; the last 8 days are kept.
     pub days: BTreeMap<i64, Agg>,
@@ -499,6 +501,10 @@ pub struct LedgerTotals {
 impl LedgerTotals {
     pub fn add(&mut self, e: &LedgerEntry) {
         let ts = e.ts_unix();
+        // test runs and lines before the savings baseline never count
+        if !crate::report::counts(e, self.baseline) {
+            return;
+        }
         self.all.add(e);
         self.days.entry(ts.div_euclid(86_400)).or_default().add(e);
         if let Some(sid) = e
@@ -578,9 +584,18 @@ fn totals(state: &Path) -> LedgerTotals {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
+    let baseline = crate::report::read_baseline(state).unwrap_or(0);
+    let mut changed = false;
+    if t.baseline != baseline {
+        t = LedgerTotals {
+            baseline,
+            ..Default::default()
+        };
+        changed = true;
+    }
     let before = t.offset;
     advance_totals(&state.join("ledger.jsonl"), &mut t);
-    if t.offset != before {
+    if changed || t.offset != before {
         if let Ok(b) = serde_json::to_vec(&t) {
             let _ = crate::fsutil::write_atomic(&cache, &b, Some(0o600));
         }
@@ -784,6 +799,8 @@ fn mm_part(d: &MmData, level: u8, show_tokens: bool) -> T {
     }
     let mut parts = vec![head];
     parts.extend(update);
+    // savings only once a real (non-test) job succeeded after the baseline
+    let show_savings = d.all.ok > 0;
     match level {
         0 => {
             match &d.session {
@@ -818,7 +835,9 @@ fn mm_part(d: &MmData, level: u8, show_tokens: bool) -> T {
                 .push(dot.clone())
                 .push(saved(d.all.net_savings_usd))
                 .s(" total");
-            parts.push(s);
+            if show_savings {
+                parts.push(s);
+            }
             if show_tokens {
                 parts.push(T::raw(&format!(
                     "{} Claude tok avoided today",
@@ -844,18 +863,25 @@ fn mm_part(d: &MmData, level: u8, show_tokens: bool) -> T {
                 .push(dot.clone())
                 .push(saved(d.all.net_savings_usd))
                 .s(" total");
-            parts.push(s);
+            if show_savings {
+                parts.push(s);
+            }
         }
         2 => {
             let n = d.session.map(|s| s.jobs()).unwrap_or(d.today.jobs());
             parts.push(T::raw(&jobs(n)));
             let mut s = T::raw("saved ");
             s.push(saved(d.today.net_savings_usd)).s(" today");
-            parts.push(s);
+            if show_savings {
+                parts.push(s);
+            }
         }
         _ => {
             let mut s = T::raw("saved ");
             s.push(saved(d.today.net_savings_usd));
+            if !show_savings {
+                return parts.remove(0);
+            }
             return T::join(vec![parts.remove(0), s], &T::raw(" "));
         }
     }
@@ -1113,12 +1139,15 @@ fn compact(v: &Value, d: &MmData, o: &Opts) -> T {
                 };
                 items.push((3, 1, T::paint(&format!("{} left", usd(left)), c), 0));
             }
-            let mut s = T::raw("saved ");
-            s.push(saved(d.today.net_savings_usd));
-            items.push((0, 1, s, 0));
-            let mut tot = T::raw("total ");
-            tot.push(saved(d.all.net_savings_usd));
-            items.push((5, 1, tot, 0));
+            // savings only once a real (non-test) job succeeded after the baseline
+            if d.all.ok > 0 {
+                let mut s = T::raw("saved ");
+                s.push(saved(d.today.net_savings_usd));
+                items.push((0, 1, s, 0));
+                let mut tot = T::raw("total ");
+                tot.push(saved(d.all.net_savings_usd));
+                items.push((5, 1, tot, 0));
+            }
             let n = d.session.map(|s| s.jobs()).unwrap_or(d.today.jobs());
             if n > 0 {
                 items.push((8, 1, T::raw(&jobs(n)), 0));

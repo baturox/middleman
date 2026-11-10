@@ -7,6 +7,117 @@ use anyhow::{bail, Result};
 use serde::Serialize;
 
 use crate::ledger::{now_unix, LedgerEntry};
+use std::path::Path;
+
+const BASELINE_FILE: &str = "savings-baseline";
+
+/// Unix time of the last `middleman savings reset` (None = never reset).
+pub fn read_baseline(state: &Path) -> Option<i64> {
+    std::fs::read_to_string(state.join(BASELINE_FILE))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Record "now" as the savings baseline (state dir, 0600). Returns the timestamp.
+pub fn write_baseline(state: &Path) -> Result<i64> {
+    crate::ledger::ensure_private_dir(state)?;
+    let t = now_unix();
+    crate::fsutil::write_atomic(
+        &state.join(BASELINE_FILE),
+        format!("{t}\n").as_bytes(),
+        Some(0o600),
+    )?;
+    Ok(t)
+}
+
+/// Does this line count toward savings totals? Test runs never do; lines before the
+/// baseline (unix seconds, 0 = none) do not either.
+pub fn counts(e: &LedgerEntry, baseline: i64) -> bool {
+    !e.is_test() && e.ts_unix() >= baseline
+}
+
+/// Where the savings went, as exact sums of the ledger fields.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Explained {
+    /// sum of `claude_equiv_usd`
+    pub avoided_usd: f64,
+    /// sum of `cost_usd`
+    pub cheap_usd: f64,
+    /// `claude_overhead_usd` on `ok` lines
+    pub handoff_ok_usd: f64,
+    /// `claude_overhead_usd` on every other line (blocked, refused, errors, dry runs)
+    pub wasted_usd: f64,
+    /// closing lines that did not produce an answer
+    pub wasted_count: u64,
+    /// sum of `net_savings_usd`
+    pub net_usd: f64,
+    /// worst single line: (ts, task_kind, model or status, net)
+    pub biggest_loss: Option<(String, String, String, f64)>,
+}
+
+pub fn explain<'a>(es: impl IntoIterator<Item = &'a LedgerEntry>) -> Explained {
+    let mut x = Explained::default();
+    for e in es {
+        x.avoided_usd += e.claude_equiv_usd;
+        x.cheap_usd += e.cost_usd;
+        x.net_usd += e.net_savings_usd;
+        if e.status == "ok" {
+            x.handoff_ok_usd += e.claude_overhead_usd;
+        } else {
+            x.wasted_usd += e.claude_overhead_usd;
+            if e.is_closing() {
+                x.wasted_count += 1;
+            }
+        }
+        if e.net_savings_usd < 0.0
+            && x.biggest_loss
+                .as_ref()
+                .is_none_or(|b| e.net_savings_usd < b.3)
+        {
+            let who = if e.model.is_empty() {
+                e.status.clone()
+            } else {
+                e.model.clone()
+            };
+            x.biggest_loss = Some((e.ts.clone(), e.task_kind.clone(), who, e.net_savings_usd));
+        }
+    }
+    x
+}
+
+fn money3(v: f64) -> String {
+    if v < -0.0005 {
+        format!("\u{2212}${:.3}", -v)
+    } else {
+        format!("${:.3}", v.abs())
+    }
+}
+
+pub fn render_explained(x: &Explained) -> String {
+    let mut s = String::new();
+    let mut line = |label: String, v: f64| s.push_str(&format!("{label:<34} {:>9}\n", money3(v)));
+    line("Claude output you didn't pay for".into(), x.avoided_usd);
+    line("\u{2212} cheap-model cost".into(), x.cheap_usd);
+    line(
+        "\u{2212} Claude hand-off cost (ok jobs)".into(),
+        x.handoff_ok_usd,
+    );
+    line(
+        format!("\u{2212} blocked/refused attempts ({})", x.wasted_count),
+        x.wasted_usd,
+    );
+    line("= net saved".into(), x.net_usd);
+    if let Some((ts, task, who, net)) = &x.biggest_loss {
+        let when: String = ts.chars().take(16).collect::<String>().replace('T', " ");
+        s.push_str(&format!(
+            "biggest loss: {when} {task} via {who} ({})\n",
+            money3(*net)
+        ));
+    }
+    s
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum By {
@@ -153,6 +264,7 @@ pub struct Report {
     pub rows: Vec<Row>,
     pub top_block_reasons: Vec<(String, usize)>,
     pub claude_models: Vec<String>,
+    pub explained: Explained,
 }
 
 fn sent(e: &LedgerEntry) -> bool {
@@ -244,6 +356,7 @@ pub fn build(entries: &[LedgerEntry], since: Option<i64>, by: By) -> Report {
         rows,
         top_block_reasons: top,
         claude_models: models.into_iter().collect(),
+        explained: explain(es.iter().copied()),
     }
 }
 
@@ -312,6 +425,8 @@ pub fn render_text(r: &Report) -> String {
         );
         s.push('\n');
     }
+    s.push('\n');
+    s.push_str(&render_explained(&r.explained));
     s.push_str(
         "net$ (saved) = Claude output avoided at API prices - Claude-side overhead (tool call, extra turn re-reading the context, tool result) - cheap spend.\n\
          Blocked calls and dry runs count their overhead too. On a Pro/Max subscription the dollars are notional: read tok_avoid as usage-limit headroom.\n",
@@ -535,5 +650,89 @@ mod tests {
         );
         assert!(parse_since("7d").unwrap().is_some() && parse_since("all").unwrap().is_none());
         assert!(parse_since("7w").is_err());
+    }
+    use crate::ledger::rfc3339_at;
+
+    #[allow(clippy::too_many_arguments)]
+    fn le(
+        ts: i64,
+        status: &str,
+        eq: f64,
+        oh: f64,
+        cost: f64,
+        purpose: Option<&str>,
+    ) -> LedgerEntry {
+        LedgerEntry {
+            ts: rfc3339_at(ts),
+            request_id: format!("r{ts}"),
+            status: status.into(),
+            closing: Some(true),
+            claude_equiv_usd: eq,
+            claude_overhead_usd: oh,
+            cost_usd: cost,
+            net_savings_usd: eq - oh - cost,
+            model: "m/x".into(),
+            task_kind: "explain".into(),
+            purpose: purpose.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn totals_skip_tests_and_lines_before_the_baseline() {
+        let es = [
+            le(1000, "ok", 0.10, 0.02, 0.01, None), // before baseline
+            le(2000, "ok", 0.10, 0.02, 0.01, Some("test")), // test run
+            le(2000, "ok", 0.20, 0.03, 0.02, None),
+        ];
+        let c: Vec<_> = es.iter().filter(|x| counts(x, 1500)).collect();
+        assert_eq!(c.len(), 1);
+        let a = aggregate(c.iter().copied());
+        assert!((a.net_savings_usd - 0.15).abs() < 1e-12);
+        assert_eq!(es.iter().filter(|x| counts(x, 0)).count(), 2);
+    }
+
+    #[test]
+    fn breakdown_equals_ledger_sums() {
+        let es = vec![
+            le(1, "ok", 0.05, 0.01, 0.004, None),
+            le(2, "ok", 0.014, 0.017, 0.002, None),
+            le(3, "blocked", 0.0, 0.0166, 0.0, None),
+            le(4, "do_it_yourself", 0.0, 0.02, 0.0, None),
+        ];
+        let x = explain(&es);
+        let sum = |f: fn(&LedgerEntry) -> f64| es.iter().map(f).sum::<f64>();
+        assert_eq!(x.avoided_usd, sum(|e| e.claude_equiv_usd));
+        assert_eq!(x.cheap_usd, sum(|e| e.cost_usd));
+        assert_eq!(x.net_usd, sum(|e| e.net_savings_usd));
+        assert_eq!(
+            x.handoff_ok_usd + x.wasted_usd,
+            sum(|e| e.claude_overhead_usd)
+        );
+        assert_eq!(x.wasted_count, 2);
+        assert!(
+            (x.avoided_usd - x.cheap_usd - x.handoff_ok_usd - x.wasted_usd - x.net_usd).abs()
+                < 1e-12
+        );
+        let t = render_explained(&x);
+        assert!(
+            t.contains("blocked/refused attempts (2)") && t.contains("biggest loss"),
+            "{t}"
+        );
+        assert!(t.contains("\u{2212}$0.020"), "{t}");
+    }
+
+    #[test]
+    fn savings_reset_writes_private_baseline() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(read_baseline(d.path()), None);
+        let t = write_baseline(d.path()).unwrap();
+        assert_eq!(read_baseline(d.path()), Some(t));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let m = std::fs::metadata(d.path().join(BASELINE_FILE)).unwrap();
+            assert_eq!(m.permissions().mode() & 0o777, 0o600);
+        }
     }
 }

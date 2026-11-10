@@ -118,6 +118,10 @@ pub struct DelegateRequest {
     /// Claude spends nothing on it: the ledger records zero Claude-side overhead.
     #[serde(skip)]
     pub via_hook: bool,
+    /// `Some("test")` marks the ledger lines as a test run (never from an MCP caller):
+    /// excluded from savings totals.
+    #[serde(skip)]
+    pub purpose: Option<String>,
 }
 
 impl DelegateRequest {
@@ -161,6 +165,7 @@ impl DelegateRequest {
             call_chars: None,
             session_id: None,
             via_hook: false,
+            purpose: None,
         }
     }
 }
@@ -340,6 +345,7 @@ struct LedgerCtx {
     prose: bool,
     /// Direct `cheap:` path: no Claude tool call, no extra turn, no result to read.
     via_hook: bool,
+    purpose: Option<String>,
 }
 
 impl LedgerCtx {
@@ -404,6 +410,7 @@ impl LedgerCtx {
             validation: "skipped".into(),
             session_id: self.session_id.clone(),
             via: self.via_hook.then(|| "hook".to_string()),
+            purpose: self.purpose.clone(),
             closing: Some(false),
             ..Default::default()
         }
@@ -777,6 +784,7 @@ impl Pipeline {
             call_chars: req.call_chars_or_estimate(),
             prose: !routing::is_code_kind(req.task_kind),
             via_hook: req.via_hook,
+            purpose: req.purpose.clone(),
         };
         let mut out = DelegateOutcome::new(&request_id, req.dry_run, write_mode);
         out.verbose = req.verbose;
@@ -1563,8 +1571,15 @@ impl Pipeline {
         let savings = match &entries {
             Ok(es) => {
                 let now = crate::ledger::now_unix();
+                // test runs and lines before the savings baseline do not count
+                let base = report::read_baseline(&self.cfg.state_dir()).unwrap_or(0);
+                let counted: Vec<LedgerEntry> = es
+                    .iter()
+                    .filter(|e| report::counts(e, base))
+                    .cloned()
+                    .collect();
                 let sum = |since: Option<i64>| {
-                    let t = report::build(es, since, report::By::Day).total;
+                    let t = report::build(&counted, since, report::By::Day).total;
                     json!({
                         "requests": t.requests,
                         "ok": t.ok,

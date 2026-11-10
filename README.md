@@ -114,6 +114,11 @@ Blocked jobs count their overhead too, and a loss is shown as a loss. `middleman
 checks the log against your OpenRouter account. On a Pro/Max subscription, savings mean more usage
 before you hit your limits rather than a smaller bill.
 
+`middleman savings` explains the total line by line (output avoided, cheap-model cost, hand-off
+cost, blocked attempts, net). `middleman savings reset` starts counting from now (the log is kept;
+`report --all` still shows everything). Test runs are never counted; `report --include-tests`
+shows them. The status line shows savings only after the first real job has succeeded.
+
 ## Protect your company names
 
 ```sh

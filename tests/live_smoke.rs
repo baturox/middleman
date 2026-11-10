@@ -43,6 +43,7 @@ async fn live_docstring_roundtrip() {
     r.max_output_tokens = Some(400);
     r.max_cost_usd = Some(0.01);
     r.user_requested = true;
+    r.purpose = Some("test".into()); // excluded from savings totals
     r.write_mode = Some(middleman::economics::WriteMode::File);
     let target = out_root.join("invoice_documented.py");
     r.output_path = Some(target.display().to_string());

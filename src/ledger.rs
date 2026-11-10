@@ -84,9 +84,16 @@ pub struct LedgerEntry {
     /// MCP server's environment: the id at spawn time, so it can lag after `/clear`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// `test` for automated test runs (live smoke test): never counted in savings totals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
 }
 
 impl LedgerEntry {
+    pub fn is_test(&self) -> bool {
+        self.purpose.as_deref() == Some("test")
+    }
+
     /// Unix seconds parsed from `ts` (RFC 3339); unparseable timestamps count as "now" so a
     /// corrupted line can never hide spend from the caps.
     pub fn ts_unix(&self) -> i64 {

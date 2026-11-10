@@ -502,19 +502,23 @@ fn absent_fields_negative_savings_and_errors() {
     let l = crate::ledger::Ledger::new(&e.state()).unwrap();
     l.append(&entry(now - 5, "x", "blocked", 0.0, 0.031, 0.0, None))
         .unwrap();
-    // no session id, no model, nothing
-    let out = render_no_spawn(
-        "{}",
-        &e,
-        now,
-        &Opts {
-            middleman_only: true,
-            ..opts(200, 1)
-        },
-    );
+    // no session id, no model, nothing; no ok job yet: no savings shown
+    let mo = Opts {
+        middleman_only: true,
+        ..opts(200, 1)
+    };
+    let out = render_no_spawn("{}", &e, now, &mo);
     assert_eq!(
         out,
-        "🛡 middleman ✓ openrouter $7.42 left · 1 job today (1 blocked) · saved -$0.03 today · -$0.03 total"
+        "🛡 middleman ✓ openrouter $7.42 left · 1 job today (1 blocked)"
+    );
+    // once a real ok job exists, honest losses show
+    l.append(&entry(now - 4, "ok1", "ok", 0.0, 0.0, 0.0, None))
+        .unwrap();
+    let out = render_no_spawn("{}", &e, now, &mo);
+    assert_eq!(
+        out,
+        "🛡 middleman ✓ openrouter $7.42 left · 2 jobs today (1 blocked) · saved -$0.03 today · -$0.03 total"
     );
     assert!(render_no_spawn("not json", &e, now, &opts(200, 1)).starts_with("Claude"));
     let red = render_no_spawn(
@@ -713,7 +717,7 @@ fn newer_release_marker_and_daily_check() {
     assert_eq!(checks.get(), 1, "checked today: no second check");
     assert_eq!(
         out,
-        "🛡 middleman ✓ openrouter $7.42 left · ↑ v99.0.0 · 0 jobs today · saved $0.00 today · $0.00 total"
+        "🛡 middleman ✓ openrouter $7.42 left · ↑ v99.0.0 · 0 jobs today"
     );
     let c = render_no_spawn("{}", &e, now, &Opts { color: true, ..o });
     assert!(c.contains("\x1b[33m↑ v99.0.0\x1b[0m"), "{c:?}");

@@ -62,6 +62,16 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum SavingsCmd {
+    /// Count savings only from now on (writes a baseline; the log is kept)
+    Reset {
+        /// Do not ask
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Guided setup: where to install, provider and key (checked live), routing mode
     Init {
@@ -164,6 +174,17 @@ enum Cmd {
         /// Compare the ledger's cost with the provider's own usage counters (free GETs)
         #[arg(long)]
         reconcile: bool,
+        /// Ignore the savings baseline and include test runs
+        #[arg(long)]
+        all: bool,
+        /// Include test runs (live smoke test) in the totals
+        #[arg(long)]
+        include_tests: bool,
+    },
+    /// What middleman saved, explained; `savings reset` starts counting from now
+    Savings {
+        #[command(subcommand)]
+        action: Option<SavingsCmd>,
     },
     /// Claude Code spend from local transcripts (~/.claude/projects), totals only
     Usage {
@@ -1933,12 +1954,23 @@ async fn real_main() -> Result<ExitCode> {
             json,
             html,
             reconcile,
+            all,
+            include_tests,
         } => {
             let since = middleman::report::parse_since(&since)?;
             let by = middleman::report::By::parse(&by)
                 .context("--by must be model, provider, task, day or project")?;
             let l = middleman::ledger::Ledger::new(&cfg.state_dir())?;
-            let es = l.entries()?;
+            let base = if all {
+                0
+            } else {
+                middleman::report::read_baseline(&cfg.state_dir()).unwrap_or(0)
+            };
+            let es: Vec<_> = l
+                .entries()?
+                .into_iter()
+                .filter(|e| (all || include_tests || !e.is_test()) && e.ts_unix() >= base)
+                .collect();
             if reconcile {
                 let r = middleman::reconcile::run(&cfg, &es, since).await;
                 if json {
@@ -1962,6 +1994,40 @@ async fn real_main() -> Result<ExitCode> {
                 say!("{}", serde_json::to_string_pretty(&r)?);
             } else {
                 say!("{}", middleman::report::render_text(&r));
+            }
+        }
+        Cmd::Savings { action } => {
+            let state = cfg.state_dir();
+            match action {
+                Some(SavingsCmd::Reset { yes }) => {
+                    if !yes {
+                        say!("Start counting savings from now? Earlier jobs stay in the log (`report --all`). [y/N]");
+                        let mut a = String::new();
+                        std::io::stdin().read_line(&mut a)?;
+                        if !a.trim().eq_ignore_ascii_case("y") {
+                            say!("not reset");
+                            return Ok(ExitCode::SUCCESS);
+                        }
+                    }
+                    middleman::report::write_baseline(&state)?;
+                    say!("savings baseline set to now");
+                }
+                None => {
+                    let base = middleman::report::read_baseline(&state).unwrap_or(0);
+                    let l = middleman::ledger::Ledger::new(&state)?;
+                    let es = l.entries()?;
+                    let x = middleman::report::explain(
+                        es.iter().filter(|e| middleman::report::counts(e, base)),
+                    );
+                    if base > 0 {
+                        say!(
+                            "since {} (savings reset)",
+                            middleman::ledger::rfc3339_at(base)
+                        );
+                    }
+                    say!("{}", middleman::report::render_explained(&x).trim_end());
+                    say!("(test runs excluded; `report --all` shows everything)");
+                }
             }
         }
         Cmd::Route { .. }
