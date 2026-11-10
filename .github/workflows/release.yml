@@ -51,6 +51,46 @@ jobs:
         shell: bash
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # Stable signature for the macOS binaries: the same identifier and certificate every
+      # release, so the designated requirement does not change (README, Upgrading). Runs before
+      # packaging, so the checksum and the attestation cover the signed binary. Without the
+      # secret (forks) the linker's ad-hoc signature stays, with a visible warning.
+      - name: Sign (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          P12: ${{ secrets.MACOS_SIGNING_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_SIGNING_PASSWORD }}
+          BIN: target/${{ matrix.target }}/release/middleman
+        run: |
+          set -euo pipefail
+          if [ -z "${P12:-}" ] || [ -z "${P12_PASSWORD:-}" ]; then
+            echo "::warning title=unsigned macOS build::MACOS_SIGNING_P12 / MACOS_SIGNING_PASSWORD are not set; the binary keeps its ad-hoc signature (see scripts/make-signing-cert.sh)"
+            exit 0
+          fi
+          kc="$RUNNER_TEMP/signing.keychain-db"
+          kcpw=$(openssl rand -hex 24)
+          trap 'security delete-keychain "$kc" 2>/dev/null || true; rm -f "$RUNNER_TEMP/signing.p12"' EXIT
+          printf '%s' "$P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security create-keychain -p "$kcpw" "$kc"
+          security set-keychain-settings -lut 900 "$kc"
+          security unlock-keychain -p "$kcpw" "$kc"
+          security import "$RUNNER_TEMP/signing.p12" -k "$kc" -P "$P12_PASSWORD" -T /usr/bin/codesign >/dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kcpw" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          # the certificate's SHA-1 is both the signing identity and the pinned leaf hash
+          leaf=$(security find-certificate -a -Z -c "middleman release signing" "$kc" | awk '/SHA-1 hash:/ {print $3; exit}')
+          [ -n "$leaf" ] || { echo "signing certificate not found in the p12" >&2; exit 1; }
+          req="designated => identifier \"dev.baturox.middleman\" and certificate leaf = H\"$leaf\""
+          codesign --force --options runtime --identifier dev.baturox.middleman \
+            --sign "$leaf" --keychain "$kc" --timestamp=none -r="$req" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          got=$(codesign -d -r- "$BIN" 2>&1 | sed -n 's/^designated => //p')
+          want="identifier \"dev.baturox.middleman\" and certificate leaf = H\"$(echo "$leaf" | tr 'A-F' 'a-f')\""
+          echo "designated requirement: $got"
+          [ "$(echo "$got" | tr 'A-F' 'a-f')" = "$(echo "$want" | tr 'A-F' 'a-f')" ] ||
+            { echo "unexpected designated requirement" >&2; exit 1; }
+
       - name: Package
         id: pkg
         shell: bash
