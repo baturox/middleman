@@ -619,6 +619,12 @@ fn key_ok(cfg: &Config, p: &ProviderCfg, now: i64) -> Result<(), String> {
             }
             return Ok(());
         }
+        if let KeyStatus::Missing(why) = &st {
+            if crate::keystore::is_denied(why) {
+                let n = clean(&p.name, 24);
+                return Err(format!("key locked (run: middleman provider test {n})"));
+            }
+        }
         return Err(no_key(p));
     }
     match p.key_status() {
@@ -667,6 +673,8 @@ pub struct MmData {
     pub agents: Option<u64>,
     /// A newer release found by the daily check (`v0.3.1`).
     pub update: Option<String>,
+    /// An automatic update installed this version (`v0.3.1`), shown for a short while.
+    pub updated: Option<String>,
 }
 
 /// Balance warning colour.
@@ -741,7 +749,13 @@ fn mm_part(d: &MmData, level: u8, show_tokens: bool) -> T {
         .update
         .as_ref()
         .filter(|_| level <= 2)
-        .map(|v| T::paint(&format!("↑ {v}"), C::Yellow));
+        .map(|v| T::paint(&format!("↑ {v}"), C::Yellow))
+        .or_else(|| {
+            d.updated
+                .as_ref()
+                .filter(|_| level <= 2)
+                .map(|v| T::paint(&format!("✓ updated to {v}"), C::Green))
+        });
     if let Some((left, age)) = d.left {
         if level <= 2 {
             let col = match d.low_balance {
@@ -885,10 +899,33 @@ fn mm_data(
     let refresh_off = std::env::var_os("MIDDLEMAN_SL_NO_REFRESH").is_some_and(|v| v == "1");
 
     // a newer release, from the daily check's cache (the check itself runs detached)
-    if crate::upgrade::checks_enabled(cfg.update.check, &|k| std::env::var(k).ok()) {
-        let uc = crate::upgrade::load_cache(&state);
-        d.update = crate::upgrade::newer_cached(uc.as_ref(), &crate::upgrade::Version::current())
-            .map(|v| v.tag());
+    let mode = cfg.update.mode();
+    if crate::upgrade::checks_enabled(mode != crate::config::UpdateMode::Off, &|k| {
+        std::env::var(k).ok()
+    }) {
+        use crate::upgrade::{self as up, Version};
+        let uc = up::load_cache(&state);
+        let cur = Version::current();
+        d.update = up::newer_cached(uc.as_ref(), &cur).map(|v| {
+            // auto mode installs patch releases itself; a bigger jump needs the user
+            if mode == crate::config::UpdateMode::Auto
+                && up::auto_decision(&cur, &v) == up::AutoDecision::Manual
+            {
+                format!("{} available (run middleman upgrade)", v.tag())
+            } else {
+                v.tag()
+            }
+        });
+        if d.update.is_none() {
+            d.updated = up::updated_notice(uc.as_ref(), now, &cur);
+            if let (Some(_), Some(c)) = (&d.updated, &uc) {
+                if c.notice_since.is_none() {
+                    let mut c = c.clone();
+                    c.notice_since = Some(now);
+                    let _ = up::save_cache(&state, &c);
+                }
+            }
+        }
         if !refresh_off {
             crate::upgrade::maybe_check(&state, uc.as_ref(), now, spawn_update);
         }
@@ -1096,6 +1133,8 @@ fn compact(v: &Value, d: &MmData, o: &Opts) -> T {
             }
             if let Some(u) = &d.update {
                 items.push((7, 1, T::paint(&format!("↑{u}"), C::Yellow), 0));
+            } else if let Some(u) = &d.updated {
+                items.push((7, 1, T::paint(&format!("✓ updated to {u}"), C::Green), 0));
             }
         }
         Some(Err(e)) => {
@@ -1227,7 +1266,11 @@ pub fn run(cfg_path: &Path, o: &Opts) -> String {
             now,
             o,
             &mut || limits::spawn_refresh(&p),
-            &mut || crate::upgrade::spawn_check(&p),
+            &mut || {
+                let auto = Config::load(&p)
+                    .is_ok_and(|c| c.update.mode() == crate::config::UpdateMode::Auto);
+                crate::upgrade::spawn_check(&p, auto)
+            },
         )
     })
     .unwrap_or_else(|_| "🛡 middleman ✗ internal error (run: middleman doctor)".into())

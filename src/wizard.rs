@@ -236,6 +236,32 @@ pub fn set_mode(text: &str, mode: RoutingMode) -> Result<String> {
     Ok(doc.to_string())
 }
 
+/// Set `[statusline] enabled`, keeping everything else.
+pub fn set_statusline_enabled(text: &str, on: bool) -> Result<String> {
+    let mut doc: toml_edit::DocumentMut = text.parse().context("config is not valid TOML")?;
+    doc.entry("statusline")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .context("`statusline` in the config is not a table")?
+        .insert("enabled", toml_edit::value(on));
+    Ok(doc.to_string())
+}
+
+/// Set `[update] mode` (dropping the older `check` key), keeping everything else.
+pub fn set_update_mode(text: &str, mode: crate::config::UpdateMode) -> Result<String> {
+    let mut doc: toml_edit::DocumentMut = text.parse().context("config is not valid TOML")?;
+    let u = doc
+        .entry("update")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .context("`update` in the config is not a table")?;
+    u.remove("check");
+    u.insert("mode", toml_edit::value(mode.as_str()));
+    let out = doc.to_string();
+    Config::from_toml(&out).context("the updated config would be invalid")?;
+    Ok(out)
+}
+
 /// Make sure `dir` is readable: append it to `[paths] roots` unless a root already covers it.
 pub fn add_root(text: &str, dir: &Path) -> Result<String> {
     let cfg = Config::from_toml(text)?;
@@ -432,6 +458,34 @@ mod tests {
             "# mine\n[paths]\nroots = [\"{}\"]\n\n[routing]\nmode = \"auto\" # keep comment\n\n[providers.openrouter]\npreset = \"openrouter\"\nkey_source = \"file\"\n",
             dir.display()
         )
+    }
+
+    #[test]
+    fn set_update_mode_replaces_check_and_keeps_comments() {
+        use crate::config::UpdateMode;
+        let base = "[paths]\nroots = [\"/tmp\"]\n";
+        let t = &format!("# mine\n{base}[update]\ncheck = false\n");
+        let out = set_update_mode(t, UpdateMode::Auto).unwrap();
+        assert!(out.contains("# mine") && !out.contains("check"), "{out}");
+        let c = Config::from_toml(&out).unwrap();
+        assert_eq!(c.update.mode(), UpdateMode::Auto);
+        let out = set_update_mode(base, UpdateMode::Off).unwrap();
+        assert_eq!(
+            Config::from_toml(&out).unwrap().update.mode(),
+            UpdateMode::Off
+        );
+        // the old spelling still means off; the default is notify
+        assert_eq!(
+            Config::from_toml(&format!("{base}[update]\ncheck = false\n"))
+                .unwrap()
+                .update
+                .mode(),
+            UpdateMode::Off
+        );
+        assert_eq!(
+            Config::from_toml(base).unwrap().update.mode(),
+            UpdateMode::Notify
+        );
     }
 
     #[test]

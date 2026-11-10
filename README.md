@@ -91,9 +91,10 @@ curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/baturox/
 
 This downloads the right binary from [Releases](https://github.com/baturox/middleman/releases/latest),
 checks its SHA-256 (it refuses to install on a missing or wrong checksum) and installs it to
-`~/.local/bin`. If the GitHub CLI is installed it also verifies the build-provenance attestation
-(`MIDDLEMAN_REQUIRE_ATTESTATION=1` makes a failed check fatal). The macOS binary is not code-signed;
-the installer removes the quarantine flag and says so.
+`~/.local/bin`. If the GitHub CLI is installed and logged in it also verifies the build-provenance
+attestation (a failed check stops the install; `MIDDLEMAN_REQUIRE_ATTESTATION=1` also requires
+`gh`). The macOS binary is signed but not notarized, so the installer removes the quarantine flag
+(see [Upgrading](#upgrading)). Output is about three lines; `MIDDLEMAN_VERBOSE=1` shows every step.
 
 Every release archive carries a [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations).
 To check a download yourself:
@@ -116,7 +117,7 @@ gh attestation verify middleman-<version>-<target>.tar.gz --repo baturox/middlem
 ```sh
 tar -xzf middleman-*-aarch64-apple-darwin.tar.gz
 install -m 0755 middleman-*/middleman ~/.local/bin/
-xattr -d com.apple.quarantine ~/.local/bin/middleman 2>/dev/null   # macOS: allow the unsigned binary
+xattr -d com.apple.quarantine ~/.local/bin/middleman 2>/dev/null   # macOS: allow the non-notarized binary
 ```
 
 From source (Rust stable):
@@ -130,46 +131,65 @@ cargo install --git https://github.com/baturox/middleman --locked
 ### Upgrading
 
 ```sh
-middleman upgrade --check     # this version, the latest release, a link to its notes (exit 10 = update available)
-middleman upgrade             # shows the release notes, asks, then installs
+middleman upgrade             # asks, then installs the latest release (--yes: no question)
+middleman upgrade --check     # this version and the latest one (exit 10 = update available)
 middleman upgrade --rollback  # put the previous binary back
+middleman update-settings     # notify (default) | auto | off
 ```
 
-`middleman upgrade` downloads the release for this machine over HTTPS (redirects only to GitHub's
-download hosts, 50 MB cap), refuses it unless its SHA-256 matches `SHA256SUMS.txt`, runs
-`gh attestation verify` when the GitHub CLI is installed (`--require-attestation` or
-`MIDDLEMAN_REQUIRE_ATTESTATION=1` makes a failure fatal), extracts only the `middleman` binary,
-checks that it runs and reports the expected version, and only then replaces the old one in a
-single rename. The old binary stays next to it as `middleman.prev`. `--version v0.3.1` picks a
-release, `--yes` skips the question. Rerunning `install.sh` over an existing install does the same
-(and also keeps `middleman.prev`).
+A successful upgrade prints about three lines:
+
+```
+✓ middleman 0.2.0 → 0.3.0 (verified)
+✓ Claude Code settings updated (backup kept; undo: middleman setup claude --undo)
+  macOS will ask once to let middleman use its Keychain key: click Always Allow
+```
+
+The last line only appears on macOS when a key is in the Keychain and the new binary will be asked
+about (see below). `--verbose` (installer: `MIDDLEMAN_VERBOSE=1`) shows every step: download,
+checksum, provenance, the wiring diff and the backup paths. Nothing else is needed afterwards: a
+running MCP server notices the new binary between requests and re-executes it in place, keeping
+the session (on Windows, run `/mcp` once).
+
+**What is checked.** The release is downloaded over HTTPS (redirects only to GitHub's download
+hosts, 50 MB cap) and refused unless its SHA-256 matches `SHA256SUMS.txt`. When the GitHub CLI is
+installed and logged in, `gh attestation verify` must pass too: a failed verification stops the
+upgrade. Without `gh` (or logged out) that check is skipped silently; `--require-attestation` or
+`MIDDLEMAN_REQUIRE_ATTESTATION=1` makes it mandatory. Only the `middleman` binary is extracted; it
+must run and report the expected version before one rename replaces the old binary, which stays
+next to it as `middleman.prev`. Rerunning `install.sh` does the same. Then the new binary runs
+`setup claude --refresh --yes` (`--no-wiring` skips it), which only updates entries middleman wrote
+(MCP command, hook command and timeout, status line command, CLAUDE.md block), backs up every file
+first and never adds anything.
 
 Installed with **cargo** or **Homebrew**? `middleman upgrade` leaves that binary alone and prints
-the command to use instead: `cargo install --git https://github.com/baturox/middleman --locked --force`
-or `brew upgrade middleman`, then `middleman setup claude --refresh`.
+the command to use instead (`cargo install --git https://github.com/baturox/middleman --locked --force`
+or `brew upgrade middleman`, then `middleman setup claude --refresh`).
 
-**What gets migrated.** Older versions wrote Claude Code wiring that the new binary may not match
-(for example 0.2.0 set a 5 s prompt-hook timeout; `cheap:` prompts need 150 s). After an upgrade,
-the new binary runs `middleman setup claude --refresh --yes` (skip it with `--no-wiring`). It only
-updates entries middleman wrote and that still exist, in user and project scope: the MCP server's
-command and arguments, the prompt hook's command and timeout, the status line command, and the
-CLAUDE.md block between its markers. It never adds anything and never touches entries that are
-not middleman's; every file is backed up first (`middleman setup claude --undo` reverts).
-`middleman doctor` tells you when the wiring is outdated.
+**Automatic updates.** `[update] mode` in the config (or `middleman update-settings`, also asked
+by `init`): `notify` (default) shows `↑ v0.3.1` in the status line and `doctor`; `auto` also
+installs patch releases of the same line in the background, with the same verification and wiring
+refresh, logs to `~/.local/state/middleman/update.log` and shows `✓ updated to v0.3.1` for a few
+minutes. It never crosses a major version (for 0.x, a minor one: 0.3.x → 0.4.0 shows
+`↑ v0.4.0 available (run middleman upgrade)`). `off` never checks (`MIDDLEMAN_NO_UPDATE_CHECK=1`
+too). The check runs at most once a day and is one unauthenticated GET to `api.github.com` with a
+generic User-Agent.
 
-**Left for you** after an upgrade:
+**macOS: Gatekeeper and the Keychain.** The macOS binaries are signed with a stable self-signed
+certificate (identifier `dev.baturox.middleman`, designated requirement pinned to that certificate),
+not notarized: notarization needs a paid Apple Developer ID, so Gatekeeper still treats the binary
+as unidentified (the installer clears the quarantine flag; integrity rests on the checksum and the
+attestation). The stable signature keeps the Keychain item's access list valid across releases,
+but macOS also has a second gate, the item's *partition list*, and it identifies code that is not
+signed by Apple or a Developer ID by its cdhash, which changes with every build. So the Keychain
+still asks once after each upgrade; click **Always Allow**. If a background read is refused (the
+status line shows `✗ key locked`), run `middleman provider test openrouter` in a terminal. To avoid
+the prompt entirely, store the key in a file instead (`MIDDLEMAN_KEYSTORE=file`, 0600) or use an
+environment variable; both are readable by any program running as you.
 
-- Run `/mcp` in Claude Code (or restart it) to reconnect: the MCP server that is running is still
-  the old binary.
-- macOS may ask once to let the new binary use the Keychain: choose **Always Allow**. The binary
-  changed, so its code signature did too, and the Keychain asks again before it hands a stored API
-  key to a program it has not seen.
-
-**Update notice.** At most once a day the status line (or `doctor`) starts a background
-`middleman upgrade --check`; when a newer release exists the status line shows `↑ v0.3.1` and
-`doctor` says `update available: run middleman upgrade`. That check is a single unauthenticated GET
-to `api.github.com` (no data about you or your projects, no identifiers, a generic User-Agent).
-Turn it off with `[update] check = false` in the config or `MIDDLEMAN_NO_UPDATE_CHECK=1`.
+Maintainers: the signing certificate is made once with `sh scripts/make-signing-cert.sh`, which
+prints the `gh secret set MACOS_SIGNING_P12` / `MACOS_SIGNING_PASSWORD` commands; without those
+secrets the release workflow builds with a warning and keeps the ad-hoc signature.
 
 ## Quick start
 
@@ -210,7 +230,7 @@ Run `middleman init`. It asks four things with arrow-key menus and checks your k
 ✔ Connect to Claude Code now? (runs `middleman setup claude`, shows the changes first) · yes
 ```
 
-Restart Claude Code and the status line shows your model and context, then `🛡 ✓ openrouter`.
+Restart Claude Code: the status line at the bottom ends with `🛡✓` when middleman is ready.
 
 - **Routing modes:** *confirm* (the default) shows you what would be sent and waits for
   `middleman approve <id>` in your terminal; *auto* lets Claude delegate safe, big-enough jobs
@@ -219,7 +239,7 @@ Restart Claude Code and the status line shows your model and context, then `🛡
   Service), never into the config or your shell history. Run `init` again to keep, update or
   start fresh (the old config is backed up).
 - `setup claude` (also offered at the end of `init`) registers the MCP server, allows its two
-  tools, adds the prompt hook, the statusline and the CLAUDE.md block, and lists each change
+  tools, adds the prompt hook, the status line and the CLAUDE.md block, and lists each change
   first. `--dry-run` only shows them, `--details` adds the exact keys, `--undo` puts the old
   files back.
 - Scripts: `middleman init --yes` (OpenRouter, user scope, confirm mode), plus
@@ -249,9 +269,7 @@ keychain is available (e.g. a headless Linux box), the key goes to a private fil
 
 ## How do I know it's working?
 
-- **Status line**, at the bottom of Claude Code (see [The status line](#the-status-line)):
-  `Opus 5.5 high │ ██░░░░░░░░ 18% 180k/1M │ ~$1.27 │ cache 47m left (1h) │ 🛡 ✓ $7.42 · 2 jobs · saved $0.21 today`.
-  It shows `✗` and the reason when the config is broken, no key is found or the key is rejected.
+- **Status line**: `🛡✓` means ready; `✗` and a short reason (`key locked`, `no key`) otherwise.
 - **Hook message**: when you send a prompt, a short line tells you what middleman told Claude,
   e.g. `🛡 middleman: suggested delegating this write_tests task (~3000 output tokens) to a cheap model`
   or `🛡 middleman: keep on Claude (sensitive: billing)`.
@@ -266,65 +284,25 @@ Claude Code started it with, so after `/clear` its calls still carry the earlier
 
 ## The status line
 
-`middleman setup claude` sets Claude Code's `statusLine` to `middleman statusline`. By default it
-prints one line, shortened to fit the terminal (`COLUMNS`); `--lines 2` (or
-`MIDDLEMAN_SL_LINES=2`) puts middleman's part on a second line:
-
 ```
-Opus 5.5 high │ ██░░░░░░░░ 18% 180k/1M │ ~$1.27 │ cache 47m left (1h)
-🛡 middleman ✓ openrouter $7.42 left · 2 jobs this session (1 blocked, 1 escalated) · 3 today · 2 agents · saved $0.06 session · $0.21 today · $1.84 total
+Opus 5.5 high · ██████░░░░ 38% 380k/1M │ 🛡✓ $9.95 left · saved $0.21 · total $1.84
 ```
 
-The same data at 120 and 60 columns, on one line:
+Your model and context, then middleman's state, provider balance and savings, shortened to fit the
+terminal. It never touches the network. `middleman statusline off` hides it (a status line of yours
+that setup replaced comes back) and `middleman statusline on` shows it again; setup and refresh
+remember the choice.
 
-```
-Opus 5.5 high │ ██░░░░░░░░ 18% 180k/1M │ ~$1.27 │ cache 47m left (1h) │ 🛡 ✓ $7.42 · 2 jobs · saved $0.21 today
-Opus 5.5 high │ 18% │ ~$1.27 │ 🛡 ✓ saved $0.21
-```
+<details>
+<summary>Options</summary>
 
-| Part | Meaning |
-|---|---|
-| `Opus 5.5 high` (`fast`) | Session model, effort level, fast mode |
-| `██░░░░░░░░ 18% 180k/1M` | Context used: share of the window, tokens, window size. Yellow at 40% or 150k, red at 70% or 300k (then `/compact or /clear` appears) |
-| `~$1.27` | Claude Code's estimate of this session's cost (yellow at $5, red at $10) |
-| `cache 47m left (1h)` | Prompt cache: time until it goes cold, and its lifetime; `cache cold: next message re-caches 180k` when expired |
-| `5h 72%` | Claude's 5-hour rate limit, when Claude Code reports it |
-| `🛡 ✓ openrouter` / `✗ <reason>` | middleman can delegate (provider and key OK), or why not |
-| `$7.42 left` | What the provider still lets you spend: the lower of the account balance and the key's limit. `(25m ago)` when the cached value is older than 10 minutes |
-| `2 jobs this session (1 blocked, 1 escalated)` · `3 today` | Delegation requests from this session and today; blocked includes "do it yourself" |
-| `2 agents` | Claude Code subagents this session started (Agent/Task tool uses in its transcript) |
-| `saved $0.06 session · $0.21 today · $1.84 total` | **Net** saving (see below); negative values are shown as they are, in red |
+`MIDDLEMAN_SL_SHOW_COST=1`, `MIDDLEMAN_SL_SHOW_CACHE=1`, `MIDDLEMAN_SL_SHOW_HINT=1` add the
+session cost estimate, the prompt-cache timer and the `/compact` hint; `MIDDLEMAN_SL_LINES=2` uses
+two lines; `NO_COLOR` turns colours off. Already have a status line? `setup claude` leaves it alone;
+`--statusline combined` replaces it (`--undo` restores it), or append
+`middleman statusline --middleman-only` to your own script's output.
 
-Colour thresholds use the same environment variables as context-line:
-`MIDDLEMAN_SL_WARN_PCT` (or `CONTEXT_LINE_WARN_PCT`, default
-40), `_DANGER_PCT` (70), `_WARN_TOKENS` (150000), `_DANGER_TOKENS` (300000), `_COST_WARN` (5).
-`NO_COLOR` turns colours off; `MIDDLEMAN_SL_TOKENS=1` adds Claude output tokens avoided today;
-`MIDDLEMAN_SL_NO_REFRESH=1` stops the background limit refresh and update check. `↑ v0.3.1` after
-the provider means a newer release is out (see [Upgrading](#upgrading)).
-
-**Already have a status line** (for example context-line)? `setup claude` leaves it alone and says
-how to combine them. Either let middleman print the whole thing (it includes context-line's
-fields): `middleman setup claude --statusline combined` (two lines; `--undo` brings yours
-back). Or keep yours and append middleman's part from your script with the same stdin:
-
-```sh
-input=$(cat)
-printf '%s\n' "$input" | node ~/.claude/context-line/statusline.mjs
-printf '%s\n' "$input" | middleman statusline --middleman-only
-```
-
-**How it stays fast and private.** The status line never touches the network and finishes in a
-few milliseconds. Provider limits come from a cache (`~/.local/state/middleman/provider-limits.json`,
-0600) written by `middleman provider refresh`, by the MCP server after each delegation, and, when
-the cache is older than 10 minutes, by one background `provider refresh --quiet` the status line
-starts (a lock file allows one at a time). Subagents are counted by reading only the bytes added to
-the transcript since the last run (the offset and counts are cached per session); nothing from
-the transcript is stored or printed. Ledger totals are kept the same way. Every printed field is
-stripped of control, escape and bidi characters.
-
-The status line also passes the session's **live context size, model and cache lifetime** to the
-MCP server (`~/.local/state/middleman/sessions/<id>.json`, 0600), so the savings maths uses the
-real numbers instead of assumptions.
+</details>
 
 ## How savings are calculated
 
@@ -483,7 +461,8 @@ that exact request, for 30 minutes.
 | `middleman setup claude` | Connect to Claude Code (`--dry-run`, `--details`, `--undo`, `--scope project`, `--statusline combined`) |
 | `middleman provider add/list/test/rotate/remove` | Manage provider keys in the OS keychain |
 | `middleman provider refresh` | Fetch balances and key limits (free requests) for the status line |
-| `middleman statusline` | The Claude Code status line (`--lines 2`, `--middleman-only`, `--columns`) |
+| `middleman statusline` | The Claude Code status line (`--lines 2`, `--middleman-only`, `--columns`); `statusline on` / `off` shows or hides it |
+| `middleman update-settings` | How middleman stays up to date: `notify`, `auto` or `off` |
 | `middleman watch` | Live view of delegations in another terminal |
 | `middleman report` | What was delegated, to which model, and the net saving (`--html` for a dashboard, `--reconcile` to check the cost against the provider's counters) |
 | `middleman check <files>` | Dry run: shows exactly what *would* be sent, without sending it |

@@ -225,6 +225,7 @@ impl Wizard {
         };
         let chosen = self.step_providers().await?;
         let mode = self.step_mode(old_mode)?;
+        let update = self.step_update()?;
 
         // ---- write
         let mut log = vec![];
@@ -251,6 +252,13 @@ impl Wizard {
             }
         } else {
             log = setup::init_write(&o)?;
+        }
+        if let Some(u) = update {
+            let text = std::fs::read_to_string(&self.cfg_path)?;
+            let new = wizard::set_update_mode(&text, u)?;
+            if new != text {
+                onboard::write_config(&self.cfg_path, &new)?;
+            }
         }
         self.finish(scope, &project_dir, &chosen, mode, &log).await
     }
@@ -926,6 +934,36 @@ impl Wizard {
         let default = MODES.iter().position(|m| m.0 == want).unwrap_or(0);
         let i = self.select("When may Claude delegate?", &items, default)?;
         Ok(MODES[i].0)
+    }
+
+    /// "Keep middleman up to date": asked with the routing mode (not when --mode was given).
+    fn step_update(&self) -> Result<Option<middleman::config::UpdateMode>> {
+        if self.a.mode.is_some() {
+            return Ok(None);
+        }
+        let cur = Config::load(&self.cfg_path)
+            .map(|c| c.update.mode())
+            .unwrap_or_default();
+        let items: Vec<String> = crate::cli_upgrade::UPDATE_CHOICES
+            .iter()
+            .map(|(m, l)| {
+                format!(
+                    "{l:<22} {}",
+                    self.ui.dim(crate::cli_upgrade::describe_mode(*m))
+                )
+            })
+            .collect();
+        let def = crate::cli_upgrade::UPDATE_CHOICES
+            .iter()
+            .position(|(m, _)| *m == cur)
+            .unwrap_or(0);
+        let i = self.select_short(
+            "Keep middleman up to date",
+            &items,
+            &crate::cli_upgrade::UPDATE_CHOICES.map(|(_, l)| l.to_string()),
+            def,
+        )?;
+        Ok(Some(crate::cli_upgrade::UPDATE_CHOICES[i].0))
     }
 
     // ---------------------------------------------------------------- step 4

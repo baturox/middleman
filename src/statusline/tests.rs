@@ -333,8 +333,10 @@ fn limits_at(e: &Env, fetched_at: i64, left: f64) {
             balance_usd: Some(20.0),
             key: Some(crate::providers::KeyLimits {
                 limit_remaining_usd: Some(left),
-                }),
+                ..Default::default()
+            }),
             fetched_at,
+            ..Default::default()
         },
     );
     limits::save(&e.state(), &c).unwrap();
@@ -702,6 +704,7 @@ fn newer_release_marker_and_daily_check() {
             checked_at: now,
             latest_version: Some("v99.0.0".into()),
             error: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -724,6 +727,7 @@ fn newer_release_marker_and_daily_check() {
             checked_at: now,
             latest_version: Some("v0.0.1".into()),
             error: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -735,6 +739,7 @@ fn newer_release_marker_and_daily_check() {
             checked_at: 0,
             latest_version: Some("v99.0.0".into()),
             error: None,
+            ..Default::default()
         },
     )
     .unwrap();

@@ -130,20 +130,25 @@ fn checksum_file_parsing() {
 }
 
 #[test]
-fn attestation_policy_is_fail_closed_when_required() {
-    assert_eq!(
-        attestation_policy(&Attestation::Verified, true).unwrap(),
-        None
-    );
-    assert!(attestation_policy(&Attestation::Failed("x".into()), true).is_err());
-    assert!(attestation_policy(&Attestation::Unavailable, true).is_err());
-    assert!(attestation_policy(&Attestation::Failed("x".into()), false)
+fn attestation_policy_fails_only_on_a_real_failure() {
+    assert!(attestation_policy(&Attestation::Verified, true)
         .unwrap()
-        .unwrap()
-        .contains("MIDDLEMAN_REQUIRE_ATTESTATION"));
-    assert!(attestation_policy(&Attestation::Unavailable, false)
-        .unwrap()
-        .is_some());
+        .contains("provenance verified"));
+    // gh ran and did not verify: fatal, required or not
+    for req in [true, false] {
+        let e = attestation_policy(&Attestation::Failed("x".into()), req).unwrap_err();
+        assert!(
+            e.to_string().contains("attestation verification failed"),
+            "{e}"
+        );
+    }
+    // gh missing or logged out: quiet unless required
+    for a in [Attestation::Unavailable, Attestation::NotLoggedIn] {
+        assert!(attestation_policy(&a, true).is_err());
+        assert!(attestation_policy(&a, false)
+            .unwrap()
+            .contains("not checked"));
+    }
     assert_eq!(
         verify_attestation(None, Path::new("/x")),
         Attestation::Unavailable
@@ -166,7 +171,7 @@ fn gh_gets_argv_without_a_shell() {
     script(
         &gh,
         &format!(
-            "for a in \"$@\"; do echo \"$a\" >> '{}'; done; exit 0",
+            "[ \"$1\" = auth ] && exit 0\nfor a in \"$@\"; do echo \"$a\" >> '{}'; done; exit 0",
             log.display()
         ),
     );
@@ -187,11 +192,90 @@ fn gh_gets_argv_without_a_shell() {
         ]
     );
     assert!(!d.path().join("pwned").exists());
-    script(&gh, "echo 'no attestations found' >&2; exit 1");
+    script(
+        &gh,
+        "[ \"$1\" = auth ] && exit 0\necho 'no attestations found' >&2; exit 1",
+    );
     assert_eq!(
         verify_attestation(Some(&gh), &f),
         Attestation::Failed("no attestations found".into())
     );
+    // logged out: verify is not even attempted
+    script(
+        &gh,
+        "[ \"$1\" = auth ] && exit 1\necho ran >> '/dev/null'; exit 1",
+    );
+    assert_eq!(verify_attestation(Some(&gh), &f), Attestation::NotLoggedIn);
+}
+
+#[test]
+fn auto_update_stays_on_the_same_line() {
+    use AutoDecision::*;
+    let d = |a: &str, b: &str| auto_decision(&v(a), &v(b));
+    assert_eq!(d("0.3.0", "0.3.1"), Install);
+    assert_eq!(d("0.3.0", "0.3.0"), Current);
+    assert_eq!(d("0.3.2", "0.3.1"), Current);
+    assert_eq!(d("0.3.1", "0.4.0"), Manual, "0.x minor is a major");
+    assert_eq!(d("0.3.1", "1.0.0"), Manual);
+    assert_eq!(d("1.2.0", "1.3.0"), Install, "1.x minor is compatible");
+    assert_eq!(d("1.2.0", "2.0.0"), Manual);
+    assert_eq!(d("0.3.0", "0.3.1-rc.1"), Manual, "never a pre-release");
+}
+
+#[test]
+fn update_log_is_private_and_appends() {
+    let d = tempfile::tempdir().unwrap();
+    let state = d.path().join("state");
+    log_update(&state, "updated v0.3.0 -> v0.3.1").unwrap();
+    log_update(&state, "failed: \u{1b}[2Jboom").unwrap();
+    let t = std::fs::read_to_string(update_log_path(&state)).unwrap();
+    let lines: Vec<&str> = t.lines().collect();
+    assert_eq!(lines.len(), 2, "{t}");
+    assert!(lines[0].ends_with(" updated v0.3.0 -> v0.3.1"), "{t}");
+    assert!(!t.contains('\u{1b}'), "cleaned: {t:?}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let m = std::fs::metadata(update_log_path(&state))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(m & 0o777, 0o600);
+    }
+}
+
+#[test]
+fn updated_notice_shows_for_a_while_then_never() {
+    let cur = v("0.3.1");
+    let now = 1_800_000_000;
+    let mut c = UpdateCache {
+        updated_to: Some("v0.3.1".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        updated_notice(Some(&c), now, &cur).as_deref(),
+        Some("v0.3.1")
+    );
+    c.notice_since = Some(now - 60);
+    assert!(updated_notice(Some(&c), now, &cur).is_some());
+    c.notice_since = Some(now - UPDATED_NOTICE_S);
+    assert_eq!(updated_notice(Some(&c), now, &cur), None);
+    // another version running (rolled back, or updated by hand): no notice
+    c.notice_since = None;
+    assert_eq!(updated_notice(Some(&c), now, &v("0.3.0")), None);
+    assert_eq!(updated_notice(None, now, &cur), None);
+}
+
+#[test]
+fn keychain_prompt_prediction() {
+    let devid = "identifier \"dev.baturox.middleman\" and anchor apple generic and certificate leaf[subject.OU] = \"ABCDE12345\"";
+    let selfsigned = "identifier \"dev.baturox.middleman\" and certificate leaf = H\"0123\"";
+    let adhoc = "cdhash H\"aaaa\"";
+    assert!(!keychain_prompt_expected(Some(devid), Some(devid)));
+    // a self-signed identity keeps the ACL entry, but its partition is the cdhash
+    assert!(keychain_prompt_expected(Some(selfsigned), Some(selfsigned)));
+    assert!(keychain_prompt_expected(Some(adhoc), Some(selfsigned)));
+    assert!(keychain_prompt_expected(None, Some(devid)));
 }
 
 #[test]
@@ -658,6 +742,7 @@ fn daily_check_cache_and_lock() {
             checked_at: now,
             latest_version: Some("v0.2.0".into()),
             error: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -686,6 +771,7 @@ fn daily_check_cache_and_lock() {
         checked_at: now,
         latest_version: Some("v0.3.1".into()),
         error: None,
+        ..Default::default()
     };
     assert_eq!(newer_cached(Some(&newer), &cur), Some(v("0.3.1")));
     let junk = UpdateCache {
@@ -722,6 +808,7 @@ fn doctor_update_messages() {
             checked_at: now - 7200,
             latest_version: Some(next.tag()),
             error: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -737,6 +824,7 @@ fn doctor_update_messages() {
             checked_at: now - 7200,
             latest_version: Some("v0.0.1".into()),
             error: None,
+            ..Default::default()
         },
     )
     .unwrap();

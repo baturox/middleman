@@ -323,6 +323,23 @@ struct JsonEdit {
 }
 
 impl JsonEdit {
+    /// Remove a top-level-or-nested key (undo puts it back).
+    fn remove(&mut self, path: Vec<String>, human: &str) -> Result<()> {
+        let Some(old) = get(&self.value, &path).cloned() else {
+            return Ok(());
+        };
+        let (last, parent) = path.split_last().expect("non-empty path");
+        obj_at(&mut self.value, parent, &self.path)?.remove(last);
+        self.summary.push(format!("- {human}"));
+        self.changes
+            .push(format!("- {} = {}", path.join("."), compact(&old)));
+        self.reverts.push(Revert::SetKey {
+            path,
+            before: Some(old),
+        });
+        Ok(())
+    }
+
     fn open(path: PathBuf) -> Result<JsonEdit> {
         let (existed, before) = read_text(&path)?;
         let value = parse_json(&path, &before)?;
@@ -757,6 +774,125 @@ pub fn outdated_check(o: &RefreshOptions) -> Check {
             what.join("; ")
         ),
     )
+}
+
+/// The Claude Code settings files `statusline on|off` acts on: the user's, and those of the
+/// projects middleman was set up in, when they carry middleman's hook or status line (the
+/// user's file when none does).
+pub fn statusline_targets(home: &Path, cwd: &Path) -> Vec<PathBuf> {
+    let mut files = vec![home.join(".claude/settings.json")];
+    for d in installed_project_dirs(home, cwd) {
+        let f = d.join(".claude/settings.json");
+        if !files.contains(&f) {
+            files.push(f);
+        }
+    }
+    let ours: Vec<PathBuf> = files
+        .iter()
+        .filter(|f| {
+            std::fs::read_to_string(f).is_ok_and(|t| {
+                t.contains("route --hook") || (t.contains("middleman") && t.contains("statusline"))
+            })
+        })
+        .cloned()
+        .collect();
+    if ours.is_empty() {
+        files.truncate(1);
+        files
+    } else {
+        ours
+    }
+}
+
+/// The non-middleman `statusLine` an earlier `setup claude` replaced in `file`, newest first.
+fn saved_foreign_statusline(backups: &Path, file: &Path) -> Option<Value> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(backups)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    dirs.sort();
+    for d in dirs.iter().rev() {
+        let Some(man) = std::fs::read_to_string(d.join("manifest.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Manifest>(&t).ok())
+        else {
+            continue;
+        };
+        for f in man.files.iter().filter(|f| f.path == file) {
+            for r in &f.reverts {
+                if let Revert::SetKey {
+                    path,
+                    before: Some(v),
+                } = r
+                {
+                    let foreign = v
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|c| !is_our_statusline(c));
+                    if path.len() == 1 && path[0] == "statusLine" && foreign {
+                        return Some(v.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `statusline off`: drop middleman's `statusLine` from `files`, putting back a status line of
+/// yours that an earlier `setup claude --statusline combined` replaced.
+pub fn statusline_off_plan(files: &[PathBuf], backups: &Path) -> Result<Plan> {
+    let mut plan = Plan::default();
+    for f in files {
+        let mut e = JsonEdit::open(f.clone())?;
+        let ours = e
+            .value
+            .pointer("/statusLine/command")
+            .and_then(Value::as_str)
+            .is_some_and(is_our_statusline);
+        if !ours {
+            continue;
+        }
+        match saved_foreign_statusline(backups, f) {
+            Some(v) => e.set(
+                p(&["statusLine"]),
+                v,
+                "your previous status line (restored)",
+            )?,
+            None => e.remove(p(&["statusLine"]), "middleman's status line")?,
+        }
+        plan.files.extend(e.finish(0o644));
+    }
+    Ok(plan)
+}
+
+/// `statusline on`: set middleman's status line in `files` (a status line of yours is left
+/// alone, with a note).
+pub fn statusline_on_plan(files: &[PathBuf], o: &SetupOptions) -> Result<Plan> {
+    let mut plan = Plan::default();
+    for f in files {
+        let mut e = JsonEdit::open(f.clone())?;
+        let cur = e
+            .value
+            .pointer("/statusLine/command")
+            .and_then(Value::as_str)
+            .map(String::from);
+        match cur {
+            Some(c) if !is_our_statusline(&c) => plan.notes.push(format!(
+                "{} already has a status line (`{}`); left alone (`middleman setup claude --statusline combined` replaces it)",
+                pretty(f),
+                crate::fsutil::clean(&c, 60)
+            )),
+            Some(_) => {}
+            None => e.set(
+                p(&["statusLine"]),
+                json!({"type": "command", "command": o.statusline_command(), "padding": 0}),
+                "middleman's status line",
+            )?,
+        }
+        plan.files.extend(e.finish(0o644));
+    }
+    Ok(plan)
 }
 
 fn is_our_hook(cmd: &str) -> bool {
@@ -1216,11 +1352,6 @@ pub fn wiring_checks(home: &Path, project_dir: &Path) -> Vec<Check> {
             &hook,
             "not installed; `middleman setup claude` adds it",
         ),
-        (
-            "Claude Code: statusline",
-            &sl,
-            "not set; `middleman setup claude` adds it",
-        ),
     ] {
         out.push(Check::optional(
             name,
@@ -1232,6 +1363,19 @@ pub fn wiring_checks(home: &Path, project_dir: &Path) -> Vec<Check> {
             },
         ));
     }
+    // the status line is a preference: on or off is information, never a warning
+    out.push(Check::optional(
+        "status line",
+        true,
+        if sl.is_empty() {
+            "off (`middleman statusline on` shows it)".to_string()
+        } else {
+            format!(
+                "on ({}; `middleman statusline off` hides it)",
+                sl.join(", ")
+            )
+        },
+    ));
     let md = [
         home.join(".claude/CLAUDE.md"),
         project_dir.join("CLAUDE.md"),

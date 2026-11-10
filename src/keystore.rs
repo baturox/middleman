@@ -84,6 +84,62 @@ fn valid_account(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Start of the error for a Keychain read the user denied (or one that would have needed a
+/// dialog in a non-interactive process).
+pub const DENIED_PREFIX: &str = "Keychain access was denied";
+
+/// The short, actionable error for a denied Keychain read of `account`'s key.
+pub fn denied_message(account: &str) -> String {
+    format!(
+        "{DENIED_PREFIX}: run `middleman provider test {account}` in a terminal and click Always Allow"
+    )
+}
+
+/// Is this (formatted) error a denied Keychain read?
+pub fn is_denied(msg: &str) -> bool {
+    msg.contains(DENIED_PREFIX)
+}
+
+/// The macOS `OSStatus` inside a credential-store error, if any. Only the number is taken from
+/// the platform error's debug form (`Error { code: -128, .. }`), never its text.
+fn os_status(e: &keyring::Error) -> Option<i32> {
+    use keyring::Error as E;
+    let inner = match e {
+        E::PlatformFailure(b) | E::NoStorageAccess(b) => b,
+        _ => return None,
+    };
+    let dbg = format!("{inner:?}");
+    let rest = dbg.split("code: ").nth(1)?;
+    let num: String = rest
+        .chars()
+        .take_while(|c| *c == '-' || c.is_ascii_digit())
+        .collect();
+    num.parse().ok()
+}
+
+/// errSecUserCanceled (-128: Deny), errSecAuthFailed (-25293), errSecInteractionNotAllowed
+/// (-25308: a dialog was needed but this process may not show one).
+fn is_denial(e: &keyring::Error) -> bool {
+    matches!(os_status(e), Some(-128 | -25293 | -25308))
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "Security", kind = "framework")]
+extern "C" {
+    fn SecKeychainSetUserInteractionAllowed(state: u8) -> i32;
+}
+
+/// From now on this process never shows a Keychain dialog: a read that would need one fails
+/// with [`denied_message`] instead. For background callers (the status line, the prompt
+/// hook) that nobody is watching. No-op elsewhere.
+pub fn set_noninteractive() {
+    #[cfg(target_os = "macos")]
+    // SAFETY: a plain C call with a by-value boolean; it only flips a per-process flag.
+    unsafe {
+        let _ = SecKeychainSetUserInteractionAllowed(0);
+    }
+}
+
 /// A short, value-free description of a credential-store error.
 fn kc_err(e: &keyring::Error) -> String {
     use keyring::Error as E;
@@ -153,6 +209,7 @@ impl Store {
                     Ok(Some(Secret::new(v.trim())))
                 }
                 Err(keyring::Error::NoEntry) => Ok(None),
+                Err(e) if is_denial(&e) => bail!("{}", denied_message(account)),
                 Err(e) => bail!("{}: {}", keychain_name(), kc_err(&e)),
             },
             Store::File { dir } => {
@@ -321,6 +378,52 @@ mod tests {
         for bad in ["../x", "a/b", "", "a b"] {
             assert!(s.set(bad, &Secret::new("k")).is_err(), "{bad}");
         }
+    }
+
+    #[derive(Debug)]
+    struct FakeOsError;
+    impl std::fmt::Display for FakeOsError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "os error")
+        }
+    }
+    impl std::error::Error for FakeOsError {}
+
+    #[test]
+    fn denied_reads_are_recognised_by_their_status_code() {
+        // the debug form security-framework uses: `Error { code: -128, message: ".." }`
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Error {
+            code: i32,
+            message: &'static str,
+        }
+        impl std::fmt::Display for Error {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.message)
+            }
+        }
+        impl std::error::Error for Error {}
+        let pf = |code| {
+            keyring::Error::PlatformFailure(Box::new(Error {
+                code,
+                message: "User canceled the operation.",
+            }))
+        };
+        for code in [-128, -25293, -25308] {
+            assert!(is_denial(&pf(code)), "{code}");
+        }
+        assert!(!is_denial(&pf(-25300)));
+        assert!(!is_denial(&keyring::Error::NoEntry));
+        assert!(!is_denial(&keyring::Error::PlatformFailure(Box::new(
+            FakeOsError
+        ))));
+        let m = denied_message("openrouter");
+        assert_eq!(
+            m,
+            "Keychain access was denied: run `middleman provider test openrouter` in a terminal and click Always Allow"
+        );
+        assert!(is_denied(&format!("wrapped: {m}")));
     }
 
     #[test]

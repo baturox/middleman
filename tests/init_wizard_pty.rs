@@ -172,6 +172,10 @@ fn wizard_update_existing_config_adds_a_local_provider() {
     r.expect("Only when I say so (explicit)");
     r.send(DOWN);
     r.send("\r"); // Automatic
+    r.expect("Keep middleman up to date");
+    r.expect("never check");
+    r.send(DOWN);
+    r.send("\r"); // update automatically
     r.expect("step 4 of 4 · Done");
     r.expect("Protect your company names");
     r.expect("Scan this project for names now?");
@@ -185,6 +189,7 @@ fn wizard_update_existing_config_adds_a_local_provider() {
     assert!(text.contains("# my notes"), "comments are kept:\n{text}");
     let c = middleman::config::Config::load(&cfg_path).unwrap();
     assert_eq!(c.routing.mode, middleman::config::RoutingMode::Auto);
+    assert_eq!(c.update.mode(), middleman::config::UpdateMode::Auto);
     assert!(c.providers.contains_key("openrouter"));
     assert_eq!(
         c.providers["ollama"].base_url,
@@ -241,6 +246,9 @@ fn wizard_bad_key_then_good_key_writes_config() {
     r.expect("When may Claude delegate?");
     r.expect("Only when I say so (explicit)");
     r.send("\r"); // Ask me each time (confirm), the default
+    r.expect("Keep middleman up to date");
+    r.expect("never check");
+    r.send("\r"); // notify me, the default
 
     r.expect("step 4 of 4 · Done");
     r.expect("Protect your company names");
@@ -258,6 +266,7 @@ fn wizard_bad_key_then_good_key_writes_config() {
     let cfg_path = home.join(".config/middleman/config.toml");
     let c = middleman::config::Config::load(&cfg_path).unwrap();
     assert_eq!(c.routing.mode, middleman::config::RoutingMode::Confirm);
+    assert_eq!(c.update.mode(), middleman::config::UpdateMode::Notify);
     let or = &c.providers["openrouter"];
     assert_eq!(or.key_source, Some(middleman::keystore::KeySource::File));
     assert!(or.model.is_none());

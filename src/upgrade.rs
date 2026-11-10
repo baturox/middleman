@@ -8,9 +8,10 @@
 //! - Downloads are HTTPS only. Redirects may only go https -> https to [`ALLOWED_HOSTS`]. Each
 //!   body is capped ([`MAX_DOWNLOAD`] for the archive).
 //! - The archive's SHA-256 must match its line in `SHA256SUMS.txt`; a missing line is an error.
-//! - When `gh` is on PATH, `gh attestation verify <file> --repo baturox/middleman` runs (argv,
-//!   no shell). A failure is a warning, or fatal with `--require-attestation` /
-//!   `MIDDLEMAN_REQUIRE_ATTESTATION=1`.
+//! - When `gh` is on PATH and logged in, `gh attestation verify <file> --repo
+//!   baturox/middleman` runs (argv, no shell) and a failure is fatal. Without `gh` (or not
+//!   logged in) the check is skipped quietly, unless `--require-attestation` /
+//!   `MIDDLEMAN_REQUIRE_ATTESTATION=1` makes that fatal too.
 //! - Only the `middleman` entry of the tarball is extracted; absolute paths, `..`, symlinks,
 //!   hardlinks and special files anywhere in the archive reject it.
 //! - The new binary must answer `--version` with the release's version before anything is
@@ -509,9 +510,12 @@ pub fn verify_sha(bytes: &[u8], sums: &str, name: &str) -> Result<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Attestation {
     Verified,
+    /// `gh` ran and did not verify the file: always fatal.
     Failed(String),
     /// `gh` is not on PATH.
     Unavailable,
+    /// `gh` is installed but not logged in (`gh auth status` fails), so it cannot check.
+    NotLoggedIn,
 }
 
 /// `name` on PATH (no shell, no `which`).
@@ -528,46 +532,214 @@ pub fn find_on_path(name: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// `gh attestation verify <file> --repo baturox/middleman`, argv passed directly.
+/// Run `cmd` with no stdin, waiting at most `limit`; the output, or None when it could not run
+/// or timed out.
+fn run_capped(mut cmd: std::process::Command, limit: Duration) -> Option<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let (mut so, mut se) = (child.stdout.take()?, child.stderr.take()?);
+    let t_out = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = (&mut so).take(1 << 20).read_to_end(&mut b);
+        b
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = (&mut se).take(1 << 20).read_to_end(&mut b);
+        b
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if start.elapsed() > limit => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => return None,
+        }
+    };
+    Some(std::process::Output {
+        status,
+        stdout: t_out.join().unwrap_or_default(),
+        stderr: t_err.join().unwrap_or_default(),
+    })
+}
+
+/// Is `gh` logged in? (`gh auth status`, output discarded.)
+pub fn gh_logged_in(gh: &Path) -> bool {
+    let mut c = std::process::Command::new(gh);
+    c.args(["auth", "status"]);
+    run_capped(c, Duration::from_secs(20)).is_some_and(|o| o.status.success())
+}
+
+/// `gh attestation verify <file> --repo baturox/middleman`, argv passed directly, when `gh` is
+/// installed and logged in.
 pub fn verify_attestation(gh: Option<&Path>, file: &Path) -> Attestation {
     let Some(gh) = gh else {
         return Attestation::Unavailable;
     };
-    let out = std::process::Command::new(gh)
-        .arg("attestation")
+    if !gh_logged_in(gh) {
+        return Attestation::NotLoggedIn;
+    }
+    let mut c = std::process::Command::new(gh);
+    c.arg("attestation")
         .arg("verify")
         .arg(file)
         .arg("--repo")
-        .arg(REPO)
-        .stdin(std::process::Stdio::null())
-        .output();
-    match out {
-        Ok(o) if o.status.success() => Attestation::Verified,
-        Ok(o) => {
+        .arg(REPO);
+    match run_capped(c, Duration::from_secs(120)) {
+        Some(o) if o.status.success() => Attestation::Verified,
+        Some(o) => {
             let err = String::from_utf8_lossy(&o.stderr);
             let first = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
             Attestation::Failed(clean(first, 200))
         }
-        Err(e) => Attestation::Failed(clean(&e.to_string(), 200)),
+        None => Attestation::Failed("gh attestation verify did not finish".into()),
     }
 }
 
-/// Apply the policy: Ok(Some(warning)) to go on with a warning, Err when it is fatal.
-pub fn attestation_policy(a: &Attestation, require: bool) -> Result<Option<String>> {
+/// Apply the policy. Ok(detail) to go on (the detail is for `--verbose`), Err when fatal:
+/// a failed verification always is; a check that could not run only with `require`.
+pub fn attestation_policy(a: &Attestation, require: bool) -> Result<String> {
     match (a, require) {
-        (Attestation::Verified, _) => Ok(None),
-        (Attestation::Failed(e), true) => bail!(
-            "attestation verification failed ({e}); refusing to install (attestation required)"
+        (Attestation::Verified, _) => Ok(format!(
+            "provenance verified: built by {REPO}'s release workflow"
+        )),
+        (Attestation::Failed(e), _) => bail!(
+            "attestation verification failed ({e}); refusing to install. The file matches its \
+             checksum but GitHub could not confirm it was built by {REPO}'s release workflow."
         ),
         (Attestation::Unavailable, true) => bail!(
             "cannot verify the build attestation: the GitHub CLI (gh) is not installed; refusing to install (attestation required)"
         ),
-        (Attestation::Failed(e), false) => Ok(Some(format!(
-            "could not verify the build attestation ({e}); the checksum matched. Set MIDDLEMAN_REQUIRE_ATTESTATION=1 to make this fatal."
-        ))),
-        (Attestation::Unavailable, false) => Ok(Some(
-            "the GitHub CLI (gh) is not installed, so the build attestation was not checked; the checksum matched.".into(),
-        )),
+        (Attestation::NotLoggedIn, true) => bail!(
+            "cannot verify the build attestation: gh is not logged in (run `gh auth login`); refusing to install (attestation required)"
+        ),
+        (Attestation::Unavailable, false) => Ok(
+            "build provenance not checked (the GitHub CLI is not installed); the checksum matched".into(),
+        ),
+        (Attestation::NotLoggedIn, false) => Ok(
+            "build provenance not checked (gh is not logged in); the checksum matched".into(),
+        ),
+    }
+}
+
+// ------------------------------------------------------------------ automatic updates
+
+/// What the background check may do with a newer release in `[update] mode = "auto"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoDecision {
+    /// A patch release of the same line: install it.
+    Install,
+    /// Newer, but a new major (or, for 0.x, a new minor) or a pre-release: only tell.
+    Manual,
+    /// Nothing newer.
+    Current,
+}
+
+/// Auto-update only within the same compatibility line: same major, and for 0.x the same
+/// minor too (0.3.0 -> 0.3.1 yes, 0.3.1 -> 0.4.0 no). Pre-releases never.
+pub fn auto_decision(cur: &Version, latest: &Version) -> AutoDecision {
+    if latest <= cur {
+        return AutoDecision::Current;
+    }
+    let same_line = latest.major == cur.major && (cur.major > 0 || latest.minor == cur.minor);
+    if same_line && !latest.is_prerelease() {
+        AutoDecision::Install
+    } else {
+        AutoDecision::Manual
+    }
+}
+
+/// `<state>/update.log`: one line per automatic update attempt (0600).
+pub fn update_log_path(state: &Path) -> PathBuf {
+    state.join("update.log")
+}
+
+/// Append `line` (time-stamped, cleaned) to the update log, keeping the file private.
+pub fn log_update(state: &Path, line: &str) -> Result<()> {
+    use std::io::Write;
+    crate::ledger::ensure_private_dir(state)?;
+    let p = update_log_path(state);
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let mut f = o
+        .open(&p)
+        .with_context(|| format!("cannot write {}", pretty(&p)))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
+    writeln!(f, "{} {}", crate::ledger::now_rfc3339(), clean(line, 400))?;
+    Ok(())
+}
+
+/// How long the status line shows "updated to vX" after it first showed it (seconds).
+pub const UPDATED_NOTICE_S: i64 = 900;
+
+/// The "updated to vX" notice, if an automatic update installed the running version and the
+/// notice has not run its course yet.
+pub fn updated_notice(cache: Option<&UpdateCache>, now: i64, cur: &Version) -> Option<String> {
+    let c = cache?;
+    let v = Version::parse(c.updated_to.as_deref()?)?;
+    if &v != cur {
+        return None;
+    }
+    match c.notice_since {
+        Some(t) if now - t >= UPDATED_NOTICE_S || t > now => None,
+        _ => Some(v.tag()),
+    }
+}
+
+// ------------------------------------------------------------------ code signature (macOS)
+
+/// The designated requirement of the binary at `path` (`codesign -d -r-`), macOS only.
+pub fn designated_requirement(path: &Path) -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let mut c = std::process::Command::new("/usr/bin/codesign");
+    c.args(["-d", "-r-"]).arg(path);
+    let o = run_capped(c, Duration::from_secs(15))?;
+    if !o.status.success() {
+        return None;
+    }
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("designated => "))
+        .map(|s| s.trim().to_string())
+}
+
+/// Will the Keychain ask before the new binary may read a key the old one stored?
+///
+/// Two gates guard a file-keychain item: its ACL (trusted applications, matched by designated
+/// requirement) and, since macOS 10.12, its partition list. securityd gives code that is not
+/// signed by Apple, the App Store or a Developer ID certificate the partition `cdhash:<hash>`,
+/// which changes with every build. So only two builds with the same Developer-ID-anchored
+/// requirement pass both gates silently; anything else (ad-hoc, or a self-signed certificate)
+/// is asked about once per new build.
+pub fn keychain_prompt_expected(old_dr: Option<&str>, new_dr: Option<&str>) -> bool {
+    match (old_dr, new_dr) {
+        (Some(a), Some(b)) => a != b || !b.contains("anchor apple generic"),
+        _ => true,
     }
 }
 
@@ -915,6 +1087,12 @@ pub struct UpdateCache {
     pub latest_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Set by an automatic update: the version it installed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_to: Option<String>,
+    /// When the status line first showed the "updated" notice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice_since: Option<i64>,
 }
 
 pub fn cache_path(state: &Path) -> PathBuf {
@@ -938,7 +1116,8 @@ pub fn release_lock(state: &Path) {
     let _ = std::fs::remove_file(lock_path(state));
 }
 
-/// Background checks are on unless `[update] check = false` or `MIDDLEMAN_NO_UPDATE_CHECK=1`.
+/// Background checks are on unless `[update] mode = "off"` (or `check = false`) or
+/// `MIDDLEMAN_NO_UPDATE_CHECK=1`.
 pub fn checks_enabled(cfg_check: bool, get: &dyn Fn(&str) -> Option<String>) -> bool {
     cfg_check && get("MIDDLEMAN_NO_UPDATE_CHECK").is_none_or(|v| v.trim() != "1")
 }
@@ -976,12 +1155,14 @@ pub fn maybe_check(
     }
 }
 
-/// The real spawner: `<exe> upgrade --check --quiet --write-cache --config <cfg>`, detached.
-pub fn spawn_check(cfg_path: &Path) -> std::io::Result<()> {
-    crate::limits::spawn_detached(
-        &["upgrade", "--check", "--quiet", "--write-cache"],
-        cfg_path,
-    )
+/// The real spawner: `<exe> upgrade --check --quiet --write-cache [--auto] --config <cfg>`,
+/// detached. With `auto` the check also installs a patch release (`[update] mode = "auto"`).
+pub fn spawn_check(cfg_path: &Path, auto: bool) -> std::io::Result<()> {
+    let mut args = vec!["upgrade", "--check", "--quiet", "--write-cache"];
+    if auto {
+        args.push("--auto");
+    }
+    crate::limits::spawn_detached(&args, cfg_path)
 }
 
 /// Doctor's line about updates (reads the cache only).
@@ -992,7 +1173,7 @@ pub fn doctor_check(state: &Path, enabled: bool, now: i64) -> crate::setup::Chec
         return Check::optional(
             "update check",
             true,
-            "off ([update] check = false or MIDDLEMAN_NO_UPDATE_CHECK=1); `middleman upgrade --check` checks now",
+            "off ([update] mode = \"off\" or MIDDLEMAN_NO_UPDATE_CHECK=1); `middleman upgrade --check` checks now",
         );
     }
     let cache = load_cache(state);

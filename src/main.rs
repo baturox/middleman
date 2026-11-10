@@ -124,6 +124,10 @@ enum Cmd {
     /// Status line for Claude Code's statusLine: model, effort, context, cost, cache, and
     /// middleman's provider, limits, jobs, subagents and net savings (reads JSON on stdin)
     Statusline {
+        /// `on` / `off`: show or hide middleman's status line in Claude Code (remembered in
+        /// the config). Without it: print the status line (what Claude Code runs)
+        #[arg(value_parser = ["on", "off"])]
+        toggle: Option<String>,
         /// 1: everything on one line (shortened to fit); 2: Claude part, then middleman part
         /// [env: MIDDLEMAN_SL_LINES]
         #[arg(long)]
@@ -275,6 +279,18 @@ enum Cmd {
         /// With --check: record the result for the status line and doctor
         #[arg(long, hide = true)]
         write_cache: bool,
+        /// With --check: install a patch release of this line (`[update] mode = "auto"`)
+        #[arg(long, hide = true)]
+        auto: bool,
+        /// Show every step: download, checksum, provenance, backups, the full wiring diff
+        /// [env: MIDDLEMAN_VERBOSE=1]
+        #[arg(long, short)]
+        verbose: bool,
+    },
+    /// Show or change how middleman keeps itself up to date: notify | auto | off
+    UpdateSettings {
+        /// notify (show `↑ vX`), auto (install patch releases in the background), off
+        mode: Option<String>,
     },
 }
 
@@ -373,6 +389,9 @@ enum SetupTarget {
         /// status line command, CLAUDE.md block), in user and project scope; adds nothing
         #[arg(long, conflicts_with = "undo")]
         refresh: bool,
+        /// With --refresh: show the full diff and the backup paths [env: MIDDLEMAN_VERBOSE=1]
+        #[arg(long, short)]
+        verbose: bool,
         #[arg(long)]
         no_statusline: bool,
         /// auto (set it unless you have another status line) | combined (replace another
@@ -387,6 +406,11 @@ enum SetupTarget {
         #[arg(long)]
         no_permissions: bool,
     },
+}
+
+/// `MIDDLEMAN_VERBOSE=1` turns `--verbose` on (the installer passes it through).
+fn verbose_env() -> bool {
+    std::env::var("MIDDLEMAN_VERBOSE").is_ok_and(|v| v.trim() == "1")
 }
 
 fn cwd() -> PathBuf {
@@ -588,6 +612,8 @@ async fn probe(
 /// blocked, so it never reaches Claude (see `middleman::direct`); every other prompt only
 /// gets advice.
 async fn route_hook(cfg_path: &Path) {
+    // nobody watches the hook: a Keychain read that needs a dialog fails instead
+    keystore::set_noninteractive();
     let mut input = String::new();
     let _ = std::io::stdin().take(1 << 20).read_to_string(&mut input);
     let parsed = serde_json::from_str::<serde_json::Value>(&input).ok();
@@ -1200,6 +1226,7 @@ struct SetupFlags {
     yes: bool,
     undo: bool,
     refresh: bool,
+    verbose: bool,
     details: bool,
     no_statusline: bool,
     statusline_combined: bool,
@@ -1233,6 +1260,8 @@ fn setup_claude(cfg_path: &Path, scope: &str, f: SetupFlags) -> Result<()> {
     }
     let scope = Scope::parse(scope).context("--scope must be user or project")?;
     let config_path = std::path::absolute(cfg_path).unwrap_or_else(|_| cfg_path.to_path_buf());
+    // `middleman statusline off` is remembered: setup does not put it back
+    let sl_off = Config::load(cfg_path).is_ok_and(|c| !c.statusline.enabled);
     if !config_path.exists() {
         note!(
             "warning: no config at {} yet; run `middleman init` or the statusline will show ✗",
@@ -1246,7 +1275,7 @@ fn setup_claude(cfg_path: &Path, scope: &str, f: SetupFlags) -> Result<()> {
         exe: std::env::current_exe().context("cannot find the middleman binary")?,
         config_path,
         hook: !f.no_hook,
-        statusline: !f.no_statusline,
+        statusline: !f.no_statusline && !sl_off,
         statusline_combined: f.statusline_combined,
         claude_md: !f.no_claude_md,
         permissions: !f.no_permissions,
@@ -1288,7 +1317,56 @@ fn setup_claude(cfg_path: &Path, scope: &str, f: SetupFlags) -> Result<()> {
     Ok(())
 }
 
-/// `setup claude --refresh`: bring middleman's existing entries up to this version.
+/// `middleman statusline on|off`: change the Claude Code settings and remember the choice.
+fn statusline_toggle(cfg_path: &Path, on: bool) -> Result<()> {
+    let home = home();
+    let ui = middleman::ui::Ui::stdout();
+    let files = claude_setup::statusline_targets(&home, &cwd());
+    let backups = claude_setup::backups_root(&home);
+    let plan = if on {
+        let o = SetupOptions {
+            scope: Scope::User,
+            home: home.clone(),
+            project_dir: cwd(),
+            exe: std::env::current_exe().context("cannot find the middleman binary")?,
+            config_path: std::path::absolute(cfg_path).unwrap_or_else(|_| cfg_path.to_path_buf()),
+            hook: false,
+            statusline: true,
+            statusline_combined: false,
+            claude_md: false,
+            permissions: false,
+        };
+        claude_setup::statusline_on_plan(&files, &o)?
+    } else {
+        claude_setup::statusline_off_plan(&files, &backups)?
+    };
+    claude_setup::apply(&plan, &backups)?;
+    if let Ok(text) = std::fs::read_to_string(cfg_path) {
+        let new = middleman::wizard::set_statusline_enabled(&text, on)?;
+        if new != text {
+            onboard::write_config(cfg_path, &new)?;
+        }
+    }
+    for n in &plan.notes {
+        say!("  {}", ui.warn(n));
+    }
+    say!(
+        "{}",
+        ui.ok(if on {
+            "status line on (`middleman statusline off` hides it)"
+        } else {
+            "status line off (`middleman statusline on` brings it back)"
+        })
+    );
+    Ok(())
+}
+
+/// One line after a quiet refresh, the same wherever it runs (installer, `upgrade`, by hand).
+const REFRESHED_LINE: &str =
+    "Claude Code settings updated (backup kept; undo: middleman setup claude --undo)";
+
+/// `setup claude --refresh`: bring middleman's existing entries up to this version. Quiet by
+/// default (one line); `--verbose` shows the diff and the backup paths.
 fn setup_refresh(cfg_path: &Path, home: &Path, f: SetupFlags) -> Result<()> {
     let ui = middleman::ui::Ui::stdout();
     let o = claude_setup::RefreshOptions {
@@ -1298,17 +1376,25 @@ fn setup_refresh(cfg_path: &Path, home: &Path, f: SetupFlags) -> Result<()> {
         config_path: std::path::absolute(cfg_path).unwrap_or_else(|_| cfg_path.to_path_buf()),
     };
     let plan = claude_setup::refresh_plan(&o);
+    // the running MCP server re-executes itself after an upgrade, except on Windows
+    let reconnect = cfg!(windows);
     if plan.is_empty() {
         say!(
-            "  {}",
-            ui.ok("middleman's Claude Code wiring is current; nothing to refresh.")
+            "{}",
+            ui.ok("Claude Code settings are current (nothing to refresh)")
         );
-        for n in &plan.notes {
-            say!("  {}", ui.warn(n));
+        if f.verbose {
+            for n in &plan.notes {
+                say!("  {}", ui.warn(n));
+            }
         }
         return Ok(());
     }
-    say!("{}", plan.render_ui(&ui, f.details).trim_end());
+    // asking needs the diff on screen; so do --verbose and --dry-run
+    let show = f.verbose || f.dry_run || !f.yes;
+    if show {
+        say!("{}", plan.render_ui(&ui, f.details || f.verbose).trim_end());
+    }
     if f.dry_run {
         say!("\n  {}", ui.dim("(dry run: nothing was changed)"));
         return Ok(());
@@ -1327,14 +1413,17 @@ fn setup_refresh(cfg_path: &Path, home: &Path, f: SetupFlags) -> Result<()> {
             return Ok(());
         }
     }
-    say!("");
-    for l in claude_setup::apply(&plan, &claude_setup::backups_root(home))? {
-        say!("{}", styled_log_line(&ui, &l));
+    let log = claude_setup::apply(&plan, &claude_setup::backups_root(home))?;
+    if f.verbose {
+        say!("");
+        for l in &log {
+            say!("{}", styled_log_line(&ui, l));
+        }
     }
-    say!(
-        "\n  {}",
-        ui.ok("Refreshed. Run /mcp in Claude Code (or restart it) to reconnect middleman.")
-    );
+    say!("{}", ui.ok(REFRESHED_LINE));
+    if reconnect {
+        say!("  Run /mcp in Claude Code (or restart it) to reconnect middleman.");
+    }
     Ok(())
 }
 
@@ -1350,6 +1439,13 @@ async fn real_main() -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Statusline {
+            toggle: Some(t), ..
+        } => {
+            statusline_toggle(&cfg_path, t == "on")?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Cmd::Statusline {
+            toggle: None,
             lines,
             middleman_only,
             columns,
@@ -1368,6 +1464,7 @@ async fn real_main() -> Result<ExitCode> {
                 }
             }
             o.middleman_only = middleman_only;
+            keystore::set_noninteractive();
             say!("{}", middleman::statusline::run(&cfg_path, &o));
             return Ok(ExitCode::SUCCESS);
         }
@@ -1502,6 +1599,7 @@ async fn real_main() -> Result<ExitCode> {
                     yes,
                     undo,
                     refresh,
+                    verbose,
                     no_statusline,
                     statusline,
                     no_hook,
@@ -1523,6 +1621,7 @@ async fn real_main() -> Result<ExitCode> {
                     yes,
                     undo,
                     refresh,
+                    verbose: verbose || verbose_env(),
                     details,
                     no_statusline: no_statusline || off,
                     statusline_combined: combined,
@@ -1621,6 +1720,8 @@ async fn real_main() -> Result<ExitCode> {
             require_attestation,
             quiet,
             write_cache,
+            auto,
+            verbose,
         } => {
             let a = cli_upgrade::UpgradeArgs {
                 check,
@@ -1631,20 +1732,30 @@ async fn real_main() -> Result<ExitCode> {
                 require_attestation,
                 quiet,
                 write_cache,
+                auto,
+                verbose: verbose || verbose_env(),
             };
             return cli_upgrade::run(&cfg_path, a).await;
+        }
+        Cmd::UpdateSettings { mode } => {
+            return cli_upgrade::update_settings(&cfg_path, mode.as_deref());
         }
         Cmd::Doctor => {
             if let Ok(cfg) = Config::load(&cfg_path) {
                 let env = |k: &str| std::env::var(k).ok();
-                if middleman::upgrade::checks_enabled(cfg.update.check, &env) {
+                let mode = cfg.update.mode();
+                if middleman::upgrade::checks_enabled(
+                    mode != middleman::config::UpdateMode::Off,
+                    &env,
+                ) {
                     let state = cfg.state_dir();
                     let c = middleman::upgrade::load_cache(&state);
+                    let auto = mode == middleman::config::UpdateMode::Auto;
                     middleman::upgrade::maybe_check(
                         &state,
                         c.as_ref(),
                         middleman::ledger::now_unix(),
-                        &mut || middleman::upgrade::spawn_check(&cfg_path),
+                        &mut || middleman::upgrade::spawn_check(&cfg_path, auto),
                     );
                 }
             }
@@ -1863,6 +1974,7 @@ async fn real_main() -> Result<ExitCode> {
         | Cmd::Completions { .. }
         | Cmd::Doctor
         | Cmd::Upgrade { .. }
+        | Cmd::UpdateSettings { .. }
         | Cmd::Dict { .. }
         | Cmd::Usage { .. }
         | Cmd::Tune { .. } => unreachable!(),

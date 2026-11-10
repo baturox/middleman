@@ -1,9 +1,12 @@
 //! `middleman upgrade`: the command-line flow around `middleman::upgrade`.
 //!
 //! Order: refuse package-managed or read-only installs (before any network), find the release,
-//! show it and ask, download, verify the checksum (and the attestation when `gh` exists),
-//! extract the binary, check its `--version`, replace atomically (old one kept as
-//! `middleman.prev`), then run the new binary's `setup claude --refresh --yes`.
+//! ask (unless --yes), download, verify the checksum (and the attestation when `gh` is
+//! installed and logged in), extract the binary, check its `--version`, replace atomically
+//! (old one kept as `middleman.prev`), then run the new binary's `setup claude --refresh --yes`.
+//!
+//! Quiet by default: one line for the binary, one for the wiring, and at most one about the
+//! Keychain. `--verbose` (or `MIDDLEMAN_VERBOSE=1`) shows every step.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,10 +14,10 @@ use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
 
-use middleman::config::{expand_tilde, Config};
+use middleman::config::{expand_tilde, Config, KeySource, UpdateMode};
 use middleman::fsutil::{clean, pretty};
 use middleman::ui::Ui;
-use middleman::upgrade::{self as up, Endpoints, UpdateCache, Version};
+use middleman::upgrade::{self as up, Endpoints, Release, UpdateCache, Version};
 
 use crate::{home, interactive, theme};
 
@@ -27,11 +30,17 @@ pub struct UpgradeArgs {
     pub require_attestation: bool,
     pub quiet: bool,
     pub write_cache: bool,
+    pub auto: bool,
+    pub verbose: bool,
 }
+
+/// The one line printed when macOS will ask about the Keychain.
+pub const KEYCHAIN_LINE: &str =
+    "macOS will ask once to let middleman use its Keychain key: click Always Allow";
 
 pub async fn run(cfg_path: &Path, a: UpgradeArgs) -> Result<ExitCode> {
     if a.rollback {
-        return rollback(a.yes);
+        return rollback(cfg_path, a.yes);
     }
     if a.check {
         return check(cfg_path, &a).await;
@@ -45,33 +54,71 @@ fn state_dir(cfg_path: &Path) -> PathBuf {
         .unwrap_or_else(|_| expand_tilde(Path::new("~/.local/state/middleman")))
 }
 
-/// `upgrade --check [--quiet] [--write-cache]`: exit 0 when up to date, 10 when not.
+/// `upgrade --check [--quiet] [--write-cache] [--auto]`: exit 0 when up to date, 10 when not.
+/// With `--auto` (the background check in `[update] mode = "auto"`) a patch release of the
+/// same line is installed too, and the result goes to `update.log`.
 async fn check(cfg_path: &Path, a: &UpgradeArgs) -> Result<ExitCode> {
     let ep = Endpoints::from_env();
     let cur = Version::current();
     let tag = a.version.as_deref().map(up::normalize_tag).transpose()?;
     let res = up::fetch_release(&ep, tag.as_deref()).await;
+    let state = state_dir(cfg_path);
     if a.write_cache {
-        let state = state_dir(cfg_path);
         let now = middleman::ledger::now_unix();
+        let old = up::load_cache(&state).unwrap_or_default();
         let c = match &res {
             Ok(r) => UpdateCache {
                 checked_at: now,
                 latest_version: Some(r.tag.clone()),
                 error: None,
+                ..old
             },
             // keep what an earlier check found; retry tomorrow
             Err(e) => UpdateCache {
                 checked_at: now,
-                latest_version: up::load_cache(&state).and_then(|c| c.latest_version),
                 error: Some(clean(&format!("{e:#}"), 120)),
+                ..old
             },
         };
         let _ = up::save_cache(&state, &c);
+    }
+    let out = check_inner(cfg_path, a, &ep, &cur, &state, res).await;
+    if a.write_cache {
         up::release_lock(&state);
     }
+    out
+}
+
+async fn check_inner(
+    cfg_path: &Path,
+    a: &UpgradeArgs,
+    ep: &Endpoints,
+    cur: &Version,
+    state: &Path,
+    res: Result<Release>,
+) -> Result<ExitCode> {
     let r = res?;
-    let newer = r.version > cur;
+    let newer = r.version > *cur;
+    if a.auto && newer {
+        let mode = Config::load(cfg_path)
+            .map(|c| c.update.mode())
+            .unwrap_or_default();
+        if mode == UpdateMode::Auto {
+            match up::auto_decision(cur, &r.version) {
+                up::AutoDecision::Install => return Ok(auto_install(cfg_path, ep, &r, state).await),
+                up::AutoDecision::Manual => {
+                    let _ = up::log_update(
+                        state,
+                        &format!(
+                            "{} is available but is not a patch release of v{cur}; run `middleman upgrade`",
+                            r.tag
+                        ),
+                    );
+                }
+                up::AutoDecision::Current => {}
+            }
+        }
+    }
     if !a.quiet {
         say!("installed: middleman v{cur}");
         say!(
@@ -81,7 +128,7 @@ async fn check(cfg_path: &Path, a: &UpgradeArgs) -> Result<ExitCode> {
         );
         if newer {
             say!("update available: run `middleman upgrade`");
-        } else if r.version == cur {
+        } else if r.version == *cur {
             say!("up to date");
         } else {
             say!("up to date (this build is newer than the latest release)");
@@ -94,10 +141,60 @@ async fn check(cfg_path: &Path, a: &UpgradeArgs) -> Result<ExitCode> {
     })
 }
 
+/// The background install: no output, everything goes to `update.log`.
+async fn auto_install(cfg_path: &Path, ep: &Endpoints, r: &Release, state: &Path) -> ExitCode {
+    let cur = Version::current();
+    let res = async {
+        if up::TARGET.contains("windows") {
+            bail!("automatic updates are not supported on Windows");
+        }
+        let exe = up::current_exe()?;
+        if let Some(m) = up::managed_by(&exe, &home(), cargo_home().as_deref()) {
+            bail!("not changed: {}", m.advice().replace('\n', " "));
+        }
+        if !up::dir_writable(exe.parent().unwrap_or(Path::new("."))) {
+            bail!("cannot write to {}", pretty(&exe));
+        }
+        let done = install_release(ep, r, &exe, require_attestation(false), &mut |_| {}).await?;
+        let wiring = refresh_wiring(&exe, cfg_path, Wiring::Silent);
+        Ok((done, wiring))
+    }
+    .await;
+    match res {
+        Ok((done, wiring)) => {
+            let _ = up::log_update(
+                state,
+                &format!(
+                    "updated v{cur} -> {} ({}; wiring {})",
+                    r.tag,
+                    done.attestation,
+                    if wiring {
+                        "refreshed"
+                    } else {
+                        "refresh FAILED: run `middleman setup claude --refresh`"
+                    }
+                ),
+            );
+            let mut c = up::load_cache(state).unwrap_or_default();
+            c.updated_to = Some(r.tag.clone());
+            c.notice_since = None;
+            let _ = up::save_cache(state, &c);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            let _ = up::log_update(state, &format!("update to {} failed: {e:#}", r.tag));
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn cargo_home() -> Option<PathBuf> {
+    std::env::var_os("CARGO_HOME").map(PathBuf::from)
+}
+
 /// Package-managed or read-only installs are not touched: say what to run instead.
 fn refuse_unmanageable(exe: &Path) -> Option<ExitCode> {
-    let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
-    if let Some(m) = up::managed_by(exe, &home(), cargo_home.as_deref()) {
+    if let Some(m) = up::managed_by(exe, &home(), cargo_home().as_deref()) {
         note!("{} is not changed: {}", pretty(exe), m.advice());
         return Some(ExitCode::from(1));
     }
@@ -133,6 +230,59 @@ fn require_attestation(flag: bool) -> bool {
     flag || std::env::var("MIDDLEMAN_REQUIRE_ATTESTATION").is_ok_and(|v| v.trim() == "1")
 }
 
+/// What `install_release` did, for the summary and the verbose log.
+struct Installed {
+    prev: PathBuf,
+    /// How the provenance check went (`provenance verified: ...` / `... not checked ...`).
+    attestation: String,
+}
+
+/// Download, verify, stage, check and install `r` over `exe`. `step` gets the verbose lines.
+async fn install_release(
+    ep: &Endpoints,
+    r: &Release,
+    exe: &Path,
+    require: bool,
+    step: &mut dyn FnMut(String),
+) -> Result<Installed> {
+    let asset = up::asset_name(&r.tag, up::TARGET).with_context(|| {
+        format!(
+            "there is no release build for {}; build it from source: {}",
+            up::TARGET,
+            up::CARGO_CMD
+        )
+    })?;
+    step(format!("-> downloading {asset}"));
+    let archive = up::download(ep, &ep.asset_url(&r.tag, &asset), up::MAX_DOWNLOAD).await?;
+    let sums = up::download(ep, &ep.asset_url(&r.tag, "SHA256SUMS.txt"), up::MAX_META).await?;
+    let sums = String::from_utf8(sums).context("SHA256SUMS.txt is not text")?;
+    let hex = up::verify_sha(&archive, &sums, &asset)?;
+    step(format!(
+        "   checksum ok (sha256 {}…, from SHA256SUMS.txt)",
+        &hex[..16]
+    ));
+
+    let tmp = up::TempDir::new()?;
+    let file = tmp.path.join(&asset);
+    std::fs::write(&file, &archive)?;
+    let gh = up::find_on_path("gh");
+    let att = up::verify_attestation(gh.as_deref(), &file);
+    let attestation = up::attestation_policy(&att, require)?;
+    step(format!("   {attestation}"));
+
+    let stem = up::archive_stem(&r.tag, up::TARGET);
+    let bin = up::extract_binary(&archive, &stem, up::MAX_DOWNLOAD)?;
+    let staged = up::stage(exe, &bin)?;
+    up::check_binary(&staged.path, &r.version)?;
+    step(format!("   the new binary runs and reports v{}", r.version));
+    let prev = up::install(exe, staged)?;
+    step(format!(
+        "   the previous binary is kept as {}; `middleman upgrade --rollback` restores it",
+        pretty(&prev)
+    ));
+    Ok(Installed { prev, attestation })
+}
+
 async fn upgrade(cfg_path: &Path, a: &UpgradeArgs) -> Result<ExitCode> {
     let ui = Ui::stdout();
     let exe = up::current_exe()?;
@@ -144,134 +294,157 @@ async fn upgrade(cfg_path: &Path, a: &UpgradeArgs) -> Result<ExitCode> {
     let want = a.version.as_deref().map(up::normalize_tag).transpose()?;
     let r = up::fetch_release(&ep, want.as_deref()).await?;
     if r.version == cur {
-        say!("middleman v{cur} is already installed; nothing to do.");
+        say!(
+            "{}",
+            ui.ok(&format!("middleman {cur} is already installed"))
+        );
         return Ok(ExitCode::SUCCESS);
     }
     if r.version < cur && want.is_none() {
         say!(
-            "middleman v{cur} is up to date (the latest release is {}).",
-            r.tag
+            "{}",
+            ui.ok(&format!(
+                "middleman {cur} is up to date (the latest release is {})",
+                r.tag
+            ))
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let asset = up::asset_name(&r.tag, up::TARGET).with_context(|| {
-        format!(
-            "there is no release build for {}; build it from source: {}",
-            up::TARGET,
-            up::CARGO_CMD
-        )
-    })?;
-
-    say!(
-        "{} middleman v{cur} -> {}{}",
-        ui.bold("Upgrade:"),
-        r.tag,
-        if r.version < cur { " (downgrade)" } else { "" }
-    );
-    say!("  binary:        {}", pretty(&exe));
-    say!("  release notes: {}", Endpoints::notes_url(&r.tag));
-    for l in up::notes_summary(&r.body, 8) {
-        say!("    {}", ui.dim(&l));
+    let down = if r.version < cur { " (downgrade)" } else { "" };
+    if a.verbose {
+        say!(
+            "{} middleman v{cur} -> {}{down}",
+            ui.bold("Upgrade:"),
+            r.tag
+        );
+        say!("  binary:        {}", pretty(&exe));
+        say!("  release notes: {}", Endpoints::notes_url(&r.tag));
+        for l in up::notes_summary(&r.body, 8) {
+            say!("    {}", ui.dim(&l));
+        }
+        say!("");
     }
-    say!("");
-    if !confirm(&format!("Install middleman {}?", r.tag), a.yes)? {
+    let prompt = format!(
+        "Upgrade middleman {cur} → {}{down}? (notes: {})",
+        r.version,
+        Endpoints::notes_url(&r.tag)
+    );
+    if !confirm(&prompt, a.yes)? {
         say!("Nothing changed.");
         return Ok(ExitCode::SUCCESS);
     }
 
-    say!("-> downloading {asset}");
-    let archive = up::download(&ep, &ep.asset_url(&r.tag, &asset), up::MAX_DOWNLOAD).await?;
-    let sums = up::download(&ep, &ep.asset_url(&r.tag, "SHA256SUMS.txt"), up::MAX_META).await?;
-    let sums = String::from_utf8(sums).context("SHA256SUMS.txt is not text")?;
-    let hex = up::verify_sha(&archive, &sums, &asset)?;
-    say!(
-        "   checksum ok (sha256 {}…, from SHA256SUMS.txt)",
-        &hex[..16]
-    );
-
-    let tmp = up::TempDir::new()?;
-    let file = tmp.path.join(&asset);
-    std::fs::write(&file, &archive)?;
-    let gh = up::find_on_path("gh");
-    let att = up::verify_attestation(gh.as_deref(), &file);
-    match up::attestation_policy(&att, require_attestation(a.require_attestation))? {
-        None => say!(
-            "   provenance verified: built by {}'s release workflow",
-            up::REPO
-        ),
-        Some(w) => note!("   warning: {w}"),
-    }
-
     if up::TARGET.contains("windows") {
-        let keep = exe.with_file_name(&asset);
-        std::fs::copy(&file, &keep)?;
-        say!(
-            "\nThe verified archive is at {}. To finish on Windows:\n  1. close Claude Code (it runs middleman)\n  2. extract middleman.exe from the archive over {}\n  3. run `middleman setup claude --refresh`",
-            pretty(&keep),
-            pretty(&exe)
-        );
-        return Ok(ExitCode::SUCCESS);
+        return windows_finish(&ep, &r, &exe).await;
     }
 
-    let stem = up::archive_stem(&r.tag, up::TARGET);
-    let bin = up::extract_binary(&archive, &stem, up::MAX_DOWNLOAD)?;
-    let staged = up::stage(&exe, &bin)?;
-    up::check_binary(&staged.path, &r.version)?;
-    say!("   the new binary runs and reports v{}", r.version);
-    let prev = up::install(&exe, staged)?;
+    let old_dr = up::designated_requirement(&exe);
+    let verbose = a.verbose;
+    let done = install_release(
+        &ep,
+        &r,
+        &exe,
+        require_attestation(a.require_attestation),
+        &mut |l| {
+            if verbose {
+                say!("{l}");
+            }
+        },
+    )
+    .await?;
     say!(
         "{}",
-        ui.ok(&format!(
-            "Installed middleman {} at {}",
-            r.tag,
-            pretty(&exe)
-        ))
-    );
-    say!(
-        "  {}",
-        ui.dim(&format!(
-            "the previous binary is kept as {}; `middleman upgrade --rollback` restores it",
-            pretty(&prev)
-        ))
+        ui.ok(&format!("middleman {cur} → {} (verified)", r.version))
     );
 
     if a.no_wiring {
-        say!("\nSkipped the wiring refresh (--no-wiring); run `middleman setup claude --refresh` later.");
+        say!("  Skipped the wiring refresh (--no-wiring); run `middleman setup claude --refresh` later.");
     } else {
-        say!("\n-> refreshing the Claude Code wiring with the new binary");
-        refresh_wiring(&exe, cfg_path);
+        refresh_wiring(
+            &exe,
+            cfg_path,
+            if verbose {
+                Wiring::Verbose
+            } else {
+                Wiring::Quiet
+            },
+        );
     }
-    manual_steps(&ui);
+    if keychain_key_stored(cfg_path)
+        && up::keychain_prompt_expected(
+            old_dr.as_deref(),
+            up::designated_requirement(&exe).as_deref(),
+        )
+        && up::TARGET.contains("apple-darwin")
+    {
+        say!("  {KEYCHAIN_LINE}");
+    }
+    if verbose {
+        say!(
+            "  {}",
+            ui.dim(&format!("previous binary: {}", pretty(&done.prev)))
+        );
+    }
     Ok(ExitCode::SUCCESS)
 }
 
-/// Run the NEW binary's `setup claude --refresh --yes` (its output goes straight through).
-fn refresh_wiring(exe: &Path, cfg_path: &Path) {
-    let _ = std::io::stdout().flush();
-    let st = std::process::Command::new(exe)
-        .args(["setup", "claude", "--refresh", "--yes", "--config"])
-        .arg(cfg_path)
-        .stdin(std::process::Stdio::null())
-        .status();
-    if !st.is_ok_and(|s| s.success()) {
-        note!("warning: the wiring refresh did not finish; run `middleman setup claude --refresh` yourself");
-    }
+/// Windows cannot replace a running exe from inside: verify, then leave the archive.
+async fn windows_finish(ep: &Endpoints, r: &Release, exe: &Path) -> Result<ExitCode> {
+    let asset = up::asset_name(&r.tag, up::TARGET).context("no release build for Windows")?;
+    let archive = up::download(ep, &ep.asset_url(&r.tag, &asset), up::MAX_DOWNLOAD).await?;
+    let sums = up::download(ep, &ep.asset_url(&r.tag, "SHA256SUMS.txt"), up::MAX_META).await?;
+    up::verify_sha(&archive, &String::from_utf8_lossy(&sums), &asset)?;
+    let keep = exe.with_file_name(&asset);
+    std::fs::write(&keep, &archive)?;
+    say!(
+        "The verified archive is at {}. To finish on Windows:\n  1. close Claude Code (it runs middleman)\n  2. extract middleman.exe from the archive over {}\n  3. run `middleman setup claude --refresh`, then /mcp in Claude Code",
+        pretty(&keep),
+        pretty(exe)
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
-fn manual_steps(ui: &Ui) {
-    say!("\n{}", ui.bold("Left for you:"));
-    say!(
-        "  - run /mcp in Claude Code to reconnect (or restart it): the MCP server that is running\n    is still the old binary."
-    );
-    if up::TARGET.contains("apple-darwin") {
-        say!(
-            "  - macOS may ask once to let the new binary use the Keychain: choose \"Always Allow\".\n    The binary changed, so its code signature did too, and the Keychain asks again\n    before it hands a stored API key to a program it has not seen."
-        );
+/// Does any configured provider keep its key in the OS keychain?
+fn keychain_key_stored(cfg_path: &Path) -> bool {
+    Config::load(cfg_path).is_ok_and(|c| {
+        c.providers
+            .values()
+            .any(|p| p.enabled && p.key_source == Some(KeySource::Keychain))
+    })
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Wiring {
+    /// The new binary's one-line summary goes straight through.
+    Quiet,
+    /// Its full diff and backup paths go through.
+    Verbose,
+    /// Nothing is printed (background update).
+    Silent,
+}
+
+/// Run the NEW binary's `setup claude --refresh --yes`. Returns true when it finished.
+fn refresh_wiring(exe: &Path, cfg_path: &Path, how: Wiring) -> bool {
+    use std::process::Stdio;
+    let _ = std::io::stdout().flush();
+    let mut c = std::process::Command::new(exe);
+    c.args(["setup", "claude", "--refresh", "--yes"]);
+    if how == Wiring::Verbose {
+        c.arg("--verbose");
     }
+    c.arg("--config").arg(cfg_path).stdin(Stdio::null());
+    if how == Wiring::Silent {
+        c.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    let ok = c.status().is_ok_and(|s| s.success());
+    if !ok && how != Wiring::Silent {
+        note!("warning: the wiring refresh did not finish; run `middleman setup claude --refresh` yourself");
+    }
+    ok
 }
 
 /// `upgrade --rollback`: swap `middleman.prev` back in.
-fn rollback(yes: bool) -> Result<ExitCode> {
+fn rollback(cfg_path: &Path, yes: bool) -> Result<ExitCode> {
     let ui = Ui::stdout();
     let exe = up::current_exe()?;
     if let Some(code) = refuse_unmanageable(&exe) {
@@ -284,27 +457,100 @@ fn rollback(yes: bool) -> Result<ExitCode> {
     let pv =
         up::binary_version(&prev).context("the previous binary does not run; not restoring it")?;
     let cur = Version::current();
-    say!(
-        "{} middleman v{cur} -> v{pv} (from {})",
-        ui.bold("Rollback:"),
-        pretty(&prev)
-    );
-    if !confirm(&format!("Put middleman v{pv} back?"), yes)? {
+    if !confirm(
+        &format!(
+            "Put middleman {pv} back (now {cur}, from {})?",
+            pretty(&prev)
+        ),
+        yes,
+    )? {
         say!("Nothing changed.");
         return Ok(ExitCode::SUCCESS);
     }
+    let old_dr = up::designated_requirement(&exe);
     let v = up::rollback(&exe)?;
     say!(
         "{}",
-        ui.ok(&format!("Restored middleman v{v} at {}", pretty(&exe)))
-    );
-    say!(
-        "  {}",
-        ui.dim(&format!(
-            "v{cur} is now {}; `middleman upgrade --rollback` again switches back",
-            pretty(&prev)
+        ui.ok(&format!(
+            "Restored middleman v{v} at {} (`middleman upgrade --rollback` again switches back)",
+            pretty(&exe)
         ))
     );
-    manual_steps(&ui);
+    if up::TARGET.contains("apple-darwin")
+        && keychain_key_stored(cfg_path)
+        && up::keychain_prompt_expected(
+            old_dr.as_deref(),
+            up::designated_requirement(&exe).as_deref(),
+        )
+    {
+        say!("  {KEYCHAIN_LINE}");
+    }
+    if up::TARGET.contains("windows") {
+        say!("  Run /mcp in Claude Code (or restart it) to reconnect middleman.");
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `middleman update-settings [notify|auto|off]`.
+pub fn update_settings(cfg_path: &Path, mode: Option<&str>) -> Result<ExitCode> {
+    let ui = Ui::stdout();
+    let text = std::fs::read_to_string(cfg_path).with_context(|| {
+        format!(
+            "no config at {}: run `middleman init` first",
+            pretty(cfg_path)
+        )
+    })?;
+    let cur = Config::from_toml(&text)
+        .map(|c| c.update.mode())
+        .unwrap_or_default();
+    let want = match mode {
+        Some(m) => UpdateMode::parse(m).context("the mode must be notify, auto or off")?,
+        None if interactive() => {
+            let items = UPDATE_CHOICES.map(|(_, l)| l);
+            let def = UPDATE_CHOICES
+                .iter()
+                .position(|(m, _)| *m == cur)
+                .unwrap_or(0);
+            let i = dialoguer::Select::with_theme(&theme())
+                .with_prompt("Keep middleman up to date")
+                .items(items)
+                .default(def)
+                .interact()?;
+            UPDATE_CHOICES[i].0
+        }
+        None => {
+            say!("updates: {} ({})", cur.as_str(), describe_mode(cur));
+            return Ok(ExitCode::SUCCESS);
+        }
+    };
+    if want != cur || !text.contains("mode =") {
+        let new = middleman::wizard::set_update_mode(&text, want)?;
+        middleman::onboard::write_config(cfg_path, &new)?;
+    }
+    say!(
+        "{}",
+        ui.ok(&format!(
+            "updates: {} ({})",
+            want.as_str(),
+            describe_mode(want)
+        ))
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The wizard's and `update-settings`' choices, default first.
+pub const UPDATE_CHOICES: [(UpdateMode, &str); 3] = [
+    (UpdateMode::Notify, "notify me"),
+    (UpdateMode::Auto, "update automatically"),
+    (UpdateMode::Off, "never check"),
+];
+
+pub fn describe_mode(m: UpdateMode) -> &'static str {
+    match m {
+        UpdateMode::Notify => "a daily check; the status line shows ↑ vX when a release is out",
+        UpdateMode::Auto => {
+            "patch releases install in the background (checksum-verified); bigger ones are only shown"
+        }
+        UpdateMode::Off => "no update checks",
+    }
 }

@@ -62,7 +62,7 @@ fn fake_gh(dir: &Path, log: &Path, code: i32) {
     script(
         &dir.join("gh"),
         &format!(
-            "for a in \"$@\"; do echo \"$a\" >> '{}'; done\n[ {code} = 0 ] || echo 'no matching attestations' >&2\nexit {code}",
+            "[ \"$1\" = auth ] && exit 0\nfor a in \"$@\"; do echo \"$a\" >> '{}'; done\n[ {code} = 0 ] || echo 'no matching attestations' >&2\nexit {code}",
             log.display()
         ),
     );
@@ -187,25 +187,16 @@ async fn upgrade_verifies_replaces_keeps_prev_and_refreshes_wiring() {
     let (so, se) = text(&out);
     assert!(out.status.success(), "{so}\n{se}");
     let cur = env!("CARGO_PKG_VERSION");
-    assert!(so.contains(&format!("middleman v{cur} -> {TAG}")), "{so}");
-    assert!(so.contains("https://github.com/baturox/middleman/releases/tag/v9.9.9"));
-    assert!(
-        !so.contains("evil.example"),
-        "the API's html_url is not used"
+    // quiet by default: the result line, then the new binary's own refresh output
+    let cfg = fx.home.join(".config/middleman/config.toml");
+    assert_eq!(
+        so,
+        format!(
+            "✓ middleman {cur} → 9.9.9 (verified)\n  (new binary) setup claude --refresh --yes --config {}\n",
+            cfg.display()
+        )
     );
-    assert!(
-        so.contains("* faster hook") && so.contains("* title escape"),
-        "{so}"
-    );
-    assert!(
-        !so.contains('\u{1b}') && !so.contains('\u{7}') && !so.contains("pwned"),
-        "{so:?}"
-    );
-    assert!(so.contains("checksum ok"));
-    assert!(so.contains("provenance verified"));
-    assert!(so.contains("the new binary runs and reports v9.9.9"));
-    assert!(so.contains("Installed middleman v9.9.9"));
-    assert!(so.contains("run /mcp in Claude Code"));
+    assert_eq!(se, "", "no warnings");
 
     // replaced, mode kept, previous kept as .prev, nothing else left behind
     assert_eq!(
@@ -237,7 +228,97 @@ async fn upgrade_verifies_replaces_keeps_prev_and_refreshes_wiring() {
         calls.starts_with("setup claude --refresh --yes --config "),
         "{calls}"
     );
-    assert!(so.contains("(new binary) setup claude --refresh --yes"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verbose_upgrade_shows_every_step() {
+    let fx = fixture();
+    let s = github(release_archive("9.9.9"), None).await;
+    let out = run(
+        &fx,
+        &fx.exe,
+        &s.uri(),
+        &["upgrade", "--yes", "--verbose"],
+        &[],
+    )
+    .await;
+    let (so, se) = text(&out);
+    assert!(out.status.success(), "{so}\n{se}");
+    let cur = env!("CARGO_PKG_VERSION");
+    assert!(so.contains(&format!("middleman v{cur} -> {TAG}")), "{so}");
+    assert!(so.contains("https://github.com/baturox/middleman/releases/tag/v9.9.9"));
+    assert!(
+        !so.contains("evil.example"),
+        "the API's html_url is not used"
+    );
+    assert!(
+        so.contains("* faster hook") && so.contains("* title escape"),
+        "{so}"
+    );
+    assert!(
+        !so.contains('\u{1b}') && !so.contains('\u{7}') && !so.contains("pwned"),
+        "{so:?}"
+    );
+    for want in [
+        "checksum ok",
+        "provenance verified",
+        "the new binary runs and reports v9.9.9",
+        "`middleman upgrade --rollback` restores it",
+        "(new binary) setup claude --refresh --yes --verbose --config",
+        &format!("✓ middleman {cur} → 9.9.9 (verified)"),
+    ] {
+        assert!(so.contains(want), "{want}: {so}");
+    }
+    assert!(!so.contains("/mcp"), "the MCP server re-executes itself");
+    // MIDDLEMAN_VERBOSE=1 does the same
+    let fx = fixture();
+    let out = run(
+        &fx,
+        &fx.exe,
+        &s.uri(),
+        &["upgrade", "--yes"],
+        &[("MIDDLEMAN_VERBOSE", "1")],
+    )
+    .await;
+    assert!(text(&out).0.contains("checksum ok"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn logged_out_gh_is_quiet() {
+    let fx = fixture();
+    script(
+        &fx.path_dir.join("gh"),
+        "[ \"$1\" = auth ] && exit 1\nexit 1",
+    );
+    let s = github(release_archive("9.9.9"), None).await;
+    let out = run(
+        &fx,
+        &fx.exe,
+        &s.uri(),
+        &["upgrade", "--yes", "--no-wiring"],
+        &[],
+    )
+    .await;
+    let (so, se) = text(&out);
+    assert!(out.status.success(), "{so}\n{se}");
+    assert_eq!(se, "");
+    assert!(so.starts_with("✓ middleman "), "{so}");
+    // required: now fatal
+    let fx = fixture();
+    script(
+        &fx.path_dir.join("gh"),
+        "[ \"$1\" = auth ] && exit 1\nexit 1",
+    );
+    let out = run(
+        &fx,
+        &fx.exe,
+        &s.uri(),
+        &["upgrade", "--yes", "--require-attestation"],
+        &[],
+    )
+    .await;
+    assert!(!out.status.success());
+    assert!(text(&out).1.contains("gh is not logged in"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -291,8 +372,15 @@ async fn tampered_or_wrong_releases_change_nothing() {
         assert_eq!(std::fs::read(&fx.exe).unwrap(), original, "{what}");
         assert_eq!(files_in(&fx.bin), vec!["middleman"], "{what}");
     }
-    // without the requirement a failed attestation is only a warning
+    // without the requirement a failed attestation is still fatal: gh ran and said no
     let s = github(release_archive("9.9.9"), None).await;
+    let out = run(&fx, &fx.exe, &s.uri(), &["upgrade", "--yes"], &[]).await;
+    let (so, se) = text(&out);
+    assert!(!out.status.success(), "{so}");
+    assert!(se.contains("attestation verification failed"), "{se}");
+    assert_eq!(std::fs::read(&fx.exe).unwrap(), original);
+    // --no-wiring
+    fake_gh(&fx.path_dir, &fx.gh_log, 0);
     let out = run(
         &fx,
         &fx.exe,
@@ -303,10 +391,6 @@ async fn tampered_or_wrong_releases_change_nothing() {
     .await;
     let (so, se) = text(&out);
     assert!(out.status.success(), "{so}\n{se}");
-    assert!(
-        se.contains("warning: could not verify the build attestation"),
-        "{se}"
-    );
     assert!(so.contains("Skipped the wiring refresh"));
     assert!(!fx.home.join("fake-calls").exists(), "--no-wiring");
 }
@@ -361,7 +445,7 @@ async fn check_exit_codes_and_daily_cache() {
     assert!(out.status.success());
     assert!(text(&out)
         .0
-        .contains("is up to date (the latest release is v0.0.1)"));
+        .contains("up to date (the latest release is v0.0.1)"));
     assert_eq!(files_in(&fx.bin), vec!["middleman"]);
 
     // a non-loopback override is ignored (it would be the real API): prove it by checking
@@ -386,7 +470,7 @@ async fn rollback_swaps_prev_back() {
     .await;
     let (so, se) = text(&out);
     assert!(out.status.success(), "{so}\n{se}");
-    assert!(so.contains("Restored middleman v0.2.0"), "{so}");
+    assert!(so.starts_with("✓ Restored middleman v0.2.0"), "{so}");
     assert_eq!(
         std::fs::read_to_string(&fx.exe).unwrap(),
         fake_binary("0.2.0")
@@ -456,19 +540,34 @@ async fn setup_claude_refresh_migrates_0_2_0_wiring() {
     std::fs::write(proj.join(".claude/settings.json"), proj_settings).unwrap();
 
     let exe = fx.exe.display().to_string();
-    let mut c = std::process::Command::new(&fx.exe);
-    c.args(["setup", "claude", "--refresh", "--yes"])
-        .env("HOME", home)
-        .env("NO_COLOR", "1")
-        .current_dir(&proj);
-    let out = c.output().unwrap();
-    let (so, se) = text(&out);
-    eprintln!("{so}\n{se}");
-    assert!(out.status.success(), "{so}\n{se}");
+    let refresh = |extra: &[&str]| {
+        let mut c = std::process::Command::new(&fx.exe);
+        c.args(["setup", "claude", "--refresh", "--yes"])
+            .args(extra)
+            .env("HOME", home)
+            .env("NO_COLOR", "1")
+            .env_remove("MIDDLEMAN_VERBOSE")
+            .current_dir(&proj);
+        let out = c.output().unwrap();
+        let (so, se) = text(&out);
+        eprintln!("{so}\n{se}");
+        assert!(out.status.success(), "{so}\n{se}");
+        so
+    };
+    // --dry-run --verbose shows the diff and changes nothing
+    let so = refresh(&["--dry-run", "--verbose"]);
     assert!(so.contains("timeout 5 s -> 150 s"), "{so}");
     assert!(so.contains("MCP server: now starts"), "{so}");
-    assert!(so.contains("backed up ~/.claude/settings.json"), "{so}");
-    assert!(so.contains("Run /mcp in Claude Code"), "{so}");
+    assert_eq!(
+        std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
+        settings_text
+    );
+    // the quiet default: one line
+    let so = refresh(&[]);
+    assert_eq!(
+        so,
+        "✓ Claude Code settings updated (backup kept; undo: middleman setup claude --undo)\n"
+    );
 
     let read = |p: PathBuf| -> Value {
         serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
@@ -516,19 +615,41 @@ async fn setup_claude_refresh_migrates_0_2_0_wiring() {
         .any(|p| std::fs::read_to_string(&p).is_ok_and(|t| t == settings_text));
     assert!(found, "0.2.0 settings.json backed up");
 
-    // second run: nothing to do
-    let out = std::process::Command::new(&fx.exe)
-        .args(["setup", "claude", "--refresh", "--yes"])
-        .env("HOME", home)
+    // second run: nothing to do (one line)
+    assert_eq!(
+        refresh(&[]),
+        "✓ Claude Code settings are current (nothing to refresh)\n"
+    );
+}
+
+#[test]
+fn verbose_refresh_lists_backups() {
+    let d = tempfile::tempdir().unwrap();
+    let home = d.path().canonicalize().unwrap();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::write(
+        home.join(".claude/settings.json"),
+        r#"{"statusLine": {"type": "command", "command": "/old/bin/middleman statusline"}}"#,
+    )
+    .unwrap();
+    let out = std::process::Command::new(built())
+        .args(["setup", "claude", "--refresh", "--yes", "--verbose"])
+        .env("HOME", &home)
         .env("NO_COLOR", "1")
-        .current_dir(&proj)
+        .current_dir(&home)
         .output()
         .unwrap();
+    let (so, se) = text(&out);
+    assert!(out.status.success(), "{so}\n{se}");
+    assert!(so.contains("backed up ~/.claude/settings.json"), "{so}");
+    assert!(so.contains("updated ~/.claude/settings.json"), "{so}");
     assert!(
-        text(&out).0.contains("nothing to refresh"),
-        "{}",
-        text(&out).0
+        so.ends_with(
+            "✓ Claude Code settings updated (backup kept; undo: middleman setup claude --undo)\n"
+        ),
+        "{so}"
     );
+    assert!(!so.contains("/mcp"), "{so}");
 }
 
 fn walk(d: &Path) -> Vec<PathBuf> {

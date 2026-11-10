@@ -133,6 +133,8 @@ pub struct Config {
     pub output: OutputCfg,
     #[serde(default)]
     pub update: UpdateCfg,
+    #[serde(default)]
+    pub statusline: StatuslineCfg,
     /// Where ledger and audit files go. Default `~/.local/state/middleman`.
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
@@ -183,16 +185,74 @@ impl Default for BudgetCfg {
     }
 }
 
+/// `[statusline]`: `enabled = false` after `middleman statusline off`, so `setup claude` and
+/// `--refresh` do not put the status line back.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StatuslineCfg {
+    pub enabled: bool,
+}
+
+impl Default for StatuslineCfg {
+    fn default() -> Self {
+        StatuslineCfg { enabled: true }
+    }
+}
+
 /// `[update]`: the daily background check for a newer release (one GET to api.github.com).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct UpdateCfg {
+    /// `notify` (default): show `↑ vX` in the status line and doctor; `auto`: also install
+    /// patch releases of the same minor line in the background; `off`: never check.
+    pub mode: Option<UpdateMode>,
+    /// Older spelling: `check = false` is `mode = "off"`.
     pub check: bool,
 }
 
 impl Default for UpdateCfg {
     fn default() -> Self {
-        UpdateCfg { check: true }
+        UpdateCfg {
+            mode: None,
+            check: true,
+        }
+    }
+}
+
+impl UpdateCfg {
+    pub fn mode(&self) -> UpdateMode {
+        if !self.check {
+            return UpdateMode::Off;
+        }
+        self.mode.unwrap_or(UpdateMode::Notify)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateMode {
+    #[default]
+    Notify,
+    Auto,
+    Off,
+}
+
+impl UpdateMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UpdateMode::Notify => "notify",
+            UpdateMode::Auto => "auto",
+            UpdateMode::Off => "off",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<UpdateMode> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "notify" => Some(UpdateMode::Notify),
+            "auto" => Some(UpdateMode::Auto),
+            "off" | "never" => Some(UpdateMode::Off),
+            _ => None,
+        }
     }
 }
 
