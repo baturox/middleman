@@ -90,3 +90,8 @@ enabled = false
 # price_in = 0.27
 # price_out = 1.10
 # tags = ["code", "chat"]
+
+# Once a day the status line / doctor check for a newer release: one unauthenticated GET to
+# api.github.com, nothing about you is sent. MIDDLEMAN_NO_UPDATE_CHECK=1 also turns it off.
+[update]
+check = true

@@ -206,7 +206,12 @@ pub async fn refresh(cfg: &Config) -> anyhow::Result<LimitsCache> {
 /// Exclusive refresh lock: Some(guard) when we got it. A lock older than
 /// [`LOCK_STALE_S`] is taken over.
 pub fn try_lock(state_dir: &Path) -> Option<RefreshLock> {
-    let p = lock_path(state_dir);
+    try_lock_at(&lock_path(state_dir))
+}
+
+/// The same exclusive lock at another path (the daily update check uses its own).
+pub fn try_lock_at(p: &Path) -> Option<RefreshLock> {
+    let p = p.to_path_buf();
     for _ in 0..2 {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
@@ -282,20 +287,23 @@ pub fn maybe_refresh(
 
 /// The real spawner: `<exe> provider refresh --quiet --config <cfg>`, detached, no stdio.
 pub fn spawn_refresh(cfg_path: &Path) -> std::io::Result<()> {
+    spawn_detached(
+        &["provider", "refresh", "--quiet", "--from-statusline"],
+        cfg_path,
+    )
+}
+
+/// Start `<this exe> <args> --config <cfg>` detached from the terminal, with no stdio.
+pub fn spawn_detached(args: &[&str], cfg_path: &Path) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
-    cmd.args([
-        "provider",
-        "refresh",
-        "--quiet",
-        "--from-statusline",
-        "--config",
-    ])
-    .arg(cfg_path)
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null());
+    cmd.args(args)
+        .arg("--config")
+        .arg(cfg_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

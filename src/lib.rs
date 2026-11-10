@@ -39,6 +39,7 @@ pub mod suggest;
 pub mod transcript;
 pub mod tune;
 pub mod ui;
+pub mod upgrade;
 pub mod usage;
 pub mod watch;
 pub mod wizard;

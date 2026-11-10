@@ -131,6 +131,8 @@ pub struct Config {
     pub providers: BTreeMap<String, ProviderCfg>,
     #[serde(default)]
     pub output: OutputCfg,
+    #[serde(default)]
+    pub update: UpdateCfg,
     /// Where ledger and audit files go. Default `~/.local/state/middleman`.
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
@@ -178,6 +180,19 @@ impl Default for BudgetCfg {
             weekly_usd: 4.0,
             reserve_usd: 1.0,
         }
+    }
+}
+
+/// `[update]`: the daily background check for a newer release (one GET to api.github.com).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UpdateCfg {
+    pub check: bool,
+}
+
+impl Default for UpdateCfg {
+    fn default() -> Self {
+        UpdateCfg { check: true }
     }
 }
 
