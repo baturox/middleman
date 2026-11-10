@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 50a74b826a3d9db24771f958bb3996b570cc370811e5a617d583add10eebfaf7 # shrinks to parts = [("db.internal.corp", "("), ("db.internal.corp", " ")]

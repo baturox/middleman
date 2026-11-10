@@ -1,0 +1,3 @@
+# Synthetic private dictionary for tests: company / product names
+Acme
+Zorblax

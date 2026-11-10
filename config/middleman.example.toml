@@ -1,0 +1,78 @@
+# middleman example config -> copy to ~/.config/middleman/config.toml (or run `middleman init`).
+# Keys are never written inline: use key_env and/or key_file (+ key_var).
+
+[limits]
+max_input_chars = 24000
+max_files = 6
+max_output_tokens = 2000
+request_timeout_s = 120
+
+[budget]
+per_call_usd = 0.05
+daily_usd = 1.0
+weekly_usd = 4.0
+reserve_usd = 1.0      # never spend the provider balance below this
+
+[paths]
+roots = ["/abs/path/to/project"]
+deny = ["**/billing/**", "**/auth/**"]   # added to the built-in deny list (.env*, *.pem, ...)
+
+[redact]
+secrets = "block"      # "block" (default) | "mask"
+pii = "block"          # "block" (default) | "pseudonymize"
+dictionary_file = "~/.config/middleman/dictionary.txt"
+
+[routing]
+mode = "auto"          # "auto" | "confirm" (dry_run first, ask the user) | "explicit" (only cheap:/delegate)
+default_quality = "cheapest"
+max_attempts = 3
+
+[economics]
+# Main Claude model the savings are measured against: opus-5.5 ($4/$20/cache-read $0.20 per 1M),
+# sonnet-5.5 ($2/$10/$0.10), fable-5.2 ($8/$40/$0.20), haiku-5.5 ($0.10/$0.50). Override with
+# price_in / price_out / price_cache_read.
+claude_model = "opus-5.5"
+min_expected_output_tokens = 800   # never delegate below this
+assumed_context_tokens = 60000     # session context re-read by the extra turn a tool call costs
+call_tokens = 200                  # output tokens Claude spends on the tool call
+summary_tokens = 150               # file-mode tool result size
+enforce_break_even = true          # block (do it yourself) when delegation would not pay
+
+[usage]
+projects_dir = "~/.claude/projects"
+# prices per model family for `middleman usage` (USD / 1M; cache_write = 1.25 x input)
+prices.opus = { input = 4.0, output = 20.0, cache_read = 0.20, cache_write = 5.0 }
+prices.sonnet = { input = 2.0, output = 10.0, cache_read = 0.10, cache_write = 2.5 }
+prices.haiku = { input = 0.10, output = 0.50, cache_read = 0.01, cache_write = 0.125 }
+prices.fable = { input = 8.0, output = 40.0, cache_read = 0.20, cache_write = 10.0 }
+
+# Chains per task kind. Steps: "auto:<tag>:<cheapest|balanced|best>", "<provider>/<model id>",
+# "<provider>" (its default `model`), "claude" (stop: do it yourself). Unlisted kinds use
+# ["auto:code:cheapest", "auto:code:balanced", "claude"] (code kinds) or the chat equivalent.
+[routes.write_tests]
+chain = ["auto:code:cheapest", "auto:code:balanced", "claude"]
+[routes.summarize]
+chain = ["auto:chat:cheapest", "claude"]
+
+# Providers: a preset fills api/base_url/key_env/trust/balance. See `middleman init --list`.
+[providers.yzlab]
+preset = "yapayzekalab"
+key_env = "YZLAB_KEY"
+key_file = "/path/to/.env.yzlab"
+task_kinds = ["write_tests", "boilerplate", "summarize", "docstring", "snippet", "explain", "translate"]
+# max_sensitivity defaults by trust: untrusted=S1, zdr=S2, local/first_party=S3
+
+[providers.openrouter]
+preset = "openrouter"
+enabled = false
+headers = { "X-Title" = "middleman" }
+
+[providers.local]
+preset = "ollama"
+enabled = false
+
+# Per-model overrides: price (USD/1M), context, tags, or exclusion.
+# [models."openrouter/deepseek/deepseek-chat"]
+# price_in = 0.27
+# price_out = 1.10
+# tags = ["code", "chat"]

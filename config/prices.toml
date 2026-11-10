@@ -1,0 +1,9 @@
+# Bundled fallback prices (USD per 1M tokens), keyed "<provider name>/<model id>".
+# Used only when the provider's /v1/models response has no pricing fields and the user
+# config has no [models."<provider>/<id>"] override. Prices change often, so this table is
+# intentionally empty: an unknown price makes a model ineligible (fail-closed on budget).
+# Add entries in your user config rather than here, e.g.
+#
+# ["deepseek/deepseek-chat"]
+# price_in = 0.27
+# price_out = 1.10

@@ -1,0 +1,12 @@
+# middleman private dictionary: one term per line, '#' starts a comment.
+# Terms are matched ASCII-case-insensitively, also inside identifiers
+# (AcmeBilling, acme_billing, ACME_URL all match "Acme"), and replaced with
+# neutral case-preserving pseudo-words that are restored in the answer.
+# Minimum length is 3 characters. Put company, product, project, customer,
+# codename and people names here.
+#
+# Acme
+# AcmeCloud
+# Zorblax
+# ProjectNightjar
+# Jane Doe
