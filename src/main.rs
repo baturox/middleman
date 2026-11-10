@@ -121,8 +121,8 @@ enum Cmd {
         #[command(subcommand)]
         target: SetupTarget,
     },
-    /// Status line for Claude Code's statusLine: model, effort, context, cost, cache, and
-    /// middleman's provider, limits, jobs, subagents and net savings (reads JSON on stdin)
+    /// Status line for Claude Code: model, context used, provider credit left and net saved
+    /// (reads Claude Code's JSON on stdin). `on` / `off` shows or hides it.
     Statusline {
         /// `on` / `off`: show or hide middleman's status line in Claude Code (remembered in
         /// the config). Without it: print the status line (what Claude Code runs)
