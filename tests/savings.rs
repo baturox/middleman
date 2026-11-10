@@ -369,5 +369,14 @@ proptest! {
         let days = middleman::report::build(&es, None, middleman::report::By::Day);
         let sum_days: f64 = days.rows.iter().map(|r| r.net_savings_usd).sum();
         prop_assert!((sum_days - total.net_savings_usd).abs() < 1e-9);
+        // the status line's incremental totals equal the report
+        let mut t = middleman::statusline::LedgerTotals::default();
+        for e in &es { t.add(e); }
+        prop_assert!((t.all.net_savings_usd - total.net_savings_usd).abs() < 1e-12);
+        let today = middleman::report::build(&es, Some(base - base.rem_euclid(86_400)), middleman::report::By::Day).total;
+        prop_assert!((t.today(base).net_savings_usd - today.net_savings_usd).abs() < 1e-12);
+        let s_even = t.session("s-even").map(|a| a.net_savings_usd).unwrap_or(0.0);
+        let s_odd = t.session("s-odd").map(|a| a.net_savings_usd).unwrap_or(0.0);
+        prop_assert!((s_even + s_odd - total.net_savings_usd).abs() < 1e-9);
     }
 }

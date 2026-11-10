@@ -16,6 +16,9 @@ fn mm(home: &Path) -> Command {
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("MIDDLEMAN_KEYS_DIR")
         .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env("MIDDLEMAN_SL_NO_REFRESH", "1")
+        .env("NO_COLOR", "1")
+        .env("COLUMNS", "200")
         .current_dir(home);
     c
 }
@@ -75,9 +78,19 @@ fn onboarding_flow_in_temp_home() {
     assert!(out.contains("keys/openrouter"), "{out}");
 
     let (out, _) = run(mm(home)
-        .args(["statusline", "--config", &cfg_s])
+        .args(["statusline", "--middleman-only", "--config", &cfg_s])
         .write_stdin(r#"{"session_id":"s-1","workspace":{"current_dir":"/"}}"#));
-    assert_eq!(out.trim(), "🛡 middleman ✓ openrouter · 0 delegated today");
+    assert_eq!(
+        out.trim(),
+        "🛡 middleman ✓ openrouter · 0 jobs this session · 0 today · saved $0.00 session · $0.00 today · $0.00 total"
+    );
+    let (out, _) = run(mm(home)
+        .args(["statusline", "--config", &cfg_s])
+        .write_stdin(r#"{"model":{"id":"claude-opus-5-5"},"effort":{"level":"high"}}"#));
+    assert!(
+        out.starts_with("Opus 5.5 high │ ░░░░░░░░░░ 0% 0 │ 🛡 middleman ✓"),
+        "{out}"
+    );
 
     let (out, _) = run(mm(home).args(["setup", "claude", "--dry-run", "--config", &cfg_s]));
     assert!(out.contains("+ register the middleman MCP server"), "{out}");

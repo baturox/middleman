@@ -120,8 +120,20 @@ enum Cmd {
         #[command(subcommand)]
         target: SetupTarget,
     },
-    /// Print one status line for Claude Code's statusLine (reads its JSON on stdin)
-    Statusline,
+    /// Status line for Claude Code's statusLine: model, effort, context, cost, cache, and
+    /// middleman's provider, limits, jobs, subagents and net savings (reads JSON on stdin)
+    Statusline {
+        /// 1: everything on one line (shortened to fit); 2: Claude part, then middleman part
+        /// [env: MIDDLEMAN_SL_LINES]
+        #[arg(long)]
+        lines: Option<u8>,
+        /// Print only the middleman part, to append to another status line script
+        #[arg(long)]
+        middleman_only: bool,
+        /// Terminal width [default: $COLUMNS, else 120]
+        #[arg(long)]
+        columns: Option<usize>,
+    },
     /// Follow the delegation log live, one readable line per call
     Watch {
         /// Show this many past entries first
@@ -305,6 +317,10 @@ enum SetupTarget {
         undo: bool,
         #[arg(long)]
         no_statusline: bool,
+        /// auto (set it unless you have another status line) | combined (replace another
+        /// status line with middleman's full two-line one) | off
+        #[arg(long, default_value = "auto")]
+        statusline: String,
         #[arg(long)]
         no_hook: bool,
         #[arg(long)]
@@ -943,6 +959,7 @@ struct SetupFlags {
     undo: bool,
     details: bool,
     no_statusline: bool,
+    statusline_combined: bool,
     no_hook: bool,
     no_claude_md: bool,
     no_permissions: bool,
@@ -984,6 +1001,7 @@ fn setup_claude(cfg_path: &Path, scope: &str, f: SetupFlags) -> Result<()> {
         config_path,
         hook: !f.no_hook,
         statusline: !f.no_statusline,
+        statusline_combined: f.statusline_combined,
         claude_md: !f.no_claude_md,
         permissions: !f.no_permissions,
     };
@@ -1035,8 +1053,20 @@ async fn real_main() -> Result<ExitCode> {
             route_hook(&cfg_path);
             return Ok(ExitCode::SUCCESS);
         }
-        Cmd::Statusline => {
-            say!("{}", middleman::statusline::run(&cfg_path));
+        Cmd::Statusline {
+            lines,
+            middleman_only,
+            columns,
+        } => {
+            let mut o = middleman::statusline::Opts::from_env(&|k: &str| std::env::var(k).ok());
+            if let Some(l) = lines {
+                o.lines = l.clamp(1, 2);
+            }
+            if let Some(c) = columns.filter(|c| *c > 0) {
+                o.columns = c;
+            }
+            o.middleman_only = middleman_only;
+            say!("{}", middleman::statusline::run(&cfg_path, &o));
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Completions { shell } => {
@@ -1170,11 +1200,18 @@ async fn real_main() -> Result<ExitCode> {
                     yes,
                     undo,
                     no_statusline,
+                    statusline,
                     no_hook,
                     no_claude_md,
                     no_permissions,
                 },
         } => {
+            let (off, combined) = match statusline.as_str() {
+                "auto" => (false, false),
+                "combined" => (false, true),
+                "off" => (true, false),
+                other => bail!("--statusline must be auto, combined or off (got {other:?})"),
+            };
             setup_claude(
                 &cfg_path,
                 &scope,
@@ -1183,7 +1220,8 @@ async fn real_main() -> Result<ExitCode> {
                     yes,
                     undo,
                     details,
-                    no_statusline,
+                    no_statusline: no_statusline || off,
+                    statusline_combined: combined,
                     no_hook,
                     no_claude_md,
                     no_permissions,
@@ -1467,7 +1505,7 @@ async fn real_main() -> Result<ExitCode> {
         | Cmd::Provider { .. }
         | Cmd::Login { .. }
         | Cmd::Setup { .. }
-        | Cmd::Statusline
+        | Cmd::Statusline { .. }
         | Cmd::Watch { .. }
         | Cmd::Completions { .. }
         | Cmd::Doctor

@@ -37,6 +37,9 @@ pub struct SetupOptions {
     pub config_path: PathBuf,
     pub hook: bool,
     pub statusline: bool,
+    /// Replace a status line that is not middleman's with middleman's full two-line one
+    /// (model, context, cost, cache, then middleman); the old one is restored by `--undo`.
+    pub statusline_combined: bool,
     pub claude_md: bool,
     pub permissions: bool,
 }
@@ -75,7 +78,20 @@ impl SetupOptions {
     }
     pub fn statusline_command(&self) -> String {
         format!(
-            "{} statusline --config {}",
+            "{} statusline {}--config {}",
+            shell_quote(&self.exe_s()),
+            if self.statusline_combined {
+                "--lines 2 "
+            } else {
+                ""
+            },
+            shell_quote(&self.cfg_s())
+        )
+    }
+    /// What to append to another status line script to add middleman's part.
+    pub fn statusline_chain_command(&self) -> String {
+        format!(
+            "{} statusline --middleman-only --config {}",
             shell_quote(&self.exe_s()),
             shell_quote(&self.cfg_s())
         )
@@ -475,14 +491,22 @@ pub fn plan(o: &SetupOptions) -> Result<Plan> {
             .unwrap_or("")
             .to_string();
         match cur {
-            Some(_) if !is_our_statusline(&cur_cmd) => plan.notes.push(format!(
-                "statusLine is already set (`{cur_cmd}`); left alone. To add middleman to it, append the output of `{}` to your script.",
-                o.statusline_command()
-            )),
+            Some(_) if !is_our_statusline(&cur_cmd) && !o.statusline_combined => {
+                plan.notes.push(format!(
+                    "statusLine is already set (`{}`); left alone. Either replace it with middleman's full line (model, effort, context, cost, cache, then middleman's part): `middleman setup claude --statusline combined`; or keep yours and append middleman's part to its output: `{}` (pipe the same stdin JSON into it).",
+                    crate::fsutil::clean(&cur_cmd, 80),
+                    o.statusline_chain_command()
+                ))
+            }
+            Some(_) if !is_our_statusline(&cur_cmd) => st.set(
+                p(&["statusLine"]),
+                new,
+                "replace your status line with middleman's combined one (model, context, cost, cache + middleman; `--undo` restores yours)",
+            )?,
             _ => st.set(
                 p(&["statusLine"]),
                 new,
-                "show middleman's status at the bottom of Claude Code",
+                "show the status line: model, context, cost, cache and middleman's savings",
             )?,
         }
     }
@@ -892,6 +916,7 @@ mod tests {
             config_path: home.join(".config/middleman/config.toml"),
             hook: true,
             statusline: true,
+            statusline_combined: false,
             claude_md: true,
             permissions: true,
         }
@@ -926,7 +951,7 @@ mod tests {
         );
         assert!(text.contains("+ allow the `delegate_task` tool"));
         assert!(text.contains("+ add the prompt hook"));
-        assert!(text.contains("+ show middleman's status"));
+        assert!(text.contains("+ show the status line"));
         assert!(text.contains("CLAUDE.md (new file)"));
         // the normal preview has no raw JSON; --details adds the exact keys
         assert!(
@@ -1031,6 +1056,31 @@ mod tests {
         assert!(ups[0]
             .to_string()
             .contains("/opt/mm/middleman route --hook"));
+        let note = pl.notes.iter().find(|n| n.contains("statusLine")).unwrap();
+        assert!(note.contains("--statusline combined") && note.contains("--middleman-only"));
+    }
+
+    #[test]
+    fn combined_statusline_replaces_a_foreign_one_and_undo_restores_it() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let mine = r#"{"statusLine": {"type": "command", "command": "node ~/.claude/context-line/statusline.mjs"}}"#;
+        std::fs::write(home.join(".claude/settings.json"), mine).unwrap();
+        let mut o = opts(home, Scope::User);
+        o.statusline_combined = true;
+        let pl = plan(&o).unwrap();
+        assert!(pl.render().contains("replace your status line"));
+        apply(&pl, &backups_root(home)).unwrap();
+        let st = read(&home.join(".claude/settings.json"));
+        let cmd = st["statusLine"]["command"].as_str().unwrap();
+        assert!(cmd.contains("statusline --lines 2 --config"), "{cmd}");
+        undo(&backups_root(home)).unwrap();
+        let st = read(&home.join(".claude/settings.json"));
+        assert_eq!(
+            st["statusLine"]["command"],
+            "node ~/.claude/context-line/statusline.mjs"
+        );
     }
 
     #[test]
