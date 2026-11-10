@@ -1,6 +1,6 @@
 [package]
 name = "middleman"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Privacy-preserving delegation layer: sanitizes and pseudonymizes code before sending small tasks to untrusted LLM providers"
 license = "MIT"
