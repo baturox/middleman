@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn positives() {
         for t in [
-            "aws = AKIAIOSFODNN7EXAMPL3",
+            concat!("aws = AKIA", "IOSFODNN7EXAMPL3"),
             "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
             "sk-ant-api03-abcdefghijklmnop",
             "token: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",

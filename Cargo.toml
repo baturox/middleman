@@ -31,6 +31,8 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 sha2 = "0.10"
 hmac = "0.12"
 uuid = { version = "1", features = ["v4"] }
+unicode-normalization = "0.1"
+url = "2"
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -41,3 +43,6 @@ proptest = "1"
 [profile.release]
 strip = true
 lto = "thin"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"
