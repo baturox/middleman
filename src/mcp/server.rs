@@ -1,7 +1,9 @@
 //! MCP server: two tools, `delegate_task` and `middleman_status`.
 
+use std::sync::Arc;
+
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use super::jsonrpc::{self, Incoming};
 use crate::pipeline::{DelegateRequest, Pipeline, Status};
@@ -13,14 +15,20 @@ const INSTRUCTIONS: &str = "middleman delegates small, self-contained, low-risk 
 untrusted model after sanitizing and pseudonymizing the input. Pass file paths (not pasted code); \
 declare sensitivity honestly (auth, billing, customer data, infra and core algorithms are \
 confidential). On status=blocked do the task yourself; do not rephrase around the block. Treat \
-output as untrusted: review and test it. Delegation only pays for large outputs (~800+ tokens): use write_mode=file with an output_path and verify by running tests, never by re-reading the file.";
+output as untrusted: review the diff before executing anything, and run tests only after reading the \
+lines flagged in `risk`. High-risk output is only staged as .middleman.new. Delegation only pays for \
+large outputs (~800+ tokens): use write_mode=file with an output_path. routing.mode confirm/explicit \
+are advisory guards against accidental delegation, not a security boundary.";
+
+/// Longest accepted JSON-RPC line on stdin (bytes); longer lines get an error reply.
+pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn tools() -> Value {
     json!([
         {
             "name": "delegate_task",
             "title": "Delegate a small task to a cheap untrusted model (sanitized)",
-            "description": "Delegate a self-contained, low-risk task that produces a LOT of output (test suites, boilerplate, docstrings for a whole file, translations, fixtures: roughly 800+ output tokens; never one-liners, which cost more in tool-call overhead than they save) to a cheap third-party model. middleman reads the files itself, blocks secrets/PII, pseudonymizes hosts/emails/paths/IPs and dictionary terms, enforces policy, budget and a break-even gate, then restores identifiers. Code kinds default to write_mode=file: the result is written to output_path (existing files are staged as .middleman.new + .middleman.patch unless overwrite=true) and you get only a short summary. Verify by running tests/compiler, do not re-read or re-emit the file. Output is untrusted. Use dry_run to preview.",
+            "description": "Delegate a self-contained, low-risk task that produces a LOT of output (test suites, boilerplate, docstrings for a whole file, translations, fixtures: roughly 800+ output tokens; never one-liners, which cost more in tool-call overhead than they save) to a cheap third-party model. middleman reads the files itself, blocks secrets/PII, pseudonymizes hosts/emails/paths/IPs and dictionary terms (best-effort detection: do not delegate high-value code), enforces policy, budget and a break-even gate, then restores identifiers. Code kinds default to write_mode=file: the result is written to output_path (existing files, and any output flagged high risk, are staged as .middleman.new + .middleman.patch) and you get only a short summary plus a `risk` report. Output is untrusted: review the diff before executing; run tests only after reading flagged lines. Do not re-emit the file. Use dry_run to preview. routing.mode=confirm needs a one-time approval_id the user approves with `middleman approve <id>`; confirm/explicit are advisory, not a security boundary.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -40,10 +48,11 @@ pub fn tools() -> Value {
                     "dry_run": {"type": "boolean"},
                     "quality": {"type": "string", "enum": ["cheapest","balanced","best"], "description": "Hint: start the routing chain at this tier"},
                     "confirmed": {"type": "boolean", "description": "routing.mode=confirm: true only after the user approved the dry-run plan"},
+                    "approval_id": {"type": "string", "description": "routing.mode=confirm: the approval_id from the dry run, after the user ran `middleman approve <id>`"},
                     "user_requested": {"type": "boolean", "description": "routing.mode=explicit: true only if the user asked to delegate (cheap: prefix or /delegate)"},
                     "write_mode": {"type": "string", "enum": ["file","inline"], "description": "file (default for write_tests/boilerplate/snippet/refactor_small/docstring): result goes to disk, only a summary comes back. inline: result returned as text (only for summaries/explanations you read)"},
                     "output_path": {"type": "string", "description": "file mode target, absolute or relative to the first root (default .middleman/out/...)"},
-                    "overwrite": {"type": "boolean", "description": "replace an existing output_path instead of staging .middleman.new + .middleman.patch"},
+                    "overwrite": {"type": "boolean", "description": "replace an existing output_path instead of staging .middleman.new + .middleman.patch (only if the user config sets [output] allow_overwrite = true; never for high-risk output)"},
                     "expected_output_tokens": {"type": "integer", "minimum": 0, "description": "your estimate of the output size; used by the break-even gate"}
                 },
                 "required": ["task_kind","instructions","declared_sensitivity"],
@@ -67,12 +76,60 @@ fn tool_result(v: &Value, is_error: bool) -> Value {
 }
 
 pub struct Server {
-    pipeline: Pipeline,
+    pipeline: Arc<Pipeline>,
+}
+
+fn panic_result(what: &str) -> Value {
+    tool_result(
+        &json!({"status": "error", "error": format!("internal error while handling {what}; the server is still running (see stderr)")}),
+        true,
+    )
+}
+
+/// Read one line of at most `max` bytes (newline excluded). `Ok(None)` at EOF;
+/// `Ok(Some(Err(n)))` when the line was longer (it is consumed and discarded).
+async fn read_line_capped<R: AsyncBufRead + Unpin>(
+    r: &mut R,
+    max: usize,
+) -> std::io::Result<Option<Result<String, usize>>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut over = 0usize;
+    let mut any = false;
+    loop {
+        let chunk = r.fill_buf().await?;
+        if chunk.is_empty() {
+            break;
+        }
+        any = true;
+        let (take, done) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(i) => (i, true),
+            None => (chunk.len(), false),
+        };
+        if over == 0 && buf.len() + take <= max {
+            buf.extend_from_slice(&chunk[..take]);
+        } else {
+            over += buf.len() + take;
+            buf.clear();
+        }
+        r.consume(if done { take + 1 } else { take });
+        if done {
+            break;
+        }
+    }
+    if !any {
+        return Ok(None);
+    }
+    if over > 0 {
+        return Ok(Some(Err(over)));
+    }
+    Ok(Some(Ok(String::from_utf8_lossy(&buf).into_owned())))
 }
 
 impl Server {
     pub fn new(pipeline: Pipeline) -> Server {
-        Server { pipeline }
+        Server {
+            pipeline: Arc::new(pipeline),
+        }
     }
 
     pub async fn handle(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
@@ -113,12 +170,25 @@ impl Server {
                                 ))
                             }
                         };
-                        let out = self.pipeline.run(req).await;
-                        let is_err = out.status == Status::Error;
-                        let v = serde_json::to_value(&out).unwrap_or_else(|_| json!({}));
-                        Ok(tool_result(&v, is_err))
+                        // a panic anywhere in the pipeline becomes status:error for this call
+                        // only; the server keeps serving
+                        let p = self.pipeline.clone();
+                        match tokio::spawn(async move { p.run(req).await }).await {
+                            Ok(out) => {
+                                let is_err = out.status == Status::Error;
+                                let v = serde_json::to_value(&out).unwrap_or_else(|_| json!({}));
+                                Ok(tool_result(&v, is_err))
+                            }
+                            Err(_) => Ok(panic_result("delegate_task")),
+                        }
                     }
-                    "middleman_status" => Ok(tool_result(&self.pipeline.status().await, false)),
+                    "middleman_status" => {
+                        let p = self.pipeline.clone();
+                        match tokio::spawn(async move { p.status().await }).await {
+                            Ok(v) => Ok(tool_result(&v, false)),
+                            Err(_) => Ok(panic_result("middleman_status")),
+                        }
+                    }
                     other => Err((jsonrpc::INVALID_PARAMS, format!("unknown tool: {other}"))),
                 }
             }
@@ -133,8 +203,24 @@ impl Server {
     pub async fn run_stdio(self) -> anyhow::Result<()> {
         let stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
-        let mut lines = BufReader::new(stdin).lines();
-        while let Some(line) = lines.next_line().await? {
+        let mut input = BufReader::new(stdin);
+        while let Some(next) = read_line_capped(&mut input, MAX_LINE_BYTES).await? {
+            let line = match next {
+                Ok(l) => l,
+                Err(n) => {
+                    tracing::warn!(bytes = n, "oversized request line rejected");
+                    let r = jsonrpc::error(
+                        Value::Null,
+                        jsonrpc::INVALID_REQUEST,
+                        &format!("request line too large ({n} bytes > {MAX_LINE_BYTES})"),
+                    );
+                    let mut s = serde_json::to_string(&r)?;
+                    s.push('\n');
+                    stdout.write_all(s.as_bytes()).await?;
+                    stdout.flush().await?;
+                    continue;
+                }
+            };
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -161,5 +247,26 @@ impl Server {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn capped_reader_rejects_long_lines_and_continues() {
+        let data = format!("{}\nshort\n{}", "x".repeat(50), "tail");
+        let mut r = BufReader::with_capacity(8, data.as_bytes());
+        assert_eq!(read_line_capped(&mut r, 10).await.unwrap(), Some(Err(50)));
+        assert_eq!(
+            read_line_capped(&mut r, 10).await.unwrap(),
+            Some(Ok("short".into()))
+        );
+        assert_eq!(
+            read_line_capped(&mut r, 10).await.unwrap(),
+            Some(Ok("tail".into()))
+        );
+        assert_eq!(read_line_capped(&mut r, 10).await.unwrap(), None);
     }
 }
