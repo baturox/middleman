@@ -2,7 +2,11 @@
 # middleman installer: downloads the latest (or $MIDDLEMAN_VERSION) release binary for this
 # machine, verifies its SHA-256 (fail-closed), optionally verifies the GitHub build-provenance
 # attestation when `gh` is installed, and installs it to $MIDDLEMAN_INSTALL_DIR
-# (default ~/.local/bin).
+# (default ~/.local/bin). Over an existing install it upgrades: the old binary is kept as
+# middleman.prev (`middleman upgrade --rollback` restores it) and, when Claude Code is wired
+# to middleman, `middleman setup claude --refresh --yes` updates that wiring
+# (MIDDLEMAN_NO_WIRING=1 skips it). Installed copies can also upgrade themselves:
+# `middleman upgrade`.
 #
 #   curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/baturox/middleman/main/install.sh | sh
 #   MIDDLEMAN_VERSION=v0.1.0 MIDDLEMAN_INSTALL_DIR=/usr/local/bin sh install.sh
@@ -52,6 +56,19 @@ main() {
     *[!A-Za-z0-9._-]*) echo "refusing odd release tag: $tag" >&2; exit 1 ;;
   esac
 
+  existing=""
+  if [ -x "$DIR/middleman" ]; then
+    existing=$("$DIR/middleman" --version 2>/dev/null | awk 'NR==1 {print $2}') || existing=""
+    case "$existing" in
+      "" | *[!A-Za-z0-9.+-]*) existing="unknown" ;;
+    esac
+    if [ "v$existing" = "$tag" ] && [ "${MIDDLEMAN_FORCE:-0}" != 1 ]; then
+      echo "middleman $tag is already installed at $DIR/middleman (MIDDLEMAN_FORCE=1 reinstalls)"
+      return 0
+    fi
+    echo "-> upgrading v$existing → $tag ($DIR/middleman)"
+  fi
+
   name="middleman-$tag-$target"
   url="https://github.com/$REPO/releases/download/$tag/$name.tar.gz"
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
@@ -87,8 +104,18 @@ main() {
   fi
 
   tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
+  got=$("$tmp/$name/middleman" --version 2>/dev/null | awk 'NR==1 {print $2}') || got=""
+  if [ "v$got" != "$tag" ]; then
+    echo "the downloaded binary does not report $tag; refusing to install" >&2
+    exit 1
+  fi
   mkdir -p "$DIR"
-  install -m 0755 "$tmp/$name/middleman" "$DIR/middleman"
+  if [ -n "$existing" ]; then
+    cp -p "$DIR/middleman" "$DIR/middleman.prev"
+  fi
+  # write next to the target, then rename: the old binary is never half replaced
+  install -m 0755 "$tmp/$name/middleman" "$DIR/.middleman.new.$$"
+  mv -f "$DIR/.middleman.new.$$" "$DIR/middleman"
   if [ "$os" = apple-darwin ]; then
     xattr -d com.apple.quarantine "$DIR/middleman" 2>/dev/null || true
     echo "   note: the macOS binary is not code-signed or notarized; the quarantine flag was"
@@ -97,7 +124,22 @@ main() {
 
   echo "installed middleman $tag to $DIR/middleman"
   case ":$PATH:" in *":$DIR:"*) ;; *) echo "  add to PATH:  export PATH=\"$DIR:\$PATH\"" ;; esac
-  echo "  next:  middleman init && middleman doctor"
+  if [ -z "$existing" ]; then
+    echo "  next:  middleman init && middleman doctor"
+    return 0
+  fi
+  echo "  the previous binary is kept as $DIR/middleman.prev (middleman upgrade --rollback restores it)"
+  if [ "${MIDDLEMAN_NO_WIRING:-0}" != 1 ] &&
+    grep -qsE 'route --hook|statusline|"middleman"' "$HOME/.claude/settings.json" "$HOME/.claude.json" .mcp.json .claude/settings.json; then
+    echo "-> refreshing the Claude Code wiring (middleman setup claude --refresh --yes)"
+    "$DIR/middleman" setup claude --refresh --yes ||
+      echo "   warning: the refresh did not finish; run: middleman setup claude --refresh" >&2
+  fi
+  echo "  left for you: run /mcp in Claude Code to reconnect (the running MCP server is the old binary)."
+  if [ "$os" = apple-darwin ]; then
+    echo "  macOS may ask once to let the new binary use the Keychain: choose Always Allow"
+    echo "  (the binary changed, so the Keychain asks again before handing over a stored key)."
+  fi
 }
 
 main "$@"
