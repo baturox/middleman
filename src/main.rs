@@ -44,6 +44,7 @@ macro_rules! note {
 }
 
 mod cli_init;
+mod cli_upgrade;
 
 #[derive(Parser)]
 #[command(
@@ -247,6 +248,34 @@ enum Cmd {
     Completions { shell: clap_complete::Shell },
     /// Run the MCP stdio server (Claude Code starts this for you)
     Mcp,
+    /// Upgrade to the latest release (checksum-verified), then refresh the Claude Code wiring
+    Upgrade {
+        /// Only check: print this version and the latest; exit code 10 when an update exists
+        #[arg(long, conflicts_with = "rollback")]
+        check: bool,
+        /// Install this release instead of the latest, e.g. v0.3.1
+        #[arg(long, value_name = "vX.Y.Z", conflicts_with = "rollback")]
+        version: Option<String>,
+        /// Do not ask for confirmation
+        #[arg(long)]
+        yes: bool,
+        /// Do not run `setup claude --refresh` with the new binary afterwards
+        #[arg(long)]
+        no_wiring: bool,
+        /// Put the previous binary (middleman.prev) back
+        #[arg(long)]
+        rollback: bool,
+        /// Refuse to install unless `gh attestation verify` succeeds
+        /// [env: MIDDLEMAN_REQUIRE_ATTESTATION=1]
+        #[arg(long)]
+        require_attestation: bool,
+        /// With --check: print nothing (the exit code tells)
+        #[arg(long)]
+        quiet: bool,
+        /// With --check: record the result for the status line and doctor
+        #[arg(long, hide = true)]
+        write_cache: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -340,6 +369,10 @@ enum SetupTarget {
         /// Restore the files changed by the last `setup claude`
         #[arg(long)]
         undo: bool,
+        /// Only update what middleman already wrote (binary path, hook command and timeout,
+        /// status line command, CLAUDE.md block), in user and project scope; adds nothing
+        #[arg(long, conflicts_with = "undo")]
+        refresh: bool,
         #[arg(long)]
         no_statusline: bool,
         /// auto (set it unless you have another status line) | combined (replace another
@@ -1166,6 +1199,7 @@ struct SetupFlags {
     dry_run: bool,
     yes: bool,
     undo: bool,
+    refresh: bool,
     details: bool,
     no_statusline: bool,
     statusline_combined: bool,
@@ -1193,6 +1227,9 @@ fn setup_claude(cfg_path: &Path, scope: &str, f: SetupFlags) -> Result<()> {
         }
         say!("  Restart Claude Code to pick up the change.");
         return Ok(());
+    }
+    if f.refresh {
+        return setup_refresh(cfg_path, &home, f);
     }
     let scope = Scope::parse(scope).context("--scope must be user or project")?;
     let config_path = std::path::absolute(cfg_path).unwrap_or_else(|_| cfg_path.to_path_buf());
@@ -1247,6 +1284,56 @@ fn setup_claude(cfg_path: &Path, scope: &str, f: SetupFlags) -> Result<()> {
     say!(
         "\n  {}",
         ui.ok("Done. Restart Claude Code (or run /mcp) to load middleman.")
+    );
+    Ok(())
+}
+
+/// `setup claude --refresh`: bring middleman's existing entries up to this version.
+fn setup_refresh(cfg_path: &Path, home: &Path, f: SetupFlags) -> Result<()> {
+    let ui = middleman::ui::Ui::stdout();
+    let o = claude_setup::RefreshOptions {
+        home: home.to_path_buf(),
+        project_dirs: claude_setup::installed_project_dirs(home, &cwd()),
+        exe: std::env::current_exe().context("cannot find the middleman binary")?,
+        config_path: std::path::absolute(cfg_path).unwrap_or_else(|_| cfg_path.to_path_buf()),
+    };
+    let plan = claude_setup::refresh_plan(&o);
+    if plan.is_empty() {
+        say!(
+            "  {}",
+            ui.ok("middleman's Claude Code wiring is current; nothing to refresh.")
+        );
+        for n in &plan.notes {
+            say!("  {}", ui.warn(n));
+        }
+        return Ok(());
+    }
+    say!("{}", plan.render_ui(&ui, f.details).trim_end());
+    if f.dry_run {
+        say!("\n  {}", ui.dim("(dry run: nothing was changed)"));
+        return Ok(());
+    }
+    if !f.yes {
+        if !interactive() {
+            bail!("re-run with --yes to apply without a prompt (or --dry-run to only look)");
+        }
+        say!("");
+        let ok = dialoguer::Confirm::with_theme(&theme())
+            .with_prompt("Refresh these entries?")
+            .default(true)
+            .interact()?;
+        if !ok {
+            say!("  Nothing changed.");
+            return Ok(());
+        }
+    }
+    say!("");
+    for l in claude_setup::apply(&plan, &claude_setup::backups_root(home))? {
+        say!("{}", styled_log_line(&ui, &l));
+    }
+    say!(
+        "\n  {}",
+        ui.ok("Refreshed. Run /mcp in Claude Code (or restart it) to reconnect middleman.")
     );
     Ok(())
 }
@@ -1408,6 +1495,7 @@ async fn real_main() -> Result<ExitCode> {
                     details,
                     yes,
                     undo,
+                    refresh,
                     no_statusline,
                     statusline,
                     no_hook,
@@ -1428,6 +1516,7 @@ async fn real_main() -> Result<ExitCode> {
                     dry_run,
                     yes,
                     undo,
+                    refresh,
                     details,
                     no_statusline: no_statusline || off,
                     statusline_combined: combined,
@@ -1517,7 +1606,42 @@ async fn real_main() -> Result<ExitCode> {
             dict_suggest(&cfg_path, root, yes, min, json)?;
             return Ok(ExitCode::SUCCESS);
         }
+        Cmd::Upgrade {
+            check,
+            version,
+            yes,
+            no_wiring,
+            rollback,
+            require_attestation,
+            quiet,
+            write_cache,
+        } => {
+            let a = cli_upgrade::UpgradeArgs {
+                check,
+                version,
+                yes,
+                no_wiring,
+                rollback,
+                require_attestation,
+                quiet,
+                write_cache,
+            };
+            return cli_upgrade::run(&cfg_path, a).await;
+        }
         Cmd::Doctor => {
+            if let Ok(cfg) = Config::load(&cfg_path) {
+                let env = |k: &str| std::env::var(k).ok();
+                if middleman::upgrade::checks_enabled(cfg.update.check, &env) {
+                    let state = cfg.state_dir();
+                    let c = middleman::upgrade::load_cache(&state);
+                    middleman::upgrade::maybe_check(
+                        &state,
+                        c.as_ref(),
+                        middleman::ledger::now_unix(),
+                        &mut || middleman::upgrade::spawn_check(&cfg_path),
+                    );
+                }
+            }
             let checks = setup::doctor(&cfg_path, &cwd(), &home()).await;
             let mut ok = true;
             for c in &checks {
@@ -1732,6 +1856,7 @@ async fn real_main() -> Result<ExitCode> {
         | Cmd::Watch { .. }
         | Cmd::Completions { .. }
         | Cmd::Doctor
+        | Cmd::Upgrade { .. }
         | Cmd::Dict { .. }
         | Cmd::Usage { .. }
         | Cmd::Tune { .. } => unreachable!(),
