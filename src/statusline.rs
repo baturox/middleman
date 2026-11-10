@@ -659,6 +659,8 @@ pub struct MmData {
     pub today: Agg,
     pub all: Agg,
     pub agents: Option<u64>,
+    /// A newer release found by the daily check (`v0.3.1`).
+    pub update: Option<String>,
 }
 
 /// Balance warning colour.
@@ -729,6 +731,11 @@ fn mm_part(d: &MmData, level: u8, show_tokens: bool) -> T {
     if level <= 1 {
         head.s(" ").s(&who);
     }
+    let update = d
+        .update
+        .as_ref()
+        .filter(|_| level <= 2)
+        .map(|v| T::paint(&format!("↑ {v}"), C::Yellow));
     if let Some((left, age)) = d.left {
         if level <= 2 {
             let col = match d.low_balance {
@@ -756,6 +763,7 @@ fn mm_part(d: &MmData, level: u8, show_tokens: bool) -> T {
         }
     }
     let mut parts = vec![head];
+    parts.extend(update);
     match level {
         0 => {
             match &d.session {
@@ -834,12 +842,14 @@ fn mm_part(d: &MmData, level: u8, show_tokens: bool) -> T {
     T::join(parts, &dot)
 }
 
-/// Gather the middleman data (local files only). `spawn` starts a detached limits refresh.
+/// Gather the middleman data (local files only). `spawn` starts a detached limits refresh,
+/// `spawn_update` the daily update check.
 fn mm_data(
     v: &Value,
     cfg_path: &Path,
     now: i64,
     spawn: &mut dyn FnMut() -> std::io::Result<()>,
+    spawn_update: &mut dyn FnMut() -> std::io::Result<()>,
 ) -> MmData {
     let session = v
         .get("session_id")
@@ -866,6 +876,17 @@ fn mm_data(
     };
     let state = cfg.state_dir();
     let mut d = MmData::default();
+    let refresh_off = std::env::var_os("MIDDLEMAN_SL_NO_REFRESH").is_some_and(|v| v == "1");
+
+    // a newer release, from the daily check's cache (the check itself runs detached)
+    if crate::upgrade::checks_enabled(cfg.update.check, &|k| std::env::var(k).ok()) {
+        let uc = crate::upgrade::load_cache(&state);
+        d.update = crate::upgrade::newer_cached(uc.as_ref(), &crate::upgrade::Version::current())
+            .map(|v| v.tag());
+        if !refresh_off {
+            crate::upgrade::maybe_check(&state, uc.as_ref(), now, spawn_update);
+        }
+    }
 
     // live session facts for the MCP server's savings maths
     if let Some(sid) = &session {
@@ -920,7 +941,6 @@ fn mm_data(
         return d;
     };
     let cache = limits::load(&state);
-    let refresh_off = std::env::var_os("MIDDLEMAN_SL_NO_REFRESH").is_some_and(|v| v == "1");
     if !refresh_off && ready.iter().any(|p| p.balance != BalanceKind::None) {
         limits::maybe_refresh(&state, cache.as_ref(), now, spawn);
     }
@@ -971,7 +991,8 @@ fn fit(variants: Vec<T>, columns: usize) -> T {
         .unwrap_or_default()
 }
 
-/// The status line for this stdin payload, with an injectable refresh spawner.
+/// The status line for this stdin payload, with an injectable refresh spawner (the update
+/// check does not start).
 pub fn render_with(
     input: &str,
     cfg_path: &Path,
@@ -979,8 +1000,24 @@ pub fn render_with(
     o: &Opts,
     spawn: &mut dyn FnMut() -> std::io::Result<()>,
 ) -> String {
+    render_jobs(input, cfg_path, now, o, spawn, &mut no_update_check)
+}
+
+fn no_update_check() -> std::io::Result<()> {
+    Err(std::io::Error::other("update check not started here"))
+}
+
+/// The status line, with injectable spawners for the limits refresh and the update check.
+pub fn render_jobs(
+    input: &str,
+    cfg_path: &Path,
+    now: i64,
+    o: &Opts,
+    spawn: &mut dyn FnMut() -> std::io::Result<()>,
+    spawn_update: &mut dyn FnMut() -> std::io::Result<()>,
+) -> String {
     let v: Value = serde_json::from_str(input).unwrap_or(Value::Null);
-    let d = mm_data(&v, cfg_path, now, spawn);
+    let d = mm_data(&v, cfg_path, now, spawn, spawn_update);
     let nowf = now as f64;
     let mm = |l: u8| mm_part(&d, l, o.show_tokens);
     if o.middleman_only {
@@ -1012,8 +1049,18 @@ pub fn run(cfg_path: &Path, o: &Opts) -> String {
     let mut input = String::new();
     let _ = std::io::stdin().take(1 << 20).read_to_string(&mut input);
     let now = crate::ledger::now_unix();
-    std::panic::catch_unwind(|| render(&input, cfg_path, now, o))
-        .unwrap_or_else(|_| "🛡 middleman ✗ internal error (run: middleman doctor)".into())
+    let p = cfg_path.to_path_buf();
+    std::panic::catch_unwind(|| {
+        render_jobs(
+            &input,
+            cfg_path,
+            now,
+            o,
+            &mut || limits::spawn_refresh(&p),
+            &mut || crate::upgrade::spawn_check(&p),
+        )
+    })
+    .unwrap_or_else(|_| "🛡 middleman ✗ internal error (run: middleman doctor)".into())
 }
 
 #[cfg(test)]

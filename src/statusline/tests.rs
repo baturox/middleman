@@ -635,3 +635,74 @@ fn fifty_mb_transcript_is_fast_after_the_first_run() {
         "second run took {best:?} (first {first:?})"
     );
 }
+
+#[test]
+fn newer_release_marker_and_daily_check() {
+    let e = env();
+    let now = 1_767_225_600 + 3600;
+    limits_at(&e, now - 30, 7.42);
+    let o = Opts {
+        middleman_only: true,
+        ..opts(200, 1)
+    };
+    let checks = Cell::new(0);
+    let mut no_limits = || Ok(());
+    let mut check = || {
+        checks.set(checks.get() + 1);
+        Ok(())
+    };
+    // no cache yet: no marker, one background check (the lock stops a second one)
+    let out = render_jobs("{}", &e.cfg, now, &o, &mut no_limits, &mut check);
+    assert!(!out.contains('↑'), "{out}");
+    render_jobs("{}", &e.cfg, now, &o, &mut no_limits, &mut check);
+    assert_eq!(checks.get(), 1);
+    // the check found a newer release
+    crate::upgrade::save_cache(
+        &e.state(),
+        &crate::upgrade::UpdateCache {
+            checked_at: now,
+            latest_version: Some("v99.0.0".into()),
+            error: None,
+        },
+    )
+    .unwrap();
+    crate::upgrade::release_lock(&e.state());
+    let out = render_jobs("{}", &e.cfg, now, &o, &mut no_limits, &mut check);
+    assert_eq!(checks.get(), 1, "checked today: no second check");
+    assert_eq!(
+        out,
+        "🛡 middleman ✓ openrouter $7.42 left · ↑ v99.0.0 · 0 jobs today · saved $0.00 today · $0.00 total"
+    );
+    let c = render_no_spawn("{}", &e, now, &Opts { color: true, ..o });
+    assert!(c.contains("\x1b[33m↑ v99.0.0\x1b[0m"), "{c:?}");
+    // the narrowest variant drops it
+    let tiny = render_no_spawn("{}", &e, now, &opts(40, 1));
+    assert!(!tiny.contains('↑'), "{tiny}");
+    // an older or equal cached version shows nothing
+    crate::upgrade::save_cache(
+        &e.state(),
+        &crate::upgrade::UpdateCache {
+            checked_at: now,
+            latest_version: Some("v0.0.1".into()),
+            error: None,
+        },
+    )
+    .unwrap();
+    assert!(!render_no_spawn("{}", &e, now, &o).contains('↑'));
+    // `[update] check = false`: no marker and no check
+    crate::upgrade::save_cache(
+        &e.state(),
+        &crate::upgrade::UpdateCache {
+            checked_at: 0,
+            latest_version: Some("v99.0.0".into()),
+            error: None,
+        },
+    )
+    .unwrap();
+    let mut text = std::fs::read_to_string(&e.cfg).unwrap();
+    text.push_str("\n[update]\ncheck = false\n");
+    std::fs::write(&e.cfg, text).unwrap();
+    let out = render_jobs("{}", &e.cfg, now, &o, &mut no_limits, &mut check);
+    assert!(!out.contains('↑'), "{out}");
+    assert_eq!(checks.get(), 1);
+}

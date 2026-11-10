@@ -251,6 +251,7 @@ pub async fn doctor(config_path: &Path, cwd: &Path, home: &Path) -> Vec<Check> {
                 format!("{e:#} (run `middleman init` to create one)"),
             ));
             out.extend(crate::claude_setup::wiring_checks(home, cwd));
+            out.push(wiring_version_check(config_path, cwd, home));
             return out;
         }
     };
@@ -413,8 +414,31 @@ pub async fn doctor(config_path: &Path, cwd: &Path, home: &Path) -> Vec<Check> {
         )),
         Err(e) => out.push(check("binary", false, e.to_string())),
     }
+    out.push(crate::upgrade::doctor_check(
+        &cfg.state_dir(),
+        crate::upgrade::checks_enabled(cfg.update.check, &|k| std::env::var(k).ok()),
+        crate::ledger::now_unix(),
+    ));
     out.extend(crate::claude_setup::wiring_checks(home, cwd));
+    out.push(wiring_version_check(config_path, cwd, home));
     out
+}
+
+/// Is the Claude Code wiring what this version would write (binary path, hook timeout, ...)?
+fn wiring_version_check(config_path: &Path, cwd: &Path, home: &Path) -> Check {
+    let Ok(exe) = std::env::current_exe() else {
+        return Check::optional(
+            "Claude Code: wiring up to date",
+            false,
+            "cannot find the binary",
+        );
+    };
+    crate::claude_setup::outdated_check(&crate::claude_setup::RefreshOptions {
+        home: home.to_path_buf(),
+        project_dirs: crate::claude_setup::installed_project_dirs(home, cwd),
+        exe,
+        config_path: std::path::absolute(config_path).unwrap_or_else(|_| config_path.to_path_buf()),
+    })
 }
 
 #[cfg(test)]
