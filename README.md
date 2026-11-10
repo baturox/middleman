@@ -166,7 +166,7 @@ Run `middleman init`. It asks four things with arrow-key menus and checks your k
 ✔ Connect to Claude Code now? (runs `middleman setup claude`, shows the changes first) · yes
 ```
 
-Restart Claude Code and the statusline shows `🛡 middleman ✓ openrouter`.
+Restart Claude Code and the status line shows your model and context, then `🛡 ✓ openrouter`.
 
 - **Routing modes:** *confirm* (the default) shows you what would be sent and waits for
   `middleman approve <id>` in your terminal; *auto* lets Claude delegate safe, big-enough jobs
@@ -205,9 +205,9 @@ keychain is available (e.g. a headless Linux box), the key goes to a private fil
 
 ## How do I know it's working?
 
-- **Statusline**, at the bottom of Claude Code:
-  `🛡 middleman ✓ openrouter · 3 delegated today (1 this session) · saved $0.21 · 1 blocked`.
-  It shows `✗` and the reason when the config is broken or no key is found.
+- **Status line**, at the bottom of Claude Code (see [The status line](#the-status-line)):
+  `Opus 5.5 high │ ██░░░░░░░░ 18% 180k/1M │ ~$1.27 │ cache 47m left (1h) │ 🛡 ✓ $7.42 · 2 jobs · saved $0.21 today`.
+  It shows `✗` and the reason when the config is broken, no key is found or the key is rejected.
 - **Hook message**: when you send a prompt, a short line tells you what middleman told Claude,
   e.g. `🛡 middleman: suggested delegating this write_tests task (~3000 output tokens) to a cheap model`
   or `🛡 middleman: keep on Claude (sensitive: billing)`.
@@ -219,6 +219,111 @@ keychain is available (e.g. a headless Linux box), the key goes to a private fil
 
 Each log line records the Claude Code session id when it's known. The MCP server gets the id
 Claude Code started it with, so after `/clear` its calls still carry the earlier id.
+
+## The status line
+
+`middleman setup claude` sets Claude Code's `statusLine` to `middleman statusline`. By default it
+prints one line, shortened to fit the terminal (`COLUMNS`); `--lines 2` (or
+`MIDDLEMAN_SL_LINES=2`) puts middleman's part on a second line:
+
+```
+Opus 5.5 high │ ██░░░░░░░░ 18% 180k/1M │ ~$1.27 │ cache 47m left (1h)
+🛡 middleman ✓ openrouter $7.42 left · 2 jobs this session (1 blocked, 1 escalated) · 3 today · 2 agents · saved $0.06 session · $0.21 today · $1.84 total
+```
+
+The same data at 120 and 60 columns, on one line:
+
+```
+Opus 5.5 high │ ██░░░░░░░░ 18% 180k/1M │ ~$1.27 │ cache 47m left (1h) │ 🛡 ✓ $7.42 · 2 jobs · saved $0.21 today
+Opus 5.5 high │ 18% │ ~$1.27 │ 🛡 ✓ saved $0.21
+```
+
+| Part | Meaning |
+|---|---|
+| `Opus 5.5 high` (`fast`) | Session model, effort level, fast mode |
+| `██░░░░░░░░ 18% 180k/1M` | Context used: share of the window, tokens, window size. Yellow at 40% or 150k, red at 70% or 300k (then `/compact or /clear` appears) |
+| `~$1.27` | Claude Code's estimate of this session's cost (yellow at $5, red at $10) |
+| `cache 47m left (1h)` | Prompt cache: time until it goes cold, and its lifetime; `cache cold: next message re-caches 180k` when expired |
+| `5h 72%` | Claude's 5-hour rate limit, when Claude Code reports it |
+| `🛡 ✓ openrouter` / `✗ <reason>` | middleman can delegate (provider and key OK), or why not |
+| `$7.42 left` | What the provider still lets you spend: the lower of the account balance and the key's limit. `(25m ago)` when the cached value is older than 10 minutes |
+| `2 jobs this session (1 blocked, 1 escalated)` · `3 today` | Delegation requests from this session and today; blocked includes "do it yourself" |
+| `2 agents` | Claude Code subagents this session started (Agent/Task tool uses in its transcript) |
+| `saved $0.06 session · $0.21 today · $1.84 total` | **Net** saving (see below); negative values are shown as they are, in red |
+
+Colour thresholds use the same environment variables as context-line:
+`MIDDLEMAN_SL_WARN_PCT` (or `CONTEXT_LINE_WARN_PCT`, default
+40), `_DANGER_PCT` (70), `_WARN_TOKENS` (150000), `_DANGER_TOKENS` (300000), `_COST_WARN` (5).
+`NO_COLOR` turns colours off; `MIDDLEMAN_SL_TOKENS=1` adds Claude output tokens avoided today;
+`MIDDLEMAN_SL_NO_REFRESH=1` stops the background limit refresh.
+
+**Already have a status line** (for example context-line)? `setup claude` leaves it alone and says
+how to combine them. Either let middleman print the whole thing (it includes context-line's
+fields): `middleman setup claude --statusline combined` (two lines; `--undo` brings yours
+back). Or keep yours and append middleman's part from your script with the same stdin:
+
+```sh
+input=$(cat)
+printf '%s\n' "$input" | node ~/.claude/context-line/statusline.mjs
+printf '%s\n' "$input" | middleman statusline --middleman-only
+```
+
+**How it stays fast and private.** The status line never touches the network and finishes in a
+few milliseconds. Provider limits come from a cache (`~/.local/state/middleman/provider-limits.json`,
+0600) written by `middleman provider refresh`, by the MCP server after each delegation, and, when
+the cache is older than 10 minutes, by one background `provider refresh --quiet` the status line
+starts (a lock file allows one at a time). Subagents are counted by reading only the bytes added to
+the transcript since the last run (the offset and counts are cached per session); nothing from
+the transcript is stored or printed. Ledger totals are kept the same way. Every printed field is
+stripped of control, escape and bidi characters.
+
+The status line also passes the session's **live context size, model and cache lifetime** to the
+MCP server (`~/.local/state/middleman/sessions/<id>.json`, 0600), so the savings maths uses the
+real numbers instead of assumptions.
+
+## How savings are calculated
+
+"Saved" is always the **net** saving, per request:
+
+```
+net = claude_equiv - overhead - cheap_cost
+
+claude_equiv = N_claude x P_out
+overhead     = call_tokens x P_out              Claude writes the tool call
+             + context_tokens x P_cache_read    the extra turn re-reads the session context
+             + result_tokens x P_cache_write    the tool result enters the cached context
+cheap_cost   = what the provider billed, summed over every attempt (escalations included)
+```
+
+| Term | Source | Measured or estimated |
+|---|---|---|
+| `N_claude` | Characters of the restored output (the file content in file mode) ÷ Claude's tokenizer ratio: 3.5 chars/token for code, 4.2 for prose (`chars_per_token_code` / `_prose`) | Estimated from measured text. The cheap model's token count is not used: other tokenizer, and it includes reasoning tokens |
+| `call_tokens` | Characters of the tool-call arguments Claude sent ÷ 3.5, + 30 for the tool_use framing | Estimated from measured text |
+| `context_tokens` | The session's live context from the status line (input + cache read + cache write of the latest request); `assumed_context_tokens` (60k) when unknown or older than 30 minutes | Measured by Claude Code, or assumed (`context_source` says which) |
+| `result_tokens` | Characters of the tool result Claude reads (summary line + JSON) ÷ 3.5 | Estimated from measured text |
+| Prices | The session's model (opus / sonnet / haiku / fable, from the status line's `model.id`), else `[economics] claude_model`. Cache write = input × 1.25 (5-minute cache) or × 2 (1-hour cache) | Price table (`price_basis` says which) |
+| `cheap_cost` | 1. `provider`: the billed cost in the response (OpenRouter `usage.cost`); 2. `balance`: balance before − after, only when no other middleman call was in flight; 3. `usage`: reported tokens × catalog price; 4. `estimate`: the worst case when a failed call may have been billed | Measured (1, 2) or estimated (3, 4); `cost_source` says which |
+
+The tool result is priced at the **cache-write** price, not the plain input price: Claude Code
+caches the conversation, so new content is written to the cache on the next request.
+
+- **Blocked, do-it-yourself and dry-run calls** cost no cheap money, but Claude still paid for
+  the tool call, the extra turn and the result: their overhead is logged, so they lower "saved".
+  (Dry runs are only logged when Claude made them through the MCP tool.)
+- **Each request has exactly one closing line** carrying the overhead; escalation attempts carry
+  only their own cost. Every line satisfies `net = claude_equiv - overhead - cost` (enforced on
+  write and read), so per-line, per-request, per-day, per-session and all-time sums agree;
+  `report`, `middleman_status` and the status line all use the same aggregation.
+- **What is not counted** (so "saved" is, if anything, low): had Claude written the file itself, it
+  would also have paid a Write tool call and turn, and its own output would be re-read on every
+  later turn; the tool result is likewise re-read on later turns.
+- `middleman report --reconcile` compares the ledger's cost with the provider's own counters
+  (OpenRouter `/key` usage for today and since the last snapshot; balance drops for `/balance`
+  gateways) and prints any discrepancy.
+
+With a large context the extra turn dominates: at 380k tokens of Opus context it alone costs
+$0.076, so a delegation pays only above roughly 4,000 output tokens. The break-even gate uses the
+live context too.
 
 ## Saving money: what actually matters
 
@@ -289,10 +394,12 @@ that exact request, for 30 minutes.
 | `middleman usage` | Your Claude Code spend from local logs (totals only, never message text) |
 | `middleman tune` | Recommended settings, with estimated savings |
 | `middleman init` | Guided setup: scope, provider and key (checked live), routing mode (`--list`, `--yes`) |
-| `middleman setup claude` | Connect to Claude Code (`--dry-run`, `--details`, `--undo`, `--scope project`) |
+| `middleman setup claude` | Connect to Claude Code (`--dry-run`, `--details`, `--undo`, `--scope project`, `--statusline combined`) |
 | `middleman provider add/list/test/rotate/remove` | Manage provider keys in the OS keychain |
+| `middleman provider refresh` | Fetch balances and key limits (free requests) for the status line |
+| `middleman statusline` | The Claude Code status line (`--lines 2`, `--middleman-only`, `--columns`) |
 | `middleman watch` | Live view of delegations in another terminal |
-| `middleman report` | What was delegated, to which model, and the net saving (`--html` for a dashboard) |
+| `middleman report` | What was delegated, to which model, and the net saving (`--html` for a dashboard, `--reconcile` to check the cost against the provider's counters) |
 | `middleman check <files>` | Dry run: shows exactly what *would* be sent, without sending it |
 | `middleman route "<prompt>"` | Shows whether a prompt would be delegated, and why |
 | `middleman doctor` | Health check: config, keys, keychain, providers, Claude Code wiring |
@@ -324,11 +431,18 @@ Every attempt, including blocked ones, is one JSON line in `~/.local/state/middl
 
 ```json
 {"task_kind":"write_tests","provider":"openrouter","model":"deepseek/deepseek-v4.1-flash",
- "effective_sensitivity":"S1","status":"ok","redactions":{"dictionary":5,"email":1},
- "input_tokens":1240,"output_tokens":2050,"cost_usd":0.0028,"latency_ms":6100,
- "write_mode":"file","claude_model":"opus-5.5","claude_equiv_usd":0.041,
- "claude_overhead_usd":0.0166,"net_savings_usd":0.0216,"validation":"passed"}
+ "effective_sensitivity":"S1","status":"ok","closing":true,"redactions":{"dictionary":5,"email":1},
+ "input_tokens":1240,"output_tokens":2050,"cost_usd":0.0028,"cost_source":"provider",
+ "catalog_cost_usd":0.0029,"latency_ms":6100,"write_mode":"file","claude_model":"opus-5.5",
+ "price_basis":"session","claude_output_tokens":2400,"call_tokens":150,"context_tokens":92000,
+ "context_source":"session","result_tokens":610,"claude_equiv_usd":0.048,
+ "claude_overhead_usd":0.0244,"net_savings_usd":0.0208,"validation":"passed"}
 ```
+
+Escalation steps are separate lines (`status` `escalated` or `failed`, `closing: false`) sharing the
+`request_id`; the closing line holds the outcome (`ok`, `blocked`, `do_it_yourself`, `error`,
+`dry_run`) and the Claude-side terms. Lines written by older versions are read as before; their
+savings figures are kept as they were recorded.
 
 A separate audit log (`audit-YYYY-MM.jsonl`, same directory, 0600) keeps the cleaned text exactly as
 it was sent, plus provider error bodies (with your key removed), so you can audit what left your
