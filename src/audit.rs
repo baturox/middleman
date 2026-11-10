@@ -1,5 +1,7 @@
 //! Audit log: `audit-YYYY-MM.jsonl` (0600). Records the sanitized payload exactly as sent,
 //! the SHA-256 of the original payload, finding counts, decision and cost. Never originals.
+//! Note: it retains the *sanitized* payload (pseudonymized text) and scrubbed provider error
+//! bodies; protect the state dir accordingly (0700 dir, 0600 files).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,6 +34,9 @@ pub struct AuditRecord {
     pub cost_usd: f64,
     pub cost_source: Option<String>,
     pub warnings: Vec<String>,
+    /// Scrubbed, truncated provider error bodies (never shown to Claude).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub provider_errors: Vec<String>,
 }
 
 pub fn sha256_hex(s: &str) -> String {

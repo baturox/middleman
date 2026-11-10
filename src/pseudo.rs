@@ -26,9 +26,16 @@ const SYLLABLES: [&str; 16] = [
 ];
 
 static SURROGATE_SHAPE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"user\d+@example\.com|svc\d+\.example\.net|198\.51\.100\.\d+|203\.0\.113\.\d+|2001:db8::[0-9a-f]+|MM_(?:SECRET|PHONE|IBAN|TCKN|CARD)_\d+|/workspace/app\d*|/home/user\d+")
+    Regex::new(r"user[0-9]+@example\.com|svc[0-9]+\.example\.net|198\.51\.100\.[0-9]+|203\.0\.113\.[0-9]+|198\.1[89]\.[0-9]+\.[0-9]+|2001:db8::[0-9a-f]+|MM_(?:SECRET|PHONE|IBAN|TCKN|CARD|IPV4)_[0-9]+|/workspace/app[0-9]*|/home/user[0-9]+")
         .expect("static regex")
 });
+
+/// Upper bound on candidate surrogates tried for one original. Reaching it fails closed.
+const MAX_ATTEMPTS: u32 = 300_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("surrogate space exhausted for {0}; refusing to send")]
+pub struct Exhausted(pub &'static str);
 
 #[derive(Debug, Clone)]
 struct Entry {
@@ -43,6 +50,7 @@ pub struct Vault {
     rev: HashMap<String, Entry>,
     counters: HashMap<&'static str, usize>,
     corpus_lower: String,
+    max_attempts: u32,
 }
 
 impl std::fmt::Debug for Vault {
@@ -80,7 +88,14 @@ impl Vault {
             rev: HashMap::new(),
             counters: HashMap::new(),
             corpus_lower: corpus.to_lowercase(),
+            max_attempts: MAX_ATTEMPTS,
         }
+    }
+
+    /// Lower the per-original attempt bound (tests).
+    pub fn with_max_attempts(mut self, n: u32) -> Vault {
+        self.max_attempts = n.max(1);
+        self
     }
 
     pub fn len(&self) -> usize {
@@ -127,7 +142,8 @@ impl Vault {
         mac.update(lower.as_bytes());
         mac.update(&attempt.to_le_bytes());
         let b = mac.finalize().into_bytes();
-        let n = 3 + (b[0] % 2) as usize;
+        // 4-5 syllables (8-10 letters): distinctive enough not to occur by chance
+        let n = 4 + (b[0] % 2) as usize;
         let mut w = String::new();
         for i in 0..n {
             w.push_str(SYLLABLES[(b[i + 1] % 16) as usize]);
@@ -138,32 +154,46 @@ impl Vault {
         w
     }
 
-    fn generate(&mut self, original: &str, f: &Finding, dict: Option<&Dictionary>) -> String {
+    fn ipv4_candidate(n: usize) -> String {
+        // 198.51.100.0/24 and 203.0.113.0/24 (documentation), then 198.18.0.0/15
+        // (benchmarking), then a typed token
+        if n <= 254 {
+            format!("198.51.100.{n}")
+        } else if n <= 508 {
+            format!("203.0.113.{}", n - 254)
+        } else if n - 508 <= 2 * 65_536 - 2 {
+            let k = (n - 508) as u32; // 1..=131_070
+            let ip = (198u32 << 24) | (18u32 << 16) | k;
+            let [a, b, c, d] = ip.to_be_bytes();
+            format!("{a}.{b}.{c}.{d}")
+        } else {
+            format!("MM_IPV4_{}", n - 508 - (2 * 65_536 - 2))
+        }
+    }
+
+    fn generate(
+        &mut self,
+        original: &str,
+        f: &Finding,
+        dict: Option<&Dictionary>,
+    ) -> Result<String, Exhausted> {
         if f.category == Category::Dictionary {
             let lower = original.to_lowercase();
-            let mut attempt = 0u32;
-            loop {
+            for attempt in 0..self.max_attempts {
                 let cand = case_shape(original, &self.dict_word(&lower, attempt));
                 if self.usable(&cand, dict) {
-                    return cand;
+                    return Ok(cand);
                 }
-                attempt += 1;
             }
+            return Err(Exhausted("dictionary"));
         }
-        loop {
+        for _ in 0..self.max_attempts {
             let cand = match f.category {
                 Category::Email => format!("user{}@example.com", self.next_n("email")),
                 Category::Url | Category::Host => {
                     format!("svc{}.example.net", self.next_n("host"))
                 }
-                Category::Ipv4 => {
-                    let n = self.next_n("ipv4");
-                    if n <= 254 {
-                        format!("198.51.100.{n}")
-                    } else {
-                        format!("203.0.113.{}", (n - 254).min(254))
-                    }
-                }
+                Category::Ipv4 => Self::ipv4_candidate(self.next_n("ipv4")),
                 Category::Ipv6 => format!("2001:db8::{:x}", self.next_n("ipv6")),
                 Category::Path if f.label == "project root" => {
                     let n = self.next_n("root");
@@ -174,7 +204,7 @@ impl Vault {
                     }
                 }
                 Category::Path => format!("/home/user{}", self.next_n("home")),
-                Category::Secret | Category::HighEntropy => {
+                Category::Secret | Category::HighEntropy | Category::DictionaryEvasion => {
                     format!("MM_SECRET_{}", self.next_n("secret"))
                 }
                 Category::Phone => format!("MM_PHONE_{}", self.next_n("phone")),
@@ -184,9 +214,10 @@ impl Vault {
                 Category::Dictionary => unreachable!(),
             };
             if self.usable(&cand, dict) {
-                return cand;
+                return Ok(cand);
             }
         }
+        Err(Exhausted(f.category.as_str()))
     }
 
     /// Same original -> same surrogate within this vault.
@@ -195,11 +226,11 @@ impl Vault {
         original: &str,
         f: &Finding,
         dict: Option<&Dictionary>,
-    ) -> String {
+    ) -> Result<String, Exhausted> {
         if let Some(s) = self.fwd.get(original) {
-            return s.clone();
+            return Ok(s.clone());
         }
-        let s = self.generate(original, f, dict);
+        let s = self.generate(original, f, dict)?;
         self.fwd.insert(original.to_string(), s.clone());
         self.rev.insert(
             s.clone(),
@@ -208,7 +239,7 @@ impl Vault {
                 inner: f.category == Category::Dictionary,
             },
         );
-        s
+        Ok(s)
     }
 
     fn automaton(&self) -> Option<(AhoCorasick, Vec<(&str, &Entry)>)> {
@@ -233,16 +264,37 @@ impl Vault {
 
     /// Replace exact known surrogates with their originals. Returns (text, replacements).
     pub fn restore(&self, text: &str) -> (String, usize) {
+        let r = self.restore_with(text, |_, _| true);
+        (r.text, r.restored)
+    }
+
+    /// `restore` with a veto: `allow(byte_start, surrogate)` false leaves that occurrence as
+    /// the surrogate. Dictionary surrogates are restored only at identifier-segment
+    /// boundaries (non-alphanumeric, `_`, or a case transition); others need a boundary too.
+    pub fn restore_with<F>(&self, text: &str, allow: F) -> Restored
+    where
+        F: Fn(usize, &str) -> bool,
+    {
+        let mut r = Restored {
+            text: String::with_capacity(text.len()),
+            restored: 0,
+            vetoed: 0,
+            unbounded: 0,
+        };
         let Some((ac, pairs)) = self.automaton() else {
-            return (text.to_string(), 0);
+            r.text = text.to_string();
+            return r;
         };
         let bytes = text.as_bytes();
-        let mut out = String::with_capacity(text.len());
         let mut last = 0;
-        let mut n = 0;
         for m in ac.find_iter(text) {
-            let (_, e) = pairs[m.pattern().as_usize()];
-            if !e.inner {
+            let (sur, e) = pairs[m.pattern().as_usize()];
+            if e.inner {
+                if !segment_bounded(text, m.start(), m.end()) {
+                    r.unbounded += 1;
+                    continue;
+                }
+            } else {
                 let before = m.start().checked_sub(1).map(|i| bytes[i]);
                 let after = bytes.get(m.end()).copied();
                 let bad = |b: Option<u8>| b.is_some_and(|b| b.is_ascii_alphanumeric());
@@ -250,13 +302,17 @@ impl Vault {
                     continue;
                 }
             }
-            out.push_str(&text[last..m.start()]);
-            out.push_str(&e.original);
+            if !allow(m.start(), sur) {
+                r.vetoed += 1;
+                continue;
+            }
+            r.text.push_str(&text[last..m.start()]);
+            r.text.push_str(&e.original);
             last = m.end();
-            n += 1;
+            r.restored += 1;
         }
-        out.push_str(&text[last..]);
-        (out, n)
+        r.text.push_str(&text[last..]);
+        r
     }
 
     /// Surrogate-shaped tokens in `output` that this vault never issued and that were not
@@ -273,6 +329,38 @@ impl Vault {
     }
 }
 
+/// Result of `Vault::restore_with`.
+#[derive(Debug, Clone)]
+pub struct Restored {
+    pub text: String,
+    pub restored: usize,
+    /// Occurrences left as surrogates by the caller's veto.
+    pub vetoed: usize,
+    /// Dictionary surrogates found glued inside a longer word (not restored).
+    pub unbounded: usize,
+}
+
+/// A dictionary surrogate at `s..e` sits on identifier-segment boundaries on both sides.
+fn segment_bounded(text: &str, s: usize, e: usize) -> bool {
+    let first = text[s..e].chars().next();
+    let last = text[s..e].chars().next_back();
+    let before_ok = match text[..s].chars().next_back() {
+        None => true,
+        Some(p) if !p.is_alphanumeric() => true,
+        // fooBar: lower -> upper; FOO_BAR handled by '_'
+        Some(p) => p.is_lowercase() && first.is_some_and(|c| c.is_uppercase()),
+    };
+    let after_ok = match text[e..].chars().next() {
+        None => true,
+        Some(n) if !n.is_alphanumeric() => true,
+        Some(n) => {
+            // ZaveloBilling: lower -> upper; ZAVELOBilling is not a boundary we produce
+            last.is_some_and(|c| c.is_lowercase()) && n.is_uppercase() || n.is_ascii_digit()
+        }
+    };
+    before_ok && after_ok
+}
+
 /// Replace each finding's span with its surrogate. `findings` must be non-overlapping
 /// (see `detect::resolve_overlaps`).
 pub fn apply(
@@ -280,7 +368,7 @@ pub fn apply(
     findings: &[Finding],
     vault: &mut Vault,
     dict: Option<&Dictionary>,
-) -> String {
+) -> Result<String, Exhausted> {
     let mut sorted: Vec<&Finding> = findings.iter().collect();
     sorted.sort_by_key(|f| f.start);
     let mut out = String::with_capacity(text.len());
@@ -294,13 +382,13 @@ pub fn apply(
             continue;
         }
         let original = &text[f.start..f.end];
-        let s = vault.surrogate_for(original, f, dict);
+        let s = vault.surrogate_for(original, f, dict)?;
         out.push_str(&text[last..f.start]);
         out.push_str(&s);
         last = f.end;
     }
     out.push_str(&text[last..]);
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -317,7 +405,7 @@ mod tests {
         let det = Detector::new(vec!["/Users/jane/acme".into()], vec![], dict);
         let fs = resolve_overlaps(det.scan(text));
         let mut v = Vault::new(text);
-        let s = apply(text, &fs, &mut v, det.dictionary());
+        let s = apply(text, &fs, &mut v, det.dictionary()).unwrap();
         let (r, _) = v.restore(&s);
         (s, r)
     }
@@ -360,7 +448,7 @@ mod tests {
         let det = Detector::new(vec![], vec![], None);
         let fs = resolve_overlaps(det.scan(t));
         let mut v = Vault::new(t);
-        let _ = apply(t, &fs, &mut v, None);
+        let _ = apply(t, &fs, &mut v, None).unwrap();
         let (r, n) = v.restore("198.51.100.12 vs 198.51.100.1.");
         assert_eq!(n, 1);
         assert_eq!(r, "198.51.100.12 vs 10.0.0.5.");
@@ -374,6 +462,46 @@ mod tests {
             u,
             vec!["MM_SECRET_3".to_string(), "user7@example.com".to_string()]
         );
+    }
+
+    #[test]
+    fn ipv4_space_is_bounded_and_fails_closed() {
+        let ips: Vec<String> = (0..600)
+            .map(|i| format!("11.{}.{}.7", i / 200, i % 200))
+            .collect();
+        let t = ips.join(" ");
+        let det = Detector::new(vec![], vec![], None);
+        let fs = resolve_overlaps(det.scan(&t));
+        assert_eq!(fs.len(), 600);
+        let mut v = Vault::new(&t);
+        let s = apply(&t, &fs, &mut v, None).unwrap();
+        assert!(s.contains("198.51.100.254") && s.contains("203.0.113.254"));
+        assert!(s.contains("198.18.0.92"), "third pool used");
+        assert_eq!(v.restore(&s).0, t);
+        // every candidate unusable -> error, not a hang
+        let corpus = "198.51.100.1 198.51.100.2";
+        let mut v = Vault::new(corpus).with_max_attempts(2);
+        let f = Finding::new(Category::Ipv4, "IPv4", 0, 12);
+        assert!(v.surrogate_for("10.0.0.1", &f, None).is_err());
+    }
+
+    #[test]
+    fn dictionary_restore_needs_segment_boundaries() {
+        let dict = Dictionary::from_terms(["acme"]).unwrap();
+        let det = Detector::new(vec![], vec![], Some(dict));
+        let t = "acme Acme";
+        let fs = resolve_overlaps(det.scan(t));
+        let mut v = Vault::new(t);
+        let out = apply(t, &fs, &mut v, det.dictionary()).unwrap();
+        let (s, cap) = out.split_once(' ').unwrap();
+        assert!((8..=10).contains(&s.len()), "{s}");
+        let crafted = format!("x{s}y pre{s}post {s} {s}_x Get{cap}Url");
+        let r = v.restore_with(&crafted, |_, _| true);
+        assert_eq!(r.restored, 3, "{:?}", r.text);
+        assert_eq!(r.unbounded, 2);
+        assert!(r
+            .text
+            .contains(&format!("x{s}y pre{s}post acme acme_x GetAcmeUrl")));
     }
 
     #[test]

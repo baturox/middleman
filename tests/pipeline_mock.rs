@@ -80,7 +80,7 @@ async fn openai_roundtrip_restores_and_sends_no_originals() {
         o.contains("class AcmeInvoice") && o.contains("def zorblax_discount"),
         "{o}"
     );
-    assert!(o.starts_with("<untrusted_output>"));
+    assert!(o.starts_with("<untrusted_output_"));
     let sent = posts(&s).await;
     assert_eq!(sent.len(), 1);
     let body = String::from_utf8_lossy(&sent[0].body).to_lowercase();
@@ -162,10 +162,16 @@ async fn infra_pseudonymized_at_s2() {
     }
     assert!(body.contains("example.net") && body.contains("198.51.100."));
     let o = out.output.unwrap();
+    // surrogates inside URLs are never restored (a URL is a possible exfiltration sink)
+    assert!(!o.contains("https://billing.acme-corp.io"), "{o}");
     assert!(
-        o.contains("https://billing.acme-corp.io:8443/v2/charges"),
+        o.contains("https://svc") && o.contains(".example.net:8443/v2/charges"),
         "{o}"
     );
+    assert!(out
+        .warnings
+        .iter()
+        .any(|w| w.contains("left unrestored inside URLs")));
     assert!(
         o.contains("jane.doe@acme-corp.io") && o.contains("/Users/janedoe/acme-platform/reports")
     );
@@ -235,9 +241,19 @@ async fn http_500_is_error_with_ledger_and_no_retry() {
     assert_eq!(out.status, Status::Error, "{out:?}");
     let js = serde_json::to_string(&out).unwrap();
     assert!(!js.contains(FAKE_KEY), "key leaked into outcome");
-    // the provider body never reaches Claude
+    // the provider body never reaches Claude; it is kept (scrubbed) in the audit log
     assert!(!js.contains("boom"), "{js}");
     assert!(js.contains("HTTP 500"));
+    let audit = std::fs::read_dir(_e.dir.path().join("state"))
+        .unwrap()
+        .flatten()
+        .find(|f| f.file_name().to_string_lossy().starts_with("audit-"))
+        .map(|f| std::fs::read_to_string(f.path()).unwrap())
+        .unwrap();
+    assert!(
+        audit.contains("boom ***") && !audit.contains(FAKE_KEY),
+        "{audit}"
+    );
     assert_eq!(posts(&s).await.len(), 1);
     let l = p.ledger().entries().unwrap();
     // the attempt line, then the request-level closing line carrying Claude-side overhead
@@ -373,9 +389,37 @@ async fn confirm_and_explicit_modes() {
     assert!(out.sanitized_payload.is_some());
     assert_eq!(out.plan.len(), 1);
     assert!(posts(&s).await.is_empty());
+    let id = out.approval_id.clone().expect("approval id issued");
+    // confirmed=true alone (the model's own say-so) is not enough
     let mut r = req(TaskKind::Docstring, "src/invoice.py");
     r.confirmed = true;
-    assert_eq!(p.run(r).await.status, Status::Ok);
+    let o = p.run(r).await;
+    assert!(o.dry_run && o.needs_confirmation);
+    // an unapproved id is refused
+    let mut r = req(TaskKind::Docstring, "src/invoice.py");
+    r.confirmed = true;
+    r.approval_id = Some(id.clone());
+    assert_eq!(p.run(r).await.status, Status::Blocked);
+    assert!(posts(&s).await.is_empty());
+    // a fresh dry run, approved by the user, works exactly once
+    let id = p
+        .run(req(TaskKind::Docstring, "src/invoice.py"))
+        .await
+        .approval_id
+        .unwrap();
+    middleman::approval::Approvals::new(&p.config().state_dir())
+        .approve(&id)
+        .unwrap();
+    let mut r = req(TaskKind::Docstring, "src/invoice.py");
+    r.confirmed = true;
+    r.approval_id = Some(id.clone());
+    assert_eq!(p.run(r.clone()).await.status, Status::Ok);
+    assert_eq!(posts(&s).await.len(), 1);
+    assert_eq!(
+        p.run(r).await.status,
+        Status::Blocked,
+        "token is single-use"
+    );
     assert_eq!(posts(&s).await.len(), 1);
 
     let s = server(&[CHEAP], 10.0).await;

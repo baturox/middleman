@@ -18,7 +18,7 @@ fn detector() -> Detector {
 fn roundtrip(det: &Detector, text: &str) -> String {
     let fs = finalize(text, det.scan(text));
     let mut v = Vault::new(text);
-    let s = apply(text, &fs, &mut v, det.dictionary());
+    let s = apply(text, &fs, &mut v, det.dictionary()).unwrap();
     // the egress gate must accept every pseudonymized payload
     let r = OutboundRequest {
         model: "m".into(),

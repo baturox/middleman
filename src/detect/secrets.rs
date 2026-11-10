@@ -34,13 +34,41 @@ fn pat_g(label: &'static str, re: &str, group: usize, check: fn(&str) -> bool) -
     }
 }
 
+fn pat_k(label: &'static str, re: &str) -> Pat {
+    Pat {
+        label,
+        re: Regex::new(re).expect("static regex"),
+        group: 1,
+        check: None,
+    }
+}
+
+const PLACEHOLDERS: &[&str] = &[
+    "xxxx",
+    "your_",
+    "your-",
+    "changeme",
+    "placeholder",
+    "example",
+    "dummy",
+];
+
+/// `${VAR}`, `$VAR`, `{name}`, `{{name}}`, `%(name)s`: a template reference, not a value.
+fn is_template_ref(v: &str) -> bool {
+    static T: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(?:\$\{[A-Za-z_][A-Za-z0-9_.:\-]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_.]*\}|\{\{\s*[A-Za-z_][A-Za-z0-9_.]*\s*\}\}|%\([A-Za-z_][A-Za-z0-9_]*\)s)$")
+            .expect("static regex")
+    });
+    T.is_match(v.trim())
+}
+
 /// A value on the right of `password = ...` that looks like a literal secret rather than code.
 fn looks_secretish(v: &str) -> bool {
     let v = v.trim_matches(|c| c == '"' || c == '\'');
     if v.len() < 8 {
         return false;
     }
-    if v.starts_with("MM_SECRET_") {
+    if v.starts_with("MM_SECRET_") || is_template_ref(v) {
         return false;
     }
     // Plain identifiers / dotted paths without digits are code, not secrets.
@@ -54,55 +82,34 @@ fn looks_secretish(v: &str) -> bool {
         return false;
     }
     let lower = v.to_ascii_lowercase();
-    for placeholder in [
-        "xxxx",
-        "your_",
-        "your-",
-        "changeme",
-        "placeholder",
-        "example",
-        "dummy",
-    ] {
-        if lower.contains(placeholder) {
-            return false;
-        }
-    }
-    true
+    !PLACEHOLDERS.iter().any(|p| lower.contains(p))
 }
 
 /// Quoted literal assigned to a secret-named variable: fire on any quoted literal of 8+ chars
-/// unless it is an obvious placeholder.
+/// (spaces allowed) unless it is an obvious placeholder or exactly a template reference.
 fn quoted_or_secretish(v: &str) -> bool {
     let quoted = v.starts_with('"') || v.starts_with('\'');
     if quoted {
         let inner = v.trim_matches(|c| c == '"' || c == '\'');
-        if inner.len() < 8 {
+        if inner.chars().count() < 8 {
             return false;
         }
         let lower = inner.to_ascii_lowercase();
-        return ![
-            "xxxx",
-            "your_",
-            "your-",
-            "changeme",
-            "placeholder",
-            "example",
-            "<",
-        ]
-        .iter()
-        .any(|p| lower.contains(p))
-            && !inner.contains('{')
-            && !inner.contains('$')
+        return !PLACEHOLDERS.iter().any(|p| lower.contains(p))
+            && !lower.contains('<')
+            && !is_template_ref(inner)
             && !inner.starts_with("MM_SECRET_");
     }
     looks_secretish(v)
 }
 
+// Key-format patterns start with `(?:^|[^A-Za-z0-9])` instead of `\b` so a `_` prefix
+// (`backup_AKIA...`, `x_ghp_...`) does not hide them; the key itself is capture group 1.
 static PATTERNS: LazyLock<Vec<Pat>> = LazyLock::new(|| {
     vec![
-        pat(
+        pat_k(
             "provider key (sk-ant/sk_live/hf_/npm_/glpat/ya29/SG.)",
-            r"\b(?:sk-ant-[A-Za-z0-9_\-]{10,}|sk_live_[A-Za-z0-9]{10,}|sk_test_[A-Za-z0-9]{10,}|rk_live_[A-Za-z0-9]{10,}|hf_[A-Za-z0-9]{30,}|npm_[A-Za-z0-9]{30,}|glpat-[A-Za-z0-9_\-]{16,}|ya29\.[A-Za-z0-9_\-]{20,}|SG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,})",
+            r"(?:^|[^A-Za-z0-9])(sk-ant-[A-Za-z0-9_\-]{10,}|sk_live_[A-Za-z0-9]{10,}|sk_test_[A-Za-z0-9]{10,}|rk_live_[A-Za-z0-9]{10,}|hf_[A-Za-z0-9]{30,}|npm_[A-Za-z0-9]{30,}|glpat-[A-Za-z0-9_\-]{16,}|ya29\.[A-Za-z0-9_\-]{20,}|SG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,})",
         ),
         pat_g(
             "api key (sk-/pk-/rk-)",
@@ -110,35 +117,44 @@ static PATTERNS: LazyLock<Vec<Pat>> = LazyLock::new(|| {
             1,
             |v| v.chars().any(|c| c.is_ascii_digit()),
         ),
-        pat("AWS access key", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
-        pat(
-            "GitHub token",
-            r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})",
+        pat_k(
+            "AWS access key",
+            r"(?:^|[^A-Za-z0-9])((?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[0-9A-Z]{16})(?:[^0-9A-Za-z]|$)",
         ),
-        pat("Slack token", r"\bxox[abprs]-[A-Za-z0-9\-]{10,}"),
-        pat("Google API key", r"\bAIza[0-9A-Za-z_\-]{30,}"),
-        pat(
+        pat_k(
+            "GitHub token",
+            r"(?:^|[^A-Za-z0-9])(gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})",
+        ),
+        pat_k(
+            "Slack token",
+            r"(?:^|[^A-Za-z0-9])(xox[abprs]-[A-Za-z0-9\-]{10,})",
+        ),
+        pat_k(
+            "Google API key",
+            r"(?:^|[^A-Za-z0-9])(AIza[0-9A-Za-z_\-]{30,})",
+        ),
+        pat_k(
             "JWT",
-            r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}",
+            r"(?:^|[^A-Za-z0-9])(eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,})",
         ),
         pat("Bearer token", r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]{20,}"),
         pat(
             "Authorization/x-api-key header",
             r"(?i)\b(?:authorization|x-api-key|api-key)\s*:\s*(?:[A-Za-z]+\s+)?[A-Za-z0-9._~+/=\-]{16,}",
         ),
-        pat(
+        pat_k(
             "Stripe/Twilio-style key",
-            r"\b(?:AC[a-f0-9]{32}|SK[a-f0-9]{32}|whsec_[A-Za-z0-9]{20,})\b",
+            r"(?:^|[^A-Za-z0-9])(AC[a-f0-9]{32}|SK[a-f0-9]{32}|whsec_[A-Za-z0-9]{20,})(?:[^0-9A-Za-z]|$)",
         ),
         pat_g(
             "env/config secret line",
-            r#"(?m)^\s*(?:export\s+)?[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PWD)[A-Z0-9_]*\s*[=:]\s*(["']?[A-Za-z0-9_\-+/=.~!@#%^&*]{8,}["']?)\s*;?\s*$"#,
+            r#"(?m)^[ \t]*(?:export[ \t]+)?[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|PASS|CREDENTIAL|PWD)[A-Z0-9_]*[ \t]*[=:][ \t]*("[^"\n]{8,}"|'[^'\n]{8,}'|[A-Za-z0-9_\-+/=.~!@#$%^&*]{8,})[ \t]*;?[ \t]*$"#,
             1,
             quoted_or_secretish,
         ),
         pat_g(
             "secret assignment",
-            r#"(?i)\b(?:password|passwd|pwd|parola|sifre|secret|client[_-]?secret|api[_-]?key|apikey|access[_-]?key|auth[_-]?token|access[_-]?token|token)\b["']?\s*[=:]\s*(["'][^"'\s]{8,}["']|[^\s"'<>()\[\]{},;]{8,})"#,
+            r#"(?i)(?:^|[^A-Za-z0-9])(?:password|passwd|passphrase|pass|pwd|parola|sifre|secret|client[_-]?secret|api[_-]?key|apikey|access[_-]?key|auth[_-]?token|access[_-]?token|token)\b["']?\s*[=:]\s*("[^"\n]{8,}"|'[^'\n]{8,}'|[^\s"'<>()\[\]{},;]{8,})"#,
             1,
             quoted_or_secretish,
         ),
@@ -202,6 +218,18 @@ mod tests {
             "https://x.test/cb?api_key=abcdef123456",
             "xoxb-123456789012-abcdefghij",
             "AIzaSyA1234567890abcdefghijklmnopqrstu",
+            concat!("src/backup_AKIA", "ABCDEFGHIJKLMNOP.py"),
+            "x_ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            "old_sk_live_abcdefghijklmnop",
+            "v2_xoxb-123456789012-abcdefghijkl",
+            "id_AIzaSyA1234567890abcdefghijklmnopqrstuv",
+            "DB_PASS=S3cretPassw0rd!",
+            "db_pass = \"S3cretPassw0rd!\"",
+            "password = \"Tr0ub4dor$3xyz\"",
+            "password: \"correct horse battery staple\"",
+            "Server=db;User Id=sa;Pwd=Sup3rS3cret!;",
+            concat!("aws_secret_access_key: wJalrXUtnFEMI", "zKtMDENGgbPxRfiCYzzQWERTY7q"),
+            "MY_PASSPHRASE='hunter2 hunter2'",
         ] {
             assert!(!hits(t).is_empty(), "expected hit: {t}");
         }
@@ -220,6 +248,11 @@ mod tests {
             "password = \"changeme_placeholder\"",
             "const TOKEN_EXPIRY_SECONDS = 3600;",
             "MM_SECRET_3",
+            "password = \"${DB_PASSWORD}\"",
+            "token: '{{ api_token }}'",
+            "bypass = 12",
+            "self.pass_count = 12345678",
+            "risk_pk_user_reference",
         ] {
             assert!(hits(t).is_empty(), "unexpected hit {:?}: {t}", hits(t));
         }

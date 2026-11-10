@@ -1,10 +1,17 @@
 //! The egress gate. `Sanitized<T>` can only be built by `seal`, which re-scans the final
 //! payload and asserts that no vault original and no credential is present. Providers accept
 //! only `&Sanitized<OutboundRequest>`, so no code path reaches the network with raw text.
+//!
+//! The gate is a second check, independent of the pseudonymization pass: besides re-running
+//! every detector, it normalizes the final payload (NFKC, invisible characters removed, full
+//! case folding) and searches it for every dictionary term and every vault original. Any hit
+//! outside a surrogate blocks. Detection is still best-effort: the gate can only find what the
+//! detectors and the dictionary describe.
 
 use thiserror::Error;
 
 use crate::config::Secret;
+use crate::detect::normalize::{fold_str, normalize};
 use crate::detect::Detector;
 use crate::pseudo::Vault;
 
@@ -71,18 +78,39 @@ pub fn seal(
             f.label
         )));
     }
-    let lower = text.to_lowercase();
     for o in vault.originals() {
-        let present = if vault.is_dict_original(o) {
-            lower.contains(&o.to_lowercase())
-        } else {
-            text.contains(o)
-        };
-        if present {
+        if text.contains(o) {
             return Err(EgressViolation::Original(format!(
                 "{} chars",
                 o.chars().count()
             )));
+        }
+    }
+    // independent pass over the normalized payload
+    let view = normalize(&text, true);
+    let outside = |(s, e): (usize, usize)| !spans.iter().any(|&(a, b)| s >= a && e <= b);
+    if let Some(d) = detector.dictionary() {
+        if d.find_folded(&view).into_iter().any(outside) {
+            return Err(EgressViolation::Original(
+                "dictionary term (normalized match)".into(),
+            ));
+        }
+    }
+    for o in vault.originals() {
+        let needle = fold_str(o);
+        if needle.chars().count() < 3 {
+            continue;
+        }
+        let mut from = 0;
+        while let Some(i) = view.text[from..].find(&needle) {
+            let s = from + i;
+            if outside(view.span(s, s + needle.len())) {
+                return Err(EgressViolation::Original(format!(
+                    "{} chars, normalized match",
+                    o.chars().count()
+                )));
+            }
+            from = s + needle.len();
         }
     }
     Ok(Sanitized { inner: req })
@@ -118,9 +146,25 @@ mod tests {
         let t = "AcmeBilling mails bob@acme-corp.io at 10.2.3.4";
         let fs = resolve_overlaps(det.scan(t));
         let mut v = Vault::new(t);
-        let s = apply(t, &fs, &mut v, det.dictionary());
+        let s = apply(t, &fs, &mut v, det.dictionary()).unwrap();
         let sealed = seal(req(&s), &v, &det, &[]).unwrap();
         assert!(!sealed.get().user.to_lowercase().contains("acme"));
+    }
+
+    #[test]
+    fn normalized_leaks_are_rejected() {
+        let dict = Dictionary::from_terms(["Yıldız Holding", "acme"]).unwrap();
+        let det = Detector::new(vec![], vec![], Some(dict));
+        let v = Vault::new("");
+        for t in [
+            "YILDIZ HOLDING results",
+            "the ac\u{200b}me module",
+            "the ＡＣＭＥ module",
+            "the \u{0430}cme module",
+            "MEGA_ACME_X",
+        ] {
+            assert!(seal(req(t), &v, &det, &[]).is_err(), "{t}");
+        }
     }
 
     #[test]

@@ -16,7 +16,7 @@ static HOST: LazyLock<Regex> = LazyLock::new(|| {
         .expect("static regex")
 });
 static IPV4: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b").expect("static regex")
+    Regex::new(r"\b([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\b").expect("static regex")
 });
 static IPV6: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)[0-9a-f]{0,4}(?::[0-9a-f]{0,4}){2,7}").expect("static regex")
@@ -72,6 +72,31 @@ const TLDS: &[&str] = &[
     "svc",
     "cluster",
 ];
+
+/// Last labels that are file extensions, never TLDs of a 3+ label host outside a host context.
+const FILE_EXTS: &[&str] = &[
+    "py", "rs", "js", "ts", "tsx", "jsx", "mjs", "cjs", "md", "json", "yaml", "yml", "toml", "txt",
+    "html", "htm", "css", "scss", "sh", "go", "java", "kt", "rb", "php", "cpp", "hpp", "cc",
+    "lock", "log", "cfg", "ini", "xml", "csv", "sql", "swift", "vue", "proto", "gradle", "scala",
+    "pl", "lua", "dart", "ex", "exs", "erl", "hs", "ml", "zig", "nim", "jl", "tf", "bak", "tmp",
+    "orig", "png", "jpg", "jpeg", "gif", "svg", "pdf", "zip", "gz", "tar", "whl", "egg", "so",
+    "dylib", "dll", "exe", "bin", "dat", "db", "env", "pyc", "pyi", "ipynb", "class", "jar", "map",
+    "min", "rst", "conf", "pem", "crt", "key", "pub", "spec", "test", "snap", "patch", "diff",
+    "new", "old",
+];
+
+/// Words shortly before a token that make it a host (`connect to x.y.app`, `host: a.b`).
+fn host_context(text: &str, start: usize) -> bool {
+    static CTX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(?:host|server|domain|connect|ssh|scp|rsync|url|uri|endpoint|dns|cname|fqdn|ping|curl|wget|dial|address|addr|proxy|mirror|registry|origin|upstream|remote)[^\n]{0,16}$|(?:@|//)$")
+            .expect("static regex")
+    });
+    let mut from = start.saturating_sub(32);
+    while !text.is_char_boundary(from) {
+        from += 1;
+    }
+    CTX.is_match(&text[from..start])
+}
 
 /// First labels that indicate a member access in code (`self.org`, `user.com`), not a host.
 const CODE_LABELS: &[&str] = &[
@@ -151,24 +176,41 @@ impl InfraScanner {
                 h.start() + host.len(),
             ));
         }
-        // bare hostnames
+        // bare hostnames: listed TLDs anywhere; any 2-24 letter TLD for 3+ labels that look
+        // like a host (a label with a digit or hyphen) or that sit in a host-like context
         for c in HOST.captures_iter(text) {
             let m = c.get(0).unwrap();
             let tld = c.get(1).unwrap().as_str().to_ascii_lowercase();
-            if !TLDS.contains(&tld.as_str()) || self.keep_host(m.as_str()) {
+            if self.keep_host(m.as_str()) {
                 continue;
             }
-            if byte_at(text, m.end()) == Some(b'(') {
-                continue; // method call
-            }
-            if byte_before(text, m.start()).is_some_and(|b| b == b'.' || b == b'$' || b == b'@') {
+            if byte_before(text, m.start()).is_some_and(|b| b == b'.' || b == b'$') {
                 continue;
             }
             let labels: Vec<&str> = m.as_str().split('.').collect();
-            if labels.len() == 2 && CODE_LABELS.contains(&labels[0].to_ascii_lowercase().as_str()) {
-                continue;
+            let first = labels[0].to_ascii_lowercase();
+            let listed = TLDS.contains(&tld.as_str());
+            let ctx = host_context(text, m.start());
+            let call = byte_at(text, m.end()) == Some(b'(');
+            let accept = if listed {
+                if labels.len() == 2 {
+                    !call && !CODE_LABELS.contains(&first.as_str())
+                } else {
+                    true
+                }
+            } else if FILE_EXTS.contains(&tld.as_str()) {
+                false
+            } else if labels.len() >= 3 {
+                let hosty = labels[..labels.len() - 1]
+                    .iter()
+                    .any(|l| l.contains('-') || l.bytes().any(|b| b.is_ascii_digit()));
+                (hosty && !CODE_LABELS.contains(&first.as_str()) && !call) || ctx
+            } else {
+                ctx && !call
+            };
+            if accept {
+                out.push(Finding::new(Category::Host, "hostname", m.start(), m.end()));
             }
-            out.push(Finding::new(Category::Host, "hostname", m.start(), m.end()));
         }
         for c in IPV4.captures_iter(text) {
             let m = c.get(0).unwrap();
@@ -183,8 +225,14 @@ impl InfraScanner {
             if !ok || is_reserved_ipv4(o) {
                 continue;
             }
-            if byte_before(text, m.start()) == Some(b'.') || byte_at(text, m.end()) == Some(b'.') {
+            if byte_before(text, m.start()) == Some(b'.') {
                 continue; // part of a longer dotted version string
+            }
+            // a trailing '.' is a sentence end unless another number follows (1.2.3.4.5)
+            if byte_at(text, m.end()) == Some(b'.')
+                && byte_at(text, m.end() + 1).is_some_and(|b| b.is_ascii_digit())
+            {
+                continue;
             }
             out.push(Finding::new(Category::Ipv4, "IPv4", m.start(), m.end()));
         }
@@ -260,6 +308,41 @@ mod tests {
         assert!(scan("import os.path; main.rs; file.py; self.org = 1; README.md").is_empty());
         assert!(scan("see https://github.com/x/y and svc2.example.net").is_empty());
         assert!(scan("x = foo.com()").is_empty());
+        for code in [
+            "obj.method.call()",
+            "self.config.get",
+            "np.random.rand",
+            "tests.test_billing.py",
+            "lodash.debounce.min",
+            "foo.bar.baz",
+        ] {
+            assert!(scan(code).is_empty(), "{code}: {:?}", scan(code));
+        }
+    }
+
+    #[test]
+    fn host_positives_beyond_tld_list() {
+        for (t, want) in [
+            (
+                "connect to build01.payments-core.app on 5432",
+                "build01.payments-core.app",
+            ),
+            (
+                "see vault.payments-core.io(primary)",
+                "vault.payments-core.io",
+            ),
+            (
+                "scp deploy@bastion.payments-core.io:/srv x",
+                "bastion.payments-core.io",
+            ),
+            ("host: api.payments.app", "api.payments.app"),
+        ] {
+            assert!(
+                scan(t).contains(&(Category::Host, want.into())),
+                "{t}: {:?}",
+                scan(t)
+            );
+        }
     }
 
     #[test]
@@ -269,6 +352,8 @@ mod tests {
         assert!(r.contains(&(Category::Ipv6, "fe80::1ff:fe23:4567:890a".into())));
         assert!(!r.iter().any(|(_, s)| s == "127.0.0.1"));
         assert!(scan("version 1.2.3.4.5 and 198.51.100.7").is_empty());
+        let r = scan("Primary database is 10.20.30.40.");
+        assert!(r.contains(&(Category::Ipv4, "10.20.30.40".into())), "{r:?}");
         assert!(scan("use std::fmt; de::Error; at 12:30:45").is_empty());
     }
 

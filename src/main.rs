@@ -154,6 +154,11 @@ enum Cmd {
     },
     /// Green/red checklist: config, keys, reachability, balance, catalog, binary, MCP, hook
     Doctor,
+    /// Approve a routing.mode=confirm dry run (run this yourself, in a terminal)
+    Approve {
+        /// The approval_id shown by the dry run
+        id: String,
+    },
 }
 
 fn cwd() -> PathBuf {
@@ -594,6 +599,17 @@ async fn real_main() -> Result<ExitCode> {
     }
     let cfg = load(&cfg_path)?;
     match cli.cmd {
+        Cmd::Approve { id } => {
+            middleman::approval::require_terminal()?;
+            eprint!("Approve delegation {id}? Type 'yes' to approve: ");
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if answer.trim() != "yes" {
+                bail!("not approved");
+            }
+            middleman::approval::Approvals::new(&cfg.state_dir()).approve(&id)?;
+            say!("approved {id} (single use, expires 30 min after the dry run)");
+        }
         Cmd::Mcp => {
             let pipeline = Pipeline::new(cfg)?;
             Server::new(pipeline).run_stdio().await?;

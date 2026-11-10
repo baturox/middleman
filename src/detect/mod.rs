@@ -4,6 +4,7 @@
 pub mod dictionary;
 pub mod entropy;
 pub mod infra;
+pub mod normalize;
 pub mod pii;
 pub mod secrets;
 
@@ -30,6 +31,9 @@ pub enum Category {
     Tckn,
     Card,
     Dictionary,
+    /// A dictionary term found only after removing separators / mapping look-alikes. Always
+    /// blocks (it cannot be rewritten reliably).
+    DictionaryEvasion,
 }
 
 impl Category {
@@ -48,12 +52,15 @@ impl Category {
             Category::Tckn => "tckn",
             Category::Card => "card",
             Category::Dictionary => "dictionary",
+            Category::DictionaryEvasion => "dictionary_evasion",
         }
     }
 
     pub fn severity(&self) -> Severity {
         match self {
-            Category::Secret | Category::HighEntropy => Severity::Hard,
+            Category::Secret | Category::HighEntropy | Category::DictionaryEvasion => {
+                Severity::Hard
+            }
             Category::Phone | Category::Iban | Category::Tckn | Category::Card => Severity::Pii,
             Category::Email
             | Category::Url
@@ -153,17 +160,56 @@ impl Detector {
         self.dict.as_ref()
     }
 
-    /// All findings, possibly overlapping.
+    /// All findings, possibly overlapping. Scanners run on the text as given and, when it
+    /// differs, on its NFKC / invisible-stripped view (findings mapped back to original
+    /// spans); secret patterns also run on a view with `"a" + "b"` concatenations joined.
     pub fn scan(&self, text: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        secrets::scan(text, &mut out);
-        entropy::scan(text, &mut out);
-        pii::scan(text, &mut out);
-        self.infra.scan(text, &mut out);
+        self.scan_plain(text, &mut out);
+        let view = normalize::normalize(text, false);
+        if view.text != text {
+            let mut extra = Vec::new();
+            self.scan_plain(&view.text, &mut extra);
+            remap(&view, extra, &mut out);
+        }
+        if let Some(joined) = normalize::join_concat(&view.text) {
+            let mut extra = Vec::new();
+            secrets::scan(&joined.text, &mut extra);
+            entropy::scan(&joined.text, &mut extra);
+            // joined -> normalized -> original
+            for f in extra {
+                if f.is_empty() {
+                    continue;
+                }
+                let (s, e) = joined.span(f.start, f.end);
+                if e > s {
+                    let (s, e) = view.span(s, e);
+                    out.push(Finding::new(f.category, f.label, s, e));
+                }
+            }
+        }
         if let Some(d) = &self.dict {
             d.scan(text, &mut out);
         }
+        out.retain(|f| text.is_char_boundary(f.start) && text.is_char_boundary(f.end));
         out
+    }
+
+    fn scan_plain(&self, text: &str, out: &mut Vec<Finding>) {
+        secrets::scan(text, out);
+        entropy::scan(text, out);
+        pii::scan(text, out);
+        self.infra.scan(text, out);
+    }
+}
+
+fn remap(view: &normalize::View, found: Vec<Finding>, out: &mut Vec<Finding>) {
+    for f in found {
+        if f.is_empty() {
+            continue;
+        }
+        let (s, e) = view.span(f.start, f.end);
+        out.push(Finding::new(f.category, f.label, s, e));
     }
 }
 
@@ -196,7 +242,10 @@ pub fn finalize(text: &str, raw: Vec<Finding>) -> Vec<Finding> {
     let mut kept = resolve_overlaps(raw);
     let mut extra = Vec::new();
     for f in &kept {
-        if f.category == Category::Dictionary {
+        if matches!(
+            f.category,
+            Category::Dictionary | Category::DictionaryEvasion
+        ) {
             continue; // the dictionary automaton already finds every occurrence
         }
         let needle = &text[f.start..f.end];

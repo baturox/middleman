@@ -1,6 +1,7 @@
 //! middleman: a local, trusted sanitization layer between Claude Code and untrusted LLM providers.
 #![deny(clippy::print_stdout)]
 
+pub mod approval;
 pub mod audit;
 pub mod budget;
 pub mod catalog;
@@ -19,6 +20,7 @@ pub mod policy;
 pub mod providers;
 pub mod pseudo;
 pub mod report;
+pub mod risk;
 pub mod routing;
 pub mod setup;
 pub mod tune;

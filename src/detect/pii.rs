@@ -7,23 +7,30 @@ use regex::Regex;
 use super::{byte_at, byte_before, is_word_byte, Category, Finding};
 
 static EMAIL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[A-Za-z0-9._%+\-]+@([A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,})")
+    Regex::new(r"[\p{L}\p{N}._%+\-]+@([\p{L}\p{N}\-]+(?:\.[\p{L}\p{N}\-]+)*\.\p{L}{2,})")
         .expect("static regex")
 });
 static PHONE_TR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(\+90|0090|0)?[ ]?\(?5\d{2}\)?[ .\-]?\d{3}[ .\-]?\d{2}[ .\-]?\d{2}")
+    Regex::new(r"(\+90|0090|0)?[ ]?\(?5[0-9]{2}\)?[ .\-]?[0-9]{3}[ .\-]?[0-9]{2}[ .\-]?[0-9]{2}")
         .expect("static regex")
 });
 static PHONE_INTL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\+\d{1,3}[ .\-]?\(?\d{2,4}\)?[ .\-]?\d{3,4}[ .\-]?\d{3,4}").expect("static regex")
-});
-static IBAN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){3,7}(?: ?[A-Z0-9]{1,4})?\b")
+    Regex::new(r"\+[0-9]{1,3}[ .\-]?\(?[0-9]{2,4}\)?[ .\-]?[0-9]{3,4}[ .\-]?[0-9]{3,4}")
         .expect("static regex")
 });
-static DIGIT_RUN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+").expect("static regex"));
+/// North-American style without a country code: `(415) 555-2671`, `415-555-2671`,
+/// `415.555.2671` (a separator or parentheses is required).
+static PHONE_NANP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:\([2-9][0-9]{2}\)[ ]?|[2-9][0-9]{2}[ .\-])[2-9][0-9]{2}[ .\-][0-9]{4}")
+        .expect("static regex")
+});
+static IBAN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b[A-Z]{2}[0-9]{2}(?: ?[A-Z0-9]{4}){3,7}(?: ?[A-Z0-9]{1,4})?\b")
+        .expect("static regex")
+});
+static DIGIT_RUN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[0-9]+").expect("static regex"));
 static CARD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\d(?:[ \-]?\d){12,18}").expect("static regex"));
+    LazyLock::new(|| Regex::new(r"[0-9](?:[ \-]?[0-9]){12,18}").expect("static regex"));
 
 pub fn is_reserved_email_domain(domain: &str) -> bool {
     let d = domain.to_ascii_lowercase();
@@ -125,6 +132,13 @@ pub fn scan(text: &str, out: &mut Vec<Finding>) {
             out.push(Finding::new(Category::Phone, "phone", m.start(), m.end()));
         }
     }
+    for m in PHONE_NANP.find_iter(text) {
+        if !byte_before(text, m.start()).is_some_and(|b| is_word_byte(b) || b == b'.' || b == b'-')
+            && !byte_at(text, m.end()).is_some_and(|b| b.is_ascii_digit() || b == b'.' || b == b'-')
+        {
+            out.push(Finding::new(Category::Phone, "phone", m.start(), m.end()));
+        }
+    }
     for m in IBAN.find_iter(text) {
         if iban_valid(m.as_str()) {
             out.push(Finding::new(Category::Iban, "IBAN", m.start(), m.end()));
@@ -140,7 +154,9 @@ pub fn scan(text: &str, out: &mut Vec<Finding>) {
             continue;
         }
         let digits: String = m.as_str().chars().filter(|c| c.is_ascii_digit()).collect();
-        let first = digits.as_bytes()[0];
+        let Some(&first) = digits.as_bytes().first() else {
+            continue;
+        };
         if (13..=19).contains(&digits.len()) && (b'3'..=b'6').contains(&first) && luhn(&digits) {
             out.push(Finding::new(
                 Category::Card,
@@ -195,6 +211,7 @@ mod tests {
         assert_eq!(cats("mail jane.doe@acme-corp.io"), vec![Category::Email]);
         assert!(cats("user3@example.com").is_empty());
         assert!(cats("a@b.test").is_empty());
+        assert_eq!(cats("yaz: çağrı@gizlifirma.com"), vec![Category::Email]);
     }
 
     #[test]
@@ -203,5 +220,15 @@ mod tests {
         assert!(cats("call 0532 123 45 67").contains(&Category::Phone));
         assert!(cats("tel +1 415 555 2671").contains(&Category::Phone));
         assert!(!cats("const N: u64 = 5321234567;").contains(&Category::Phone));
+        assert!(cats("call (415) 555-2671 now").contains(&Category::Phone));
+        assert!(cats("call 415-555-2671").contains(&Category::Phone));
+        assert!(!cats("version 1.415.555.2671").contains(&Category::Phone));
+        assert!(!cats("date 2024-05-12").contains(&Category::Phone));
+    }
+
+    #[test]
+    fn unicode_digits_do_not_panic() {
+        let t = "\u{0661}\u{0662}\u{0663}\u{0664}\u{0665}\u{0666}\u{0667}\u{0668}\u{0669}\u{0660}\u{0661}\u{0662}\u{0663}";
+        assert!(cats(t).is_empty());
     }
 }
