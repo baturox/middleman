@@ -235,7 +235,9 @@ async fn http_500_is_error_with_ledger_and_no_retry() {
     assert_eq!(out.status, Status::Error, "{out:?}");
     let js = serde_json::to_string(&out).unwrap();
     assert!(!js.contains(FAKE_KEY), "key leaked into outcome");
-    assert!(js.contains("***"));
+    // the provider body never reaches Claude
+    assert!(!js.contains("boom"), "{js}");
+    assert!(js.contains("HTTP 500"));
     assert_eq!(posts(&s).await.len(), 1);
     let l = p.ledger().entries().unwrap();
     // the attempt line, then the request-level closing line carrying Claude-side overhead
