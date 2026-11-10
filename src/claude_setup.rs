@@ -417,6 +417,348 @@ impl JsonEdit {
     }
 }
 
+impl JsonEdit {
+    /// `set`, with a plain `~ {human}` summary line.
+    fn update(&mut self, path: Vec<String>, new: Value, human: &str) -> Result<()> {
+        let n = self.summary.len();
+        self.set(path, new, human)?;
+        if self.summary.len() > n {
+            *self.summary.last_mut().expect("pushed") = format!("~ {human}");
+        }
+        Ok(())
+    }
+}
+
+/// The first word of a shell command line, unquoted, and the rest verbatim. None when the
+/// word is not a plain path (unquoted shell syntax, unbalanced quotes).
+fn first_word(cmd: &str) -> Option<(String, &str)> {
+    let s = cmd.trim_start();
+    let mut word = String::new();
+    let mut it = s.char_indices();
+    let mut end = s.len();
+    while let Some((i, c)) = it.next() {
+        match c {
+            c if c.is_whitespace() => {
+                end = i;
+                break;
+            }
+            '\'' => loop {
+                match it.next()? {
+                    (_, '\'') => break,
+                    (_, ch) => word.push(ch),
+                }
+            },
+            '"' => loop {
+                match it.next()? {
+                    (_, '"') => break,
+                    (_, '\\') => word.push(it.next()?.1),
+                    (_, ch) if "$`".contains(ch) => return None,
+                    (_, ch) => word.push(ch),
+                }
+            },
+            '\\' => word.push(it.next()?.1),
+            c if c.is_ascii_alphanumeric() || "/._-+:=@%,".contains(c) => word.push(c),
+            _ => return None,
+        }
+    }
+    (!word.is_empty()).then(|| (word, &s[end..]))
+}
+
+/// A middleman binary path: absolute, file name `middleman` (or `middleman.exe`).
+fn is_middleman_path(p: &str) -> bool {
+    let p = Path::new(p);
+    p.is_absolute()
+        && p.file_name()
+            .is_some_and(|n| n == "middleman" || n == "middleman.exe")
+}
+
+/// For a command middleman wrote (`<middleman> <sub> ...`): the binary path and the rest.
+fn our_command<'a>(cmd: &'a str, sub: &str) -> Option<(String, &'a str)> {
+    let (word, rest) = first_word(cmd)?;
+    let after = rest.trim_start();
+    let sub_ok = after == sub
+        || after
+            .strip_prefix(sub)
+            .is_some_and(|r| r.starts_with(char::is_whitespace));
+    (is_middleman_path(&word) && sub_ok).then_some((word, rest))
+}
+
+/// The same command pointing at `exe` (None when it already does).
+fn repoint(cmd: &str, sub: &str, exe: &str) -> Option<String> {
+    let (word, rest) = our_command(cmd, sub)?;
+    (word != exe).then(|| format!("{}{rest}", shell_quote(exe)))
+}
+
+pub struct RefreshOptions {
+    pub home: PathBuf,
+    /// Projects to look at (the current dir, and every project `setup claude` wrote to).
+    pub project_dirs: Vec<PathBuf>,
+    pub exe: PathBuf,
+    /// Used only when an existing MCP entry names no `--config`.
+    pub config_path: PathBuf,
+}
+
+/// The project a file written by `setup claude --scope project` belongs to.
+fn project_dir_of(file: &Path, home: &Path) -> Option<PathBuf> {
+    let parent = file.parent()?;
+    let dir = match file.file_name()?.to_str()? {
+        ".mcp.json" => parent.to_path_buf(),
+        "settings.json" if parent.file_name()? == ".claude" => parent.parent()?.to_path_buf(),
+        "CLAUDE.md" if parent != home.join(".claude") => parent.to_path_buf(),
+        _ => return None,
+    };
+    (dir != home).then_some(dir)
+}
+
+/// `cwd`, then every existing project directory named in a (not undone) backup manifest.
+pub fn installed_project_dirs(home: &Path, cwd: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![cwd.to_path_buf()];
+    let mut manifests: Vec<PathBuf> = std::fs::read_dir(backups_root(home))
+        .map(|r| {
+            r.filter_map(|e| e.ok().map(|e| e.path().join("manifest.json")))
+                .filter(|p| p.is_file())
+                .collect()
+        })
+        .unwrap_or_default();
+    manifests.sort();
+    for m in manifests {
+        let Some(man) = std::fs::read_to_string(&m)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Manifest>(&t).ok())
+        else {
+            continue;
+        };
+        for f in man.files {
+            if let Some(d) = project_dir_of(&f.path, home) {
+                if d.is_dir() && !dirs.contains(&d) {
+                    dirs.push(d);
+                }
+            }
+        }
+    }
+    dirs
+}
+
+fn refresh_mcp(e: &mut JsonEdit, o: &RefreshOptions, notes: &mut Vec<String>) -> Result<()> {
+    let path = p(&["mcpServers", "middleman"]);
+    let Some(cur) = get(&e.value, &path).cloned() else {
+        return Ok(());
+    };
+    let cmd = cur.get("command").and_then(Value::as_str).unwrap_or("");
+    let args: Vec<&str> = cur
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !is_middleman_path(cmd) || args.first() != Some(&"mcp") {
+        notes.push(format!(
+            "{}: the `middleman` MCP entry does not run a middleman binary (`{}`); left alone",
+            pretty(&e.path),
+            crate::fsutil::clean(cmd, 80)
+        ));
+        return Ok(());
+    }
+    let cfg = args
+        .iter()
+        .position(|a| *a == "--config")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| o.config_path.display().to_string());
+    let exe = o.exe.display().to_string();
+    let mut new = cur.clone();
+    new["command"] = json!(exe);
+    new["args"] = json!(["mcp", "--config", cfg]);
+    if new == cur {
+        return Ok(());
+    }
+    let mut what = vec![];
+    if cmd != exe {
+        what.push(format!("now starts {} (was {})", pretty(&o.exe), cmd));
+    }
+    if new["args"] != cur["args"] {
+        what.push("arguments updated".into());
+    }
+    e.update(path, new, &format!("MCP server: {}", what.join(", ")))
+}
+
+fn refresh_settings(e: &mut JsonEdit, o: &RefreshOptions) -> Result<()> {
+    let exe = o.exe.display().to_string();
+    let path = p(&["hooks", "UserPromptSubmit"]);
+    let groups = get(&e.value, &path)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for (i, g) in groups.iter().enumerate() {
+        let Some(hooks) = g.get("hooks").and_then(Value::as_array) else {
+            continue;
+        };
+        let mut new_g = g.clone();
+        let mut what = vec![];
+        for (j, h) in hooks.iter().enumerate() {
+            let Some(cmd) = h.get("command").and_then(Value::as_str) else {
+                continue;
+            };
+            if our_command(cmd, "route").is_none() || !cmd.contains("route --hook") {
+                continue;
+            }
+            let nh = &mut new_g["hooks"][j];
+            if let Some(c) = repoint(cmd, "route", &exe) {
+                nh["command"] = json!(c);
+                what.push(format!("command now runs {}", pretty(&o.exe)));
+            }
+            let t = h.get("timeout").and_then(Value::as_f64);
+            if t.is_none_or(|t| t < HOOK_TIMEOUT_S as f64) {
+                nh["timeout"] = json!(HOOK_TIMEOUT_S);
+                what.push(format!(
+                    "timeout {} -> {HOOK_TIMEOUT_S} s (a `cheap:` prompt runs inside the hook)",
+                    t.map(|t| format!("{t} s"))
+                        .unwrap_or_else(|| "default".into())
+                ));
+            }
+        }
+        if &new_g != g {
+            let n = e.summary.len();
+            e.replace_item(path.clone(), i, new_g, "")?;
+            e.summary[n] = format!("~ prompt hook: {}", what.join(", "));
+        }
+    }
+    let sl = p(&["statusLine", "command"]);
+    if let Some(cmd) = get(&e.value, &sl).and_then(Value::as_str) {
+        if let Some(c) = repoint(cmd, "statusline", &exe) {
+            e.update(
+                sl,
+                json!(c),
+                &format!("status line now runs {}", pretty(&o.exe)),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn replace_md_block(text: &str, block: &str) -> Option<String> {
+    let (a, b) = (text.find(MD_BEGIN)?, text.find(MD_END)?);
+    if b < a {
+        return None;
+    }
+    let mut end = b + MD_END.len();
+    if text[end..].starts_with('\n') {
+        end += 1;
+    }
+    Some(format!("{}{}{}", &text[..a], block, &text[end..]))
+}
+
+/// The managed block between the markers, as it is in `text`.
+fn md_block_in(text: &str) -> Option<String> {
+    let (a, b) = (text.find(MD_BEGIN)?, text.find(MD_END)?);
+    (b > a).then(|| {
+        let end = b + MD_END.len();
+        let end = if text[end..].starts_with('\n') {
+            end + 1
+        } else {
+            end
+        };
+        text[a..end].to_string()
+    })
+}
+
+/// `setup claude --refresh`: bring entries that middleman wrote (and that still exist) up to
+/// this version: MCP command and args, hook command and timeout, status line command, the
+/// CLAUDE.md block. Never adds anything, never touches entries that are not middleman's.
+/// Files that cannot be parsed are skipped with a note.
+pub fn refresh_plan(o: &RefreshOptions) -> Plan {
+    let mut plan = Plan::default();
+    let mut seen = std::collections::HashSet::new();
+    let mut fresh = |f: &Path| {
+        f.is_file() && seen.insert(std::fs::canonicalize(f).unwrap_or_else(|_| f.to_path_buf()))
+    };
+    let projects = &o.project_dirs;
+    let mcp = std::iter::once((o.home.join(".claude.json"), 0o600))
+        .chain(projects.iter().map(|d| (d.join(".mcp.json"), 0o644)));
+    for (f, mode) in mcp.collect::<Vec<_>>() {
+        if !fresh(&f) {
+            continue;
+        }
+        match JsonEdit::open(f.clone()) {
+            Ok(mut e) => match refresh_mcp(&mut e, o, &mut plan.notes) {
+                Ok(()) => plan.files.extend(e.finish(mode)),
+                Err(err) => plan.notes.push(format!("skipped {}: {err:#}", pretty(&f))),
+            },
+            Err(err) => plan.notes.push(format!("skipped {}: {err:#}", pretty(&f))),
+        }
+    }
+    let settings = std::iter::once(o.home.join(".claude").join("settings.json")).chain(
+        projects
+            .iter()
+            .map(|d| d.join(".claude").join("settings.json")),
+    );
+    for f in settings.collect::<Vec<_>>() {
+        if !fresh(&f) {
+            continue;
+        }
+        match JsonEdit::open(f.clone()).and_then(|mut e| refresh_settings(&mut e, o).map(|_| e)) {
+            Ok(e) => plan.files.extend(e.finish(0o644)),
+            Err(err) => plan.notes.push(format!("skipped {}: {err:#}", pretty(&f))),
+        }
+    }
+    let mds = std::iter::once(o.home.join(".claude").join("CLAUDE.md"))
+        .chain(projects.iter().map(|d| d.join("CLAUDE.md")));
+    for f in mds.collect::<Vec<_>>() {
+        if !fresh(&f) {
+            continue;
+        }
+        let Ok((_, before)) = read_text(&f) else {
+            continue;
+        };
+        let Some(after) = replace_md_block(&before, &md_block()) else {
+            continue;
+        };
+        if after != before {
+            plan.files.push(FilePlan {
+                path: f,
+                existed: true,
+                changes: vec!["~ middleman block between its markers".into()],
+                summary: vec!["~ the middleman block updated to this version's text".into()],
+                reverts: vec![Revert::MdBlock {
+                    before: md_block_in(&before),
+                }],
+                before,
+                after,
+                new_mode: 0o644,
+            });
+        }
+    }
+    plan
+}
+
+/// Doctor: would `setup claude --refresh` change anything?
+pub fn outdated_check(o: &RefreshOptions) -> Check {
+    let plan = refresh_plan(o);
+    if plan.is_empty() {
+        return Check::optional(
+            "Claude Code: wiring up to date",
+            true,
+            "matches what this version writes",
+        );
+    }
+    let what: Vec<String> = plan
+        .files
+        .iter()
+        .flat_map(|f| {
+            f.summary
+                .iter()
+                .map(move |s| format!("{}: {}", pretty(&f.path), s.trim_start_matches("~ ")))
+        })
+        .collect();
+    Check::optional(
+        "Claude Code: wiring up to date",
+        false,
+        format!(
+            "outdated ({}); run `middleman setup claude --refresh`",
+            what.join("; ")
+        ),
+    )
+}
+
 fn is_our_hook(cmd: &str) -> bool {
     cmd.contains("middleman") && cmd.contains("route --hook")
 }
@@ -766,12 +1108,16 @@ pub fn undo(backups: &Path) -> Result<Vec<String>> {
             log.push(format!("{} no longer exists; skipped", pretty(&f.path)));
             continue;
         }
-        let is_md = f
-            .reverts
-            .iter()
-            .any(|r| matches!(r, Revert::MdBlock { .. }));
-        let after = if is_md {
-            remove_md_block(&now)
+        let md = f.reverts.iter().find_map(|r| match r {
+            Revert::MdBlock { before } => Some(before),
+            _ => None,
+        });
+        let after = if let Some(before) = md {
+            // a refreshed block goes back to its old text; an added one is removed
+            match before {
+                Some(b) => replace_md_block(&now, b).unwrap_or(now.clone()),
+                None => remove_md_block(&now),
+            }
         } else {
             let mut v = parse_json(&f.path, &now)?;
             revert_json(&mut v, &f.reverts);
@@ -1101,6 +1447,220 @@ mod tests {
         assert!(paths.contains(&home.join("proj/.mcp.json")));
         assert!(paths.contains(&home.join("proj/.claude/settings.json")));
         assert!(paths.contains(&home.join("proj/CLAUDE.md")));
+    }
+
+    #[test]
+    fn first_word_parsing() {
+        assert_eq!(
+            first_word("/a/middleman route --hook"),
+            Some(("/a/middleman".into(), " route --hook"))
+        );
+        assert_eq!(
+            first_word("'/a b/middleman' statusline"),
+            Some(("/a b/middleman".into(), " statusline"))
+        );
+        assert_eq!(
+            first_word(r"'/it'\''s/middleman' x"),
+            Some(("/it's/middleman".into(), " x"))
+        );
+        assert_eq!(first_word("x;/a/middleman route --hook"), None);
+        assert_eq!(first_word("$(evil)/middleman route --hook"), None);
+        assert_eq!(first_word("'/unbalanced"), None);
+        assert!(our_command("/a/middleman route --hook", "route").is_some());
+        assert!(our_command("/a/middleman routex", "route").is_none());
+        assert!(
+            our_command("middleman route --hook", "route").is_none(),
+            "not absolute"
+        );
+        assert!(our_command("/a/not-middleman route --hook", "route").is_none());
+        assert!(our_command("~/my.sh | /a/middleman statusline", "statusline").is_none());
+    }
+
+    /// What 0.2.0's `setup claude` wrote (5 s hook timeout, the old binary path), next to
+    /// entries that are not middleman's.
+    fn old_wiring(home: &Path) -> Vec<(PathBuf, String)> {
+        let files = vec![
+            (
+                home.join(".claude.json"),
+                r#"{"numStartups": 3, "mcpServers": {"middleman": {"type": "stdio", "command": "/old/bin/middleman", "args": ["mcp", "--config", "/cfg/custom.toml"], "env": {"X": "1"}}, "other": {"command": "npx", "args": ["x"]}}}"#,
+            ),
+            (
+                home.join(".claude/settings.json"),
+                r#"{"model": "opus", "permissions": {"allow": ["Bash(ls)"]},
+                   "hooks": {"UserPromptSubmit": [
+                       {"hooks": [{"type": "command", "command": "/usr/local/bin/other-hook.sh", "timeout": 5}]},
+                       {"hooks": [{"type": "command", "command": "/old/bin/middleman route --hook --config /cfg/custom.toml", "timeout": 5}]}],
+                     "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/old/bin/middleman-ish"}]}]},
+                   "statusLine": {"type": "command", "command": "/old/bin/middleman statusline --config /cfg/custom.toml", "padding": 0}}"#,
+            ),
+            (
+                home.join(".claude/CLAUDE.md"),
+                "# mine\n\n<!-- middleman:begin (managed by `middleman setup claude`) -->\nold text\n<!-- middleman:end -->\n\nafter\n",
+            ),
+            (
+                home.join("proj/.mcp.json"),
+                r#"{"mcpServers": {"middleman": {"type": "stdio", "command": "/old/bin/middleman", "args": ["mcp", "--config", "/cfg/custom.toml"], "env": {}}}}"#,
+            ),
+            (
+                home.join("proj/.claude/settings.json"),
+                r#"{"statusLine": {"type": "command", "command": "~/my.sh | /old/bin/middleman statusline --middleman-only"}}"#,
+            ),
+        ];
+        files
+            .into_iter()
+            .map(|(p, t)| {
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, t).unwrap();
+                (p, t.to_string())
+            })
+            .collect()
+    }
+
+    fn refresh_opts(home: &Path) -> RefreshOptions {
+        RefreshOptions {
+            home: home.to_path_buf(),
+            project_dirs: vec![home.join("proj")],
+            exe: PathBuf::from("/opt/mm/middleman"),
+            config_path: home.join(".config/middleman/config.toml"),
+        }
+    }
+
+    #[test]
+    fn refresh_updates_only_middleman_entries_and_backs_up() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        let orig = old_wiring(home);
+        let o = refresh_opts(home);
+        assert!(!outdated_check(&o).ok);
+        let pl = refresh_plan(&o);
+        let text = pl.render();
+        assert!(text.contains("timeout 5 s -> 150 s"), "{text}");
+        assert!(
+            text.contains("status line now runs /opt/mm/middleman"),
+            "{text}"
+        );
+        assert!(
+            text.contains("MCP server: now starts /opt/mm/middleman (was /old/bin/middleman)"),
+            "{text}"
+        );
+        assert!(text.contains("the middleman block updated"), "{text}");
+        let paths: Vec<_> = pl.files.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(paths.len(), 4, "{paths:?}");
+        assert!(!paths.contains(&home.join("proj/.claude/settings.json")));
+
+        let log = apply(&pl, &backups_root(home)).unwrap();
+        assert_eq!(log.iter().filter(|l| l.starts_with("backed up")).count(), 4);
+
+        let cj = read(&home.join(".claude.json"));
+        assert_eq!(cj["numStartups"], 3);
+        assert_eq!(
+            cj["mcpServers"]["other"],
+            json!({"command": "npx", "args": ["x"]})
+        );
+        assert_eq!(
+            cj["mcpServers"]["middleman"],
+            json!({"type": "stdio", "command": "/opt/mm/middleman", "args": ["mcp", "--config", "/cfg/custom.toml"], "env": {"X": "1"}})
+        );
+        let st = read(&home.join(".claude/settings.json"));
+        let ups = st["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(ups.len(), 2);
+        assert_eq!(
+            ups[0],
+            json!({"hooks": [{"type": "command", "command": "/usr/local/bin/other-hook.sh", "timeout": 5}]}),
+            "an unrelated hook keeps its 5 s timeout"
+        );
+        assert_eq!(
+            ups[1],
+            json!({"hooks": [{"type": "command", "command": "/opt/mm/middleman route --hook --config /cfg/custom.toml", "timeout": 150}]})
+        );
+        assert_eq!(
+            st["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "/old/bin/middleman-ish"
+        );
+        assert_eq!(
+            st["statusLine"],
+            json!({"type": "command", "command": "/opt/mm/middleman statusline --config /cfg/custom.toml", "padding": 0})
+        );
+        assert_eq!(
+            st["permissions"]["allow"],
+            json!(["Bash(ls)"]),
+            "nothing added"
+        );
+        let md = std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap();
+        assert!(md.starts_with("# mine\n\n<!-- middleman:begin"));
+        assert!(md.ends_with("<!-- middleman:end -->\n\nafter\n"));
+        assert!(!md.contains("old text") && md.contains("mcp__middleman__delegate_task"));
+        let pm = read(&home.join("proj/.mcp.json"));
+        assert_eq!(
+            pm["mcpServers"]["middleman"]["command"],
+            "/opt/mm/middleman"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("proj/.claude/settings.json")).unwrap(),
+            orig[4].1,
+            "a foreign status line that chains middleman is not touched"
+        );
+
+        // up to date now
+        assert!(refresh_plan(&o).is_empty());
+        assert!(outdated_check(&o).ok);
+        // the project is found again from the backup manifest
+        assert!(installed_project_dirs(home, &home.join("elsewhere")).contains(&home.join("proj")));
+
+        // undo restores every byte
+        undo(&backups_root(home)).unwrap();
+        for (p, t) in &orig {
+            assert_eq!(&std::fs::read_to_string(p).unwrap(), t, "{}", p.display());
+        }
+    }
+
+    #[test]
+    fn refresh_never_adds_and_reverts_a_changed_md_to_the_old_block() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude.json"), r#"{"a": 1}"#).unwrap();
+        std::fs::write(
+            home.join(".claude/settings.json"),
+            r#"{"statusLine": {"type": "command", "command": "~/my.sh"}}"#,
+        )
+        .unwrap();
+        std::fs::write(home.join(".claude/CLAUDE.md"), "# no block\n").unwrap();
+        let o = refresh_opts(home);
+        let pl = refresh_plan(&o);
+        assert!(pl.is_empty(), "{}", pl.render());
+        assert!(!home.join("proj").exists());
+        assert!(outdated_check(&o).ok);
+        // an `mcpServers.middleman` that is not a middleman binary is reported, not changed
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"mcpServers": {"middleman": {"command": "npx", "args": ["some-middleman"]}}}"#,
+        )
+        .unwrap();
+        let pl = refresh_plan(&o);
+        assert!(pl.is_empty());
+        assert!(
+            pl.notes.iter().any(|n| n.contains("left alone")),
+            "{:?}",
+            pl.notes
+        );
+        // broken JSON is skipped with a note, not an error
+        std::fs::write(home.join(".claude/settings.json"), "{nope").unwrap();
+        assert!(refresh_plan(&o).notes.iter().any(|n| n.contains("skipped")));
+
+        // CLAUDE.md edited after a refresh: undo puts the old block back, keeps the edit
+        let old = format!("top\n{MD_BEGIN}\nold\n{MD_END}\n");
+        std::fs::write(home.join(".claude/CLAUDE.md"), &old).unwrap();
+        std::fs::write(home.join(".claude/settings.json"), "{}").unwrap();
+        apply(&refresh_plan(&o), &backups_root(home)).unwrap();
+        let mut md = std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap();
+        md.push_str("mine\n");
+        std::fs::write(home.join(".claude/CLAUDE.md"), &md).unwrap();
+        undo(&backups_root(home)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap(),
+            format!("{old}mine\n")
+        );
     }
 
     #[test]
