@@ -95,6 +95,10 @@ impl fmt::Display for Secret {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// True when `[paths] roots` contained the `{project}` placeholder (resolved at load time
+    /// to the git root of the working directory; dropped when it would be $HOME or `/`).
+    #[serde(skip)]
+    pub project_root_placeholder: bool,
     #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
@@ -583,6 +587,25 @@ impl KeyStatus {
     }
 }
 
+/// `[paths] roots` entry meaning "the project the current Claude Code session is in".
+pub const PROJECT_ROOT_PLACEHOLDER: &str = "{project}";
+
+/// The git root at or above `cwd` (else `cwd`), canonicalized. `None` for `$HOME`, `/`, or a
+/// directory that does not exist, so a session started in the home folder reads nothing.
+pub fn project_root_for(cwd: &Path) -> Option<PathBuf> {
+    let cwd = std::fs::canonicalize(cwd).ok()?;
+    let root = cwd
+        .ancestors()
+        .find(|d| d.join(".git").exists())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cwd.clone());
+    let home = std::env::var_os("HOME").and_then(|h| std::fs::canonicalize(h).ok());
+    if root.parent().is_none() || Some(&root) == home.as_ref() {
+        return None;
+    }
+    Some(root)
+}
+
 pub fn expand_tilde(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
     if let Some(rest) = s.strip_prefix("~/") {
@@ -620,16 +643,22 @@ fn is_loopback_ipv4_url(u: &str) -> bool {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        Self::load_in(path, &cwd)
+    }
+
+    /// Load the user config, resolving the `{project}` root against `cwd`.
+    pub fn load_in(path: &Path, cwd: &Path) -> Result<Config> {
         let path = expand_tilde(path);
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("cannot read config {}", path.display()))?;
-        Self::from_toml(&text)
+        Self::from_toml_in(&text, cwd)
     }
 
     /// Load the user config, then apply the nearest `.middleman.toml` at or above `cwd`
     /// (tighten-only). Returns the config and the overlay path if one was applied.
     pub fn load_with_project(path: &Path, cwd: &Path) -> Result<(Config, Option<PathBuf>)> {
-        let mut cfg = Self::load(path)?;
+        let mut cfg = Self::load_in(path, cwd)?;
         let mut dir = Some(cwd);
         while let Some(d) = dir {
             let f = d.join(PROJECT_FILE);
@@ -648,10 +677,36 @@ impl Config {
     }
 
     pub fn from_toml(text: &str) -> Result<Config> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        Self::from_toml_in(text, &cwd)
+    }
+
+    /// Parse a config, resolving the `{project}` root placeholder against `cwd`.
+    pub fn from_toml_in(text: &str, cwd: &Path) -> Result<Config> {
         let mut cfg: Config = toml::from_str(text).context("invalid config TOML")?;
         cfg.normalize();
+        cfg.resolve_project_root(cwd);
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Replace the `{project}` placeholder in `[paths] roots` with the project the session is
+    /// in: the git root at or above `cwd`, else `cwd`. Never resolves to `$HOME` or `/`
+    /// (it is dropped instead, so nothing extra becomes readable: fail-closed).
+    fn resolve_project_root(&mut self, cwd: &Path) {
+        let before = self.paths.roots.len();
+        self.paths
+            .roots
+            .retain(|r| r.as_os_str() != PROJECT_ROOT_PLACEHOLDER);
+        if self.paths.roots.len() == before {
+            return;
+        }
+        self.project_root_placeholder = true;
+        if let Some(root) = project_root_for(cwd) {
+            if !self.paths.roots.iter().any(|r| r == &root) {
+                self.paths.roots.push(root);
+            }
+        }
     }
 
     fn normalize(&mut self) {
@@ -676,8 +731,8 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.paths.roots.is_empty() {
-            bail!("paths.roots must list at least one directory");
+        if self.paths.roots.is_empty() && !self.project_root_placeholder {
+            bail!("paths.roots must list at least one directory (or \"{{project}}\")");
         }
         for r in &self.paths.roots {
             if !r.is_absolute() {
@@ -1020,6 +1075,28 @@ task_kinds = ["snippet", "docstring"]
         assert!(or.enabled);
         assert_eq!(or.model.as_deref(), Some("qwen/qwen3.8-flash"));
         assert!(!c.providers["deepseek"].enabled);
+    }
+
+    #[test]
+    fn project_placeholder_resolves_to_git_root_and_never_home() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+        let text = "[paths]\nroots = [\"{project}\"]\n";
+        let c = Config::from_toml_in(text, &repo.join("src/deep")).unwrap();
+        assert!(c.project_root_placeholder);
+        assert_eq!(c.paths.roots, vec![std::fs::canonicalize(&repo).unwrap()]);
+        // no git repo: the directory itself
+        let plain = d.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let c = Config::from_toml_in(text, &plain).unwrap();
+        assert_eq!(c.paths.roots, vec![std::fs::canonicalize(&plain).unwrap()]);
+        // filesystem root: nothing becomes readable, config still loads
+        let c = Config::from_toml_in(text, Path::new("/")).unwrap();
+        assert!(c.paths.roots.is_empty());
+        // without the placeholder an empty list is still an error
+        assert!(Config::from_toml_in("[paths]\nroots = []\n", &plain).is_err());
     }
 
     #[test]

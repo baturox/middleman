@@ -239,7 +239,7 @@ pub fn set_mode(text: &str, mode: RoutingMode) -> Result<String> {
 /// Make sure `dir` is readable: append it to `[paths] roots` unless a root already covers it.
 pub fn add_root(text: &str, dir: &Path) -> Result<String> {
     let cfg = Config::from_toml(text)?;
-    if cfg.paths.roots.iter().any(|r| dir.starts_with(r)) {
+    if cfg.project_root_placeholder || cfg.paths.roots.iter().any(|r| dir.starts_with(r)) {
         return Ok(text.to_string());
     }
     let mut doc: toml_edit::DocumentMut = text.parse().context("config is not valid TOML")?;

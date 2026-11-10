@@ -295,9 +295,10 @@ impl Wizard {
         let ui = self.ui;
         let (info, warns) = wizard::inspect_project(&self.cwd, &self.home);
         let suggested = info.git_root.clone().unwrap_or_else(|| self.cwd.clone());
-        let user_roots = |dir: &Path| {
+        // User scope: readable root = whichever project the Claude Code session is in.
+        let user_roots = |_dir: &Path| {
             if self.a.root.is_empty() {
-                vec![dir.to_path_buf()]
+                vec![PathBuf::from(middleman::config::PROJECT_ROOT_PLACEHOLDER)]
             } else {
                 self.a.root.clone()
             }
@@ -957,7 +958,18 @@ impl Wizard {
             );
         }
         if let Ok(c) = Config::load(&self.cfg_path) {
-            let roots: Vec<String> = c.paths.roots.iter().map(|r| pretty(r)).collect();
+            let mut roots: Vec<String> = c.paths.roots.iter().map(|r| pretty(r)).collect();
+            if c.project_root_placeholder {
+                roots.retain(|r| {
+                    middleman::config::project_root_for(&self.cwd)
+                        .map(|p| pretty(&p) != *r)
+                        .unwrap_or(true)
+                });
+                roots.insert(
+                    0,
+                    "the project each Claude Code session is open in (its git root)".into(),
+                );
+            }
             out!(
                 "{}",
                 ui.row(
@@ -965,7 +977,9 @@ impl Wizard {
                     &format!(
                         "{} {}",
                         roots.join(", "),
-                        ui.dim("(middleman only reads files here; edit [paths] roots to add more)")
+                        ui.dim(
+                            "(middleman only reads files there; never your home folder as a whole)"
+                        )
                     )
                 )
             );
@@ -1365,10 +1379,12 @@ async fn non_interactive(cfg_path: PathBuf, a: InitArgs) -> Result<()> {
         Some(m) => parse_mode(m)?,
         None => DEFAULT_MODE,
     };
-    let roots = if a.root.is_empty() {
-        vec![cwd.clone()]
-    } else {
+    let roots = if !a.root.is_empty() {
         a.root.clone()
+    } else if scope == Scope::User {
+        vec![PathBuf::from(middleman::config::PROJECT_ROOT_PLACEHOLDER)]
+    } else {
+        vec![cwd.clone()]
     };
     let o = InitOptions {
         scope,

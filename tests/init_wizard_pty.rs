@@ -255,7 +255,16 @@ fn wizard_bad_key_then_good_key_writes_config() {
     let or = &c.providers["openrouter"];
     assert_eq!(or.key_source, Some(middleman::keystore::KeySource::File));
     assert!(or.model.is_none());
-    assert_eq!(c.paths.roots, vec![proj.clone()]);
+    // user scope: the readable root is whichever project the session is in, not a fixed path
+    assert!(c.project_root_placeholder);
+    let in_proj = middleman::config::Config::load_in(&cfg_path, &proj).unwrap();
+    assert_eq!(
+        in_proj.paths.roots,
+        vec![std::fs::canonicalize(&proj).unwrap()]
+    );
+    assert!(std::fs::read_to_string(&cfg_path)
+        .unwrap()
+        .contains(middleman::config::PROJECT_ROOT_PLACEHOLDER));
     let text = std::fs::read_to_string(&cfg_path).unwrap();
     assert!(!text.contains(GOOD));
     assert_eq!(
