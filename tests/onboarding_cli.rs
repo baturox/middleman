@@ -80,8 +80,19 @@ fn onboarding_flow_in_temp_home() {
     assert_eq!(out.trim(), "🛡 middleman ✓ openrouter · 0 delegated today");
 
     let (out, _) = run(mm(home).args(["setup", "claude", "--dry-run", "--config", &cfg_s]));
-    assert!(out.contains("+ mcpServers.middleman"), "{out}");
+    assert!(out.contains("+ register the middleman MCP server"), "{out}");
+    assert!(!out.contains("mcpServers") && !out.contains('{'), "{out}");
+    assert!(!out.contains('\x1b'), "no escape codes when piped: {out:?}");
     assert!(out.contains("dry run: nothing was changed"));
+    let (out, _) = run(mm(home).args([
+        "setup",
+        "claude",
+        "--dry-run",
+        "--details",
+        "--config",
+        &cfg_s,
+    ]));
+    assert!(out.contains("+ mcpServers.middleman"), "{out}");
     assert!(!home.join(".claude.json").exists());
     assert!(!home.join(".claude").exists());
 
@@ -177,4 +188,148 @@ fn missing_key_message_is_actionable() {
         .args(["statusline", "--config", &cfg.display().to_string()])
         .write_stdin("{}"));
     assert!(out.contains("✗ no key for openrouter"), "{out}");
+}
+
+/// A mock OpenRouter: `GET /api/v1/key` accepts only `GOOD`, `/api/v1/models` lists models.
+fn mock_openrouter(rt: &tokio::runtime::Runtime) -> wiremock::MockServer {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    rt.block_on(async {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/key"))
+            .and(header("authorization", format!("Bearer {KEY}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"label": "middleman test", "limit": 10, "limit_remaining": 7.5, "usage": 2.5}
+            })))
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/key"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&s)
+            .await;
+        s
+    })
+}
+
+#[test]
+fn non_interactive_init_checks_and_stores_the_key() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = mock_openrouter(&rt);
+    let base = format!("{}/api/v1", server.uri());
+    let d = tempfile::tempdir().unwrap();
+    let home = d.path();
+    let cfg = home.join(".config/middleman/config.toml");
+    let cfg_s = cfg.display().to_string();
+
+    // no TTY and no --yes: a clear error, nothing written
+    let o = mm(home)
+        .args(["init", "--config", &cfg_s])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("--yes"), "{err}");
+    assert!(!cfg.exists());
+
+    // unknown provider without --base-url
+    let o = mm(home)
+        .args(["init", "--yes", "--providers", "nope", "--config", &cfg_s])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&o.stderr).contains("--base-url"));
+    // a custom remote endpoint needs a key
+    let o = mm(home)
+        .args([
+            "init",
+            "--yes",
+            "--providers",
+            "work",
+            "--base-url",
+            "https://llm.example.invalid/v1",
+            "--config",
+            &cfg_s,
+        ])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&o.stderr).contains("--key-stdin"));
+    assert!(!cfg.exists());
+
+    // a wrong key: plain-words advice, nothing written or stored
+    let o = mm(home)
+        .env("MIDDLEMAN_TEST_BASE_URL_OPENROUTER", &base)
+        .args(["init", "--yes", "--key-stdin", "--config", &cfg_s])
+        .write_stdin("sk-or-v1-this-is-the-wrong-key-0000\n")
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("rejected this key (HTTP 401)"), "{err}");
+    assert!(err.contains("openrouter.ai/settings/keys"), "{err}");
+    assert!(!err.contains("wrong-key"));
+    assert!(!cfg.exists());
+    assert!(!home.join(".config/middleman/keys/openrouter").exists());
+
+    // the right key: OpenRouter is the default provider, confirm the default mode
+    let (out, err) = run(mm(home)
+        .env("MIDDLEMAN_TEST_BASE_URL_OPENROUTER", &base)
+        .args(["init", "--yes", "--key-stdin", "--config", &cfg_s])
+        .write_stdin(format!("{KEY}\n")));
+    assert!(out.contains("wrote"), "{out}");
+    assert!(err.contains("label middleman test"), "{err}");
+    let c = middleman::config::Config::load(&cfg).unwrap();
+    assert_eq!(c.routing.mode, middleman::config::RoutingMode::Confirm);
+    assert_eq!(
+        c.providers["openrouter"].key_source,
+        Some(middleman::keystore::KeySource::File)
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join(".config/middleman/keys/openrouter")).unwrap(),
+        KEY
+    );
+
+    // --list: grouped, no legacy/alias presets, key status without the value
+    let (out, _) = run(mm(home).args(["init", "--list", "--config", &cfg_s]));
+    assert!(
+        out.contains("Recommended") && out.contains("Direct vendors"),
+        "{out}"
+    );
+    assert!(out.find("openrouter").unwrap() < out.find("deepseek").unwrap());
+    assert!(!out.contains("yapayzekalab") && !out.contains("YZLAB"));
+    assert!(out.contains("✓ key stored"), "{out}");
+    assert!(out.contains("— not set"), "{out}");
+    let (out2, _) = run(mm(home).args(["provider", "list", "--all", "--config", &cfg_s]));
+    assert_eq!(out, out2);
+
+    // an existing config is merged, not overwritten, when flags ask for a change
+    let (out, _) = run(mm(home).args([
+        "init",
+        "--yes",
+        "--providers",
+        "deepseek",
+        "--mode",
+        "explicit",
+        "--config",
+        &cfg_s,
+    ]));
+    assert!(out.contains("existing config merged"), "{out}");
+    let c = middleman::config::Config::load(&cfg).unwrap();
+    assert!(c.providers.contains_key("openrouter") && c.providers.contains_key("deepseek"));
+    assert_eq!(c.routing.mode, middleman::config::RoutingMode::Explicit);
+
+    // --force starts fresh and keeps a backup
+    run(mm(home).args(["init", "--yes", "--force", "--config", &cfg_s]));
+    let backups = std::fs::read_dir(home.join(".config/middleman"))
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".bak-")
+        })
+        .count();
+    assert_eq!(backups, 1);
+    drop(server);
 }

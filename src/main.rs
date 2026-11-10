@@ -26,7 +26,7 @@ use middleman::pipeline::{DelegateRequest, Pipeline};
 use middleman::providers::presets::{self, Preset};
 use middleman::providers::{ModelInfo, Provider};
 use middleman::pseudo::Vault;
-use middleman::setup::{self, InitOptions, Scope};
+use middleman::setup::{self, Scope};
 use middleman::TaskKind;
 
 /// stdout is the MCP channel in `mcp` mode; CLI subcommands write through this macro.
@@ -42,6 +42,8 @@ macro_rules! note {
         let _ = writeln!(std::io::stderr(), $($t)*);
     }};
 }
+
+mod cli_init;
 
 #[derive(Parser)]
 #[command(
@@ -60,30 +62,40 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Set up middleman: pick a provider, log in or paste a key, choose scope and routing mode
+    /// Guided setup: where to install, provider and key (checked live), routing mode
     Init {
         /// user (all projects) | project (this repo: also writes .middleman.toml)
         #[arg(long)]
         scope: Option<String>,
-        /// Comma-separated presets, e.g. openrouter,deepseek (skips the picker)
+        /// Comma-separated providers, e.g. openrouter,deepseek (skips the picker) [default with --yes: openrouter]
         #[arg(long)]
         providers: Option<String>,
-        /// auto | confirm | explicit
+        /// confirm (ask each time) | auto | explicit (only `cheap:` prompts) [default: confirm]
         #[arg(long)]
         mode: Option<String>,
-        /// Allowed roots [default: current directory]
+        /// Folders middleman may read [default: current directory, or the project]
         #[arg(long)]
         root: Vec<PathBuf>,
-        /// Non-interactive: accept defaults for anything not given (keys come from env vars)
+        /// Non-interactive: use flags and defaults, ask nothing
         #[arg(long)]
         yes: bool,
-        /// Overwrite existing middleman config files
+        /// Non-interactive: read the provider's key from stdin, check it, store it
+        #[arg(long)]
+        key_stdin: bool,
+        /// With --key-stdin: store the key without the free check request
+        #[arg(long)]
+        no_validate: bool,
+        /// Base URL for a local server on another port, or a custom endpoint
+        /// (with `--providers <your-name>`)
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Replace existing middleman config files (each is backed up first)
         #[arg(long)]
         force: bool,
         /// Also run `middleman setup claude --yes` at the end
         #[arg(long)]
         apply: bool,
-        /// List presets and which key env vars are set, then exit
+        /// List providers by group, with key status, then exit
         #[arg(long)]
         list: bool,
     },
@@ -234,7 +246,11 @@ enum ProviderCmd {
         no_validate: bool,
     },
     /// List configured providers and where each key is stored (never the key)
-    List,
+    List {
+        /// Show every available provider by group, with key status
+        #[arg(long)]
+        all: bool,
+    },
     /// Check a provider's key with a free request
     Test { name: String },
     /// Replace a provider's stored key
@@ -266,6 +282,9 @@ enum SetupTarget {
         /// Show the changes and exit
         #[arg(long)]
         dry_run: bool,
+        /// Also show the exact keys and values that change
+        #[arg(long)]
+        details: bool,
         /// Apply without asking
         #[arg(long)]
         yes: bool,
@@ -612,18 +631,37 @@ async fn obtain_key(preset: &Preset, how: KeyHow, no_validate: bool) -> Result<S
         KeyHow::Stdin => read_key_stdin()?,
         KeyHow::Ask => read_key_hidden(preset)?,
     };
+    let ui = middleman::ui::Ui::stderr();
     if how != KeyHow::Login {
-        if let Some(w) = onboard::check_pasted(preset.name, key.expose())? {
-            note!("warning: {w}");
+        if let Some(w) = onboard::check_pasted(preset.label, preset.key_prefix, key.expose())? {
+            note!("{}", ui.warn(&w));
         }
     }
     if !no_validate {
-        note!(
-            "Checking the key with a free request to {}...",
-            preset.base_url
-        );
-        let info = onboard::validate_key(preset.api, preset.base_url, preset.balance, &key).await?;
-        note!("  ok: {}", info.summary());
+        let base = preset.check_base_url();
+        let res = ui
+            .spin(
+                &format!("Checking the key with a free request to {}", preset.host()),
+                onboard::validate_key(preset.api, &base, preset.balance, &key),
+            )
+            .await;
+        match res {
+            Ok(info) => note!(
+                "{}",
+                ui.ok(&format!("{} works: {}", preset.label, info.summary()))
+            ),
+            Err(e) => {
+                let d = onboard::diagnose(
+                    &e,
+                    &onboard::CheckTarget {
+                        label: preset.label,
+                        key_url: preset.key_url,
+                        local: false,
+                    },
+                );
+                bail!("{} {}", d.title, d.advice);
+            }
+        }
     }
     Ok(key)
 }
@@ -640,46 +678,14 @@ fn store(name: &str, key: &Secret) -> Result<KeySource> {
 fn preset_or_bail(name: &str) -> Result<&'static Preset> {
     presets::find(name).with_context(|| {
         format!(
-            "unknown provider {name:?}; presets: {}",
-            presets::PRESETS
+            "unknown provider {name:?}; one of: {} (see `middleman init --list`)",
+            presets::visible()
                 .iter()
                 .map(|p| p.name)
                 .collect::<Vec<_>>()
                 .join(", ")
         )
     })
-}
-
-fn pick_preset() -> Result<&'static Preset> {
-    let list: Vec<&'static Preset> = presets::PRESETS.iter().collect();
-    let items: Vec<String> = list
-        .iter()
-        .map(|p| {
-            let host = p
-                .base_url
-                .split("//")
-                .nth(1)
-                .and_then(|h| h.split('/').next())
-                .unwrap_or("");
-            let hint = match p.name {
-                "openrouter" => "  one key for DeepSeek, Qwen, Kimi, GLM, ... (recommended)",
-                "ollama" | "lmstudio" => "  local, no key",
-                "anthropic" => "  first-party Claude API",
-                _ => "",
-            };
-            format!("{:<13} {host}{hint}", p.name)
-        })
-        .collect();
-    let default = list
-        .iter()
-        .position(|p| p.name == "openrouter")
-        .unwrap_or(0);
-    let i = dialoguer::Select::with_theme(&theme())
-        .with_prompt("Pick a provider")
-        .items(&items)
-        .default(default)
-        .interact()?;
-    Ok(list[i])
 }
 
 fn read_config_text(cfg_path: &Path) -> Result<String> {
@@ -705,7 +711,7 @@ async fn provider_add(
     let text = read_config_text(cfg_path)?;
     let preset = match name {
         Some(n) => preset_or_bail(&n)?,
-        None if interactive() => pick_preset()?,
+        None if interactive() => cli_init::pick_preset()?,
         None => bail!("name the provider, e.g. `middleman provider add openrouter`"),
     };
     if must_exist {
@@ -842,7 +848,8 @@ async fn login(cfg_path: &Path, provider: &str, no_browser: bool, timeout: u64) 
     }
     let preset = preset_or_bail(provider)?;
     let key = browser_login(no_browser, Duration::from_secs(timeout.max(10))).await?;
-    let info = onboard::validate_key(preset.api, preset.base_url, preset.balance, &key).await?;
+    let info =
+        onboard::validate_key(preset.api, &preset.check_base_url(), preset.balance, &key).await?;
     note!("Logged in: {}", info.summary());
     let source = store(provider, &key)?;
     match std::fs::read_to_string(cfg_path) {
@@ -858,24 +865,37 @@ async fn login(cfg_path: &Path, provider: &str, no_browser: bool, timeout: u64) 
 
 // ---------------------------------------------------------------- setup claude
 
-#[allow(clippy::too_many_arguments)]
-fn setup_claude(
-    cfg_path: &Path,
-    scope: &str,
+/// `setup claude` switches; `Default` = preview, ask, wire everything.
+#[derive(Default, Clone, Copy)]
+struct SetupFlags {
     dry_run: bool,
     yes: bool,
     undo: bool,
-    statusline: bool,
-    hook: bool,
-    claude_md: bool,
-    permissions: bool,
-) -> Result<()> {
+    details: bool,
+    no_statusline: bool,
+    no_hook: bool,
+    no_claude_md: bool,
+    no_permissions: bool,
+}
+
+fn styled_log_line(ui: &middleman::ui::Ui, l: &str) -> String {
+    if l.starts_with("backed up") || l.starts_with("undo with") {
+        format!("  {}", ui.dim(l))
+    } else if l.starts_with("updated") || l.starts_with("restored") || l.starts_with("removed") {
+        format!("  {}", ui.ok(l))
+    } else {
+        format!("  {l}")
+    }
+}
+
+fn setup_claude(cfg_path: &Path, scope: &str, f: SetupFlags) -> Result<()> {
     let home = home();
-    if undo {
+    let ui = middleman::ui::Ui::stdout();
+    if f.undo {
         for l in claude_setup::undo(&claude_setup::backups_root(&home))? {
-            say!("{l}");
+            say!("{}", styled_log_line(&ui, &l));
         }
-        say!("Restart Claude Code to pick up the change.");
+        say!("  Restart Claude Code to pick up the change.");
         return Ok(());
     }
     let scope = Scope::parse(scope).context("--scope must be user or project")?;
@@ -892,201 +912,45 @@ fn setup_claude(
         project_dir: cwd(),
         exe: std::env::current_exe().context("cannot find the middleman binary")?,
         config_path,
-        hook,
-        statusline,
-        claude_md,
-        permissions,
+        hook: !f.no_hook,
+        statusline: !f.no_statusline,
+        claude_md: !f.no_claude_md,
+        permissions: !f.no_permissions,
     };
     let plan = claude_setup::plan(&o)?;
-    say!("{}", plan.render().trim_end());
+    say!("{}", plan.render_ui(&ui, f.details).trim_end());
     if plan.is_empty() {
         return Ok(());
     }
-    if dry_run {
-        say!("(dry run: nothing was changed)");
+    if f.dry_run {
+        say!(
+            "\n  {}",
+            ui.dim("(dry run: nothing was changed; --details shows the exact keys)")
+        );
         return Ok(());
     }
-    if !yes {
+    if !f.yes {
         if !interactive() {
             bail!("re-run with --yes to apply without a prompt (or --dry-run to only look)");
         }
+        say!("");
         let ok = dialoguer::Confirm::with_theme(&theme())
-            .with_prompt("Apply these changes? (every file is backed up first)")
+            .with_prompt("Apply these changes?")
             .default(true)
             .interact()?;
         if !ok {
-            say!("Nothing changed.");
+            say!("  Nothing changed.");
             return Ok(());
         }
     }
+    say!("");
     for l in claude_setup::apply(&plan, &claude_setup::backups_root(&home))? {
-        say!("{l}");
+        say!("{}", styled_log_line(&ui, &l));
     }
-    say!("Done. Restart Claude Code (or run /mcp) to load middleman; `middleman doctor` checks everything.");
-    Ok(())
-}
-
-// ---------------------------------------------------------------- init
-
-fn parse_mode(m: &str) -> Result<RoutingMode> {
-    Ok(match m {
-        "auto" => RoutingMode::Auto,
-        "confirm" => RoutingMode::Confirm,
-        "explicit" => RoutingMode::Explicit,
-        _ => bail!("mode must be auto, confirm or explicit"),
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn init(
-    cfg_path: PathBuf,
-    scope: Option<String>,
-    providers: Option<String>,
-    mode: Option<String>,
-    root: Vec<PathBuf>,
-    yes: bool,
-    force: bool,
-    apply: bool,
-) -> Result<()> {
-    let ask = !yes && interactive();
-    let mut key_sources = std::collections::BTreeMap::new();
-    let providers: Vec<String> = match providers {
-        Some(p) => p
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect(),
-        None if ask => {
-            let preset = pick_preset()?;
-            if let Some(env) = preset.key_env {
-                let has_env = std::env::var_os(env).is_some_and(|v| !v.is_empty());
-                let use_env = has_env
-                    && dialoguer::Confirm::with_theme(&theme())
-                        .with_prompt(format!(
-                            "{env} is set in this shell. Use it instead of storing a key?"
-                        ))
-                        .default(false)
-                        .interact()?;
-                if !use_env {
-                    let key = obtain_key(preset, KeyHow::Ask, false).await?;
-                    key_sources.insert(preset.name.to_string(), store(preset.name, &key)?);
-                }
-            }
-            vec![preset.name.to_string()]
-        }
-        None => {
-            let found: Vec<String> = setup::detect_keys()
-                .into_iter()
-                .filter(|k| k.2)
-                .map(|k| k.0.to_string())
-                .collect();
-            if found.is_empty() {
-                vec!["openrouter".into()]
-            } else {
-                found
-            }
-        }
-    };
-    for p in &providers {
-        preset_or_bail(p)?;
-    }
-    let scope = match scope {
-        Some(s) => Scope::parse(&s).context("--scope must be user or project")?,
-        None if ask => {
-            let i = dialoguer::Select::with_theme(&theme())
-                .with_prompt("Where should middleman apply?")
-                .items([
-                    "All my projects (user scope)",
-                    "Only this project (writes .middleman.toml here)",
-                ])
-                .default(0)
-                .interact()?;
-            if i == 0 {
-                Scope::User
-            } else {
-                Scope::Project
-            }
-        }
-        None => Scope::User,
-    };
-    let mode = match mode {
-        Some(m) => parse_mode(&m)?,
-        None if ask => {
-            let i = dialoguer::Select::with_theme(&theme())
-                .with_prompt("When may Claude delegate?")
-                .items([
-                    "auto      when it is safe and pays off (recommended)",
-                    "confirm   show me the plan and ask first",
-                    "explicit  only when I start a prompt with `cheap:`",
-                ])
-                .default(0)
-                .interact()?;
-            [
-                RoutingMode::Auto,
-                RoutingMode::Confirm,
-                RoutingMode::Explicit,
-            ][i]
-        }
-        None => RoutingMode::Auto,
-    };
-    let o = InitOptions {
-        scope,
-        providers: providers.clone(),
-        mode,
-        roots: if root.is_empty() { vec![cwd()] } else { root },
-        config_path: cfg_path.clone(),
-        project_dir: cwd(),
-        force,
-        key_sources: key_sources.clone(),
-    };
-    let existed = cfg_path.exists();
-    for l in setup::init_write(&o)? {
-        say!("{l}");
-    }
-    if existed && !force {
-        // keep the user's config, but record any key we just stored
-        let mut text = std::fs::read_to_string(&cfg_path)?;
-        for (name, src) in &key_sources {
-            text = onboard::upsert_provider(&text, name, Some(*src))?;
-        }
-        if !key_sources.is_empty() {
-            onboard::write_config(&cfg_path, &text)?;
-            say!("recorded the stored key in {}", pretty(&cfg_path));
-        }
-    }
-    for p in &providers {
-        if key_sources.contains_key(p) {
-            continue;
-        }
-        if let Some(env) = preset_or_bail(p)?.key_env {
-            if std::env::var_os(env).is_none() {
-                say!("no key for {p} yet: run `middleman provider add {p}`");
-            }
-        }
-    }
-    let wire = apply
-        || (ask
-            && dialoguer::Confirm::with_theme(&theme())
-                .with_prompt("Connect middleman to Claude Code now? (shows every change first)")
-                .default(true)
-                .interact()?);
-    if wire {
-        say!("");
-        setup_claude(
-            &cfg_path,
-            scope.as_str(),
-            false,
-            apply,
-            false,
-            true,
-            true,
-            true,
-            true,
-        )?;
-    } else {
-        say!("Next: `middleman setup claude` connects it to Claude Code.");
-    }
-    say!("Then `middleman models refresh` fetches current prices, and `middleman doctor` checks it all.");
+    say!(
+        "\n  {}",
+        ui.ok("Done. Restart Claude Code (or run /mcp) to load middleman.")
+    );
     Ok(())
 }
 
@@ -1140,27 +1004,30 @@ async fn real_main() -> Result<ExitCode> {
             mode,
             root,
             yes,
+            key_stdin,
+            no_validate,
+            base_url,
             force,
             apply,
             list,
         } => {
             if list {
-                for p in presets::PRESETS {
-                    let present = p.key_env.map(|k| std::env::var_os(k).is_some());
-                    say!(
-                        "{:<14} {:?} {:<55} key_env={:<20} present={:?} trust={:?} verified={}",
-                        p.name,
-                        p.api,
-                        p.base_url,
-                        p.key_env.unwrap_or("-"),
-                        present,
-                        p.trust,
-                        p.verified
-                    );
-                }
+                say!("{}", cli_init::list(&cfg_path).trim_end());
                 return Ok(ExitCode::SUCCESS);
             }
-            init(cfg_path, scope, providers, mode, root, yes, force, apply).await?;
+            let a = cli_init::InitArgs {
+                scope,
+                providers,
+                mode,
+                root,
+                yes,
+                force,
+                apply,
+                key_stdin,
+                no_validate,
+                base_url,
+            };
+            cli_init::run(cfg_path, a).await?;
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Provider { action } => {
@@ -1197,7 +1064,11 @@ async fn real_main() -> Result<ExitCode> {
                     provider_add(&cfg_path, Some(name), how, no_validate, true).await?;
                     Ok(ExitCode::SUCCESS)
                 }
-                ProviderCmd::List => {
+                ProviderCmd::List { all: true } => {
+                    say!("{}", cli_init::list(&cfg_path).trim_end());
+                    Ok(ExitCode::SUCCESS)
+                }
+                ProviderCmd::List { all: false } => {
                     provider_list(&cfg_path)?;
                     Ok(ExitCode::SUCCESS)
                 }
@@ -1221,6 +1092,7 @@ async fn real_main() -> Result<ExitCode> {
                 SetupTarget::Claude {
                     scope,
                     dry_run,
+                    details,
                     yes,
                     undo,
                     no_statusline,
@@ -1232,13 +1104,16 @@ async fn real_main() -> Result<ExitCode> {
             setup_claude(
                 &cfg_path,
                 &scope,
-                dry_run,
-                yes,
-                undo,
-                !no_statusline,
-                !no_hook,
-                !no_claude_md,
-                !no_permissions,
+                SetupFlags {
+                    dry_run,
+                    yes,
+                    undo,
+                    details,
+                    no_statusline,
+                    no_hook,
+                    no_claude_md,
+                    no_permissions,
+                },
             )?;
             return Ok(ExitCode::SUCCESS);
         }

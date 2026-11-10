@@ -128,8 +128,10 @@ pub struct FilePlan {
     pub existed: bool,
     pub before: String,
     pub after: String,
-    /// One line per edit, for the preview.
+    /// One technical line per edit (keys and values), for `--details`.
     pub changes: Vec<String>,
+    /// One plain-words line per edit, for the normal preview.
+    pub summary: Vec<String>,
     pub reverts: Vec<Revert>,
     new_mode: u32,
 }
@@ -145,27 +147,55 @@ impl Plan {
         self.files.is_empty()
     }
 
+    /// Plain-words preview without styling.
     pub fn render(&self) -> String {
+        self.render_ui(&crate::ui::Ui::plain(), false)
+    }
+
+    /// The preview: per file, one plain-words line per change; with `details`, the exact
+    /// keys and values as well.
+    pub fn render_ui(&self, ui: &crate::ui::Ui, details: bool) -> String {
         let mut s = String::new();
         if self.files.is_empty() {
-            s.push_str("Claude Code is already set up for middleman; nothing to change.\n");
+            s.push_str(&format!(
+                "  {}\n",
+                ui.ok("Claude Code is already set up for middleman; nothing to change.")
+            ));
+        } else {
+            s.push_str(&format!(
+                "  Claude Code will be changed like this {}:\n",
+                ui.dim("(every file is backed up first; `middleman setup claude --undo` reverts)")
+            ));
         }
         for f in &self.files {
             s.push_str(&format!(
-                "{}{}\n",
-                pretty(&f.path),
-                if f.existed { "" } else { " (new file)" }
+                "\n  {}{}\n",
+                ui.bold(&pretty(&f.path)),
+                if f.existed {
+                    String::new()
+                } else {
+                    ui.dim(" (new file)")
+                }
             ));
-            for c in &f.changes {
-                for (i, line) in c.lines().enumerate() {
-                    s.push_str(if i == 0 { "  " } else { "    " });
-                    s.push_str(line);
-                    s.push('\n');
+            for line in &f.summary {
+                let (mark, rest) = line.split_at(line.find(' ').unwrap_or(0));
+                let mark = match mark {
+                    "+" => ui.green("+"),
+                    "~" => ui.yellow("~"),
+                    m => m.to_string(),
+                };
+                s.push_str(&format!("    {mark}{rest}\n"));
+            }
+            if details {
+                for c in &f.changes {
+                    for line in c.lines() {
+                        s.push_str(&format!("        {}\n", ui.dim(line)));
+                    }
                 }
             }
         }
         for n in &self.notes {
-            s.push_str(&format!("note: {n}\n"));
+            s.push_str(&format!("\n  {}\n", ui.warn(n)));
         }
         s
     }
@@ -268,6 +298,7 @@ struct JsonEdit {
     before: String,
     value: Value,
     changes: Vec<String>,
+    summary: Vec<String>,
     reverts: Vec<Revert>,
 }
 
@@ -281,15 +312,20 @@ impl JsonEdit {
             before,
             value,
             changes: vec![],
+            summary: vec![],
             reverts: vec![],
         })
     }
 
-    fn set(&mut self, path: Vec<String>, new: Value) -> Result<()> {
+    fn set(&mut self, path: Vec<String>, new: Value, human: &str) -> Result<()> {
         let old = get(&self.value, &path).cloned();
         if old.as_ref() == Some(&new) {
             return Ok(());
         }
+        self.summary.push(match old {
+            None => format!("+ {human}"),
+            Some(_) => format!("~ {human} (replaces the old entry)"),
+        });
         let (last, parent) = path.split_last().expect("non-empty path");
         obj_at(&mut self.value, parent, &self.path)?.insert(last.clone(), new.clone());
         self.changes.push(match &old {
@@ -305,21 +341,30 @@ impl JsonEdit {
         Ok(())
     }
 
-    fn push_unique(&mut self, path: Vec<String>, item: Value) -> Result<()> {
+    fn push_unique(&mut self, path: Vec<String>, item: Value, human: &str) -> Result<()> {
         let arr = arr_at(&mut self.value, &path, &self.path)?;
         if arr.contains(&item) {
             return Ok(());
         }
         arr.push(item.clone());
+        self.summary.push(format!("+ {human}"));
         self.changes
             .push(format!("+ {} += {}", path.join("."), compact(&item)));
         self.reverts.push(Revert::ArrayPush { path, item });
         Ok(())
     }
 
-    fn replace_item(&mut self, path: Vec<String>, idx: usize, item: Value) -> Result<()> {
+    fn replace_item(
+        &mut self,
+        path: Vec<String>,
+        idx: usize,
+        item: Value,
+        human: &str,
+    ) -> Result<()> {
         let arr = arr_at(&mut self.value, &path, &self.path)?;
         let old = std::mem::replace(&mut arr[idx], item.clone());
+        self.summary
+            .push(format!("~ {human} (replaces the old middleman entry)"));
         self.changes.push(format!(
             "~ {}[{idx}]: {}\n  -> {}",
             path.join("."),
@@ -345,6 +390,7 @@ impl JsonEdit {
             before: self.before,
             after,
             changes: self.changes,
+            summary: self.summary,
             reverts: self.reverts,
             new_mode,
         })
@@ -364,7 +410,11 @@ pub fn plan(o: &SetupOptions) -> Result<Plan> {
     let mut plan = Plan::default();
 
     let mut mcp = JsonEdit::open(o.mcp_file())?;
-    mcp.set(p(&["mcpServers", "middleman"]), o.mcp_entry())?;
+    mcp.set(
+        p(&["mcpServers", "middleman"]),
+        o.mcp_entry(),
+        "register the middleman MCP server (Claude Code starts it when needed)",
+    )?;
     plan.files.extend(mcp.finish(match o.scope {
         Scope::User => 0o600,
         Scope::Project => 0o644,
@@ -379,7 +429,11 @@ pub fn plan(o: &SetupOptions) -> Result<Plan> {
     let mut st = JsonEdit::open(o.settings_file())?;
     if o.permissions {
         for t in TOOLS {
-            st.push_unique(p(&["permissions", "allow"]), json!(t))?;
+            let human = format!(
+                "allow the `{}` tool without asking each time",
+                t.trim_start_matches("mcp__middleman__")
+            );
+            st.push_unique(p(&["permissions", "allow"]), json!(t), &human)?;
         }
     }
     if o.hook {
@@ -399,13 +453,15 @@ pub fn plan(o: &SetupOptions) -> Result<Plan> {
                 .unwrap_or_default()
         };
         let want = o.hook_command();
+        let human = "add the prompt hook: a local check (~20 ms) that tells Claude when a job \
+                     can be delegated; it never blocks a prompt";
         if !arr.iter().any(|g| cmds(g).contains(&want)) {
             match arr
                 .iter()
                 .position(|g| cmds(g).iter().any(|c| is_our_hook(c)))
             {
-                Some(i) => st.replace_item(path, i, group)?,
-                None => st.push_unique(path, group)?,
+                Some(i) => st.replace_item(path, i, group, human)?,
+                None => st.push_unique(path, group, human)?,
             }
         }
     }
@@ -423,7 +479,11 @@ pub fn plan(o: &SetupOptions) -> Result<Plan> {
                 "statusLine is already set (`{cur_cmd}`); left alone. To add middleman to it, append the output of `{}` to your script.",
                 o.statusline_command()
             )),
-            _ => st.set(p(&["statusLine"]), new)?,
+            _ => st.set(
+                p(&["statusLine"]),
+                new,
+                "show middleman's status at the bottom of Claude Code",
+            )?,
         }
     }
     plan.files.extend(st.finish(0o644));
@@ -458,11 +518,17 @@ pub fn plan(o: &SetupOptions) -> Result<Plan> {
                 block.lines().count()
             )];
             lines.extend(block.lines().map(|l| format!("| {l}")));
+            let human = format!(
+                "{} the middleman block ({} lines): tells Claude what it may delegate and how",
+                if replaced { "~ update" } else { "+ add" },
+                block.lines().count()
+            );
             plan.files.push(FilePlan {
                 path,
                 existed,
                 before,
                 after,
+                summary: vec![human],
                 changes: vec![lines.join("\n")],
                 reverts: vec![Revert::MdBlock { before: None }],
                 new_mode: 0o644,
@@ -854,11 +920,24 @@ mod tests {
         let plan = plan(&o).unwrap();
         assert_eq!(plan.files.len(), 3, "{}", plan.render());
         let text = plan.render();
-        assert!(text.contains("+ mcpServers.middleman"));
-        assert!(text.contains("permissions.allow += \"mcp__middleman__delegate_task\""));
-        assert!(text.contains("hooks.UserPromptSubmit +="));
-        assert!(text.contains("+ statusLine"));
+        assert!(
+            text.contains("+ register the middleman MCP server"),
+            "{text}"
+        );
+        assert!(text.contains("+ allow the `delegate_task` tool"));
+        assert!(text.contains("+ add the prompt hook"));
+        assert!(text.contains("+ show middleman's status"));
         assert!(text.contains("CLAUDE.md (new file)"));
+        // the normal preview has no raw JSON; --details adds the exact keys
+        assert!(
+            !text.contains('{') && !text.contains("mcpServers"),
+            "{text}"
+        );
+        let details = plan.render_ui(&crate::ui::Ui::plain(), true);
+        assert!(details.contains("+ mcpServers.middleman"));
+        assert!(details.contains("permissions.allow += \"mcp__middleman__delegate_task\""));
+        assert!(details.contains("hooks.UserPromptSubmit +="));
+        assert!(details.contains("+ statusLine"));
         // dry run writes nothing
         assert!(!home.join(".claude/CLAUDE.md").exists());
 

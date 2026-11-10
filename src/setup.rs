@@ -4,14 +4,20 @@
 //! statusline, CLAUDE.md) is `middleman setup claude` (see `claude_setup`), which `init`
 //! offers to run at the end.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
 use crate::config::{BalanceKind, Config, KeySource, RoutingMode, PROJECT_FILE};
+use crate::fsutil::pretty;
+use crate::onboard::ProviderEntry;
 use crate::providers::presets::{self, PRESETS};
+
+/// A TOML basic string (quoted and escaped).
+fn toml_str(s: &str) -> String {
+    toml_edit::Value::from(s).to_string().trim().to_string()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Scope {
@@ -37,14 +43,21 @@ impl Scope {
 
 pub struct InitOptions {
     pub scope: Scope,
-    pub providers: Vec<String>,
+    /// Providers to write; `key_source` is set for keys `init` stored.
+    pub providers: Vec<ProviderEntry>,
     pub mode: RoutingMode,
     pub roots: Vec<PathBuf>,
     pub config_path: PathBuf,
     pub project_dir: PathBuf,
+    /// Replace existing files (each is backed up first).
     pub force: bool,
-    /// Providers whose key was stored by `init` (written as `key_source`).
-    pub key_sources: BTreeMap<String, KeySource>,
+}
+
+impl InitOptions {
+    /// Preset providers by name, no stored keys (tests and simple callers).
+    pub fn preset_entries(names: &[&str]) -> Vec<ProviderEntry> {
+        names.iter().map(|n| ProviderEntry::preset(n)).collect()
+    }
 }
 
 /// Which preset key env vars exist (never their values).
@@ -84,30 +97,56 @@ pub fn render_user_config(o: &InitOptions) -> Result<String> {
     s.push_str("[redact]\nsecrets = \"block\"\npii = \"block\"\n# dictionary_file = \"~/.config/middleman/dictionary.txt\"\n\n");
     s.push_str(&format!(
         "[routing]\nmode = \"{}\"\ndefault_quality = \"cheapest\"\n\n",
-        format!("{:?}", o.mode).to_lowercase()
+        crate::wizard::mode_str(o.mode)
     ));
-    for name in &o.providers {
-        let Some(p) = presets::find(name) else {
-            bail!("unknown preset {name} (see `middleman init --list`)");
+    for e in &o.providers {
+        let name = &e.name;
+        s.push_str(&format!("[providers.{name}]\n"));
+        let preset = match &e.preset {
+            Some(pn) => {
+                let Some(p) = presets::find(pn) else {
+                    bail!("unknown provider {pn} (see `middleman init --list`)");
+                };
+                s.push_str(&format!("preset = \"{pn}\"\n"));
+                Some(p)
+            }
+            None => {
+                s.push_str("api = \"openai\"\n");
+                None
+            }
         };
-        s.push_str(&format!("[providers.{name}]\npreset = \"{name}\"\n"));
-        if let Some(src) = o.key_sources.get(name) {
+        if let Some(u) = &e.base_url {
+            s.push_str(&format!("base_url = {}\n", toml_str(u)));
+        }
+        if e.local && preset.is_none() {
+            s.push_str("trust = \"local\"\n");
+        }
+        let key_env = preset.and_then(|p| p.key_env);
+        if let Some(src) = e.key_source {
             s.push_str(&format!(
-                "key_source = \"{}\"   # stored by middleman; {} still wins when set\n",
+                "key_source = \"{}\"   # stored by middleman{}\n",
                 src.as_str(),
-                p.key_env.unwrap_or("the env var")
+                key_env
+                    .map(|k| format!("; {k} still wins when set"))
+                    .unwrap_or_default()
             ));
-        } else if let Some(k) = p.key_env {
+        } else if let Some(k) = key_env {
             if std::env::var_os(k).is_none() {
                 s.push_str(&format!(
                     "# no key yet: run `middleman provider add {name}` (stores it in the OS keychain) or export {k}\n"
                 ));
             }
         }
-        if !p.verified {
+        if let Some(m) = &e.model {
+            s.push_str(&format!("model = {}\n", toml_str(m)));
+        }
+        if preset.is_some_and(|p| !p.verified && e.base_url.is_none()) {
             s.push_str("# base_url from preset (not live-verified); run `middleman doctor`\n");
         }
         s.push('\n');
+    }
+    if let Some(e) = o.providers.iter().find(|e| e.model.is_some()) {
+        s = crate::wizard::pin_model_routes(&s, &e.name)?;
     }
     Ok(s)
 }
@@ -117,39 +156,52 @@ pub fn render_project_overlay(mode: RoutingMode) -> String {
         "# {PROJECT_FILE}: per-repo overlay. It may only TIGHTEN the user config\n\
 # (lower budgets/limits/max_sensitivity, add deny globs, disable providers, stricter routing mode).\n\n\
 [routing]\nmode = \"{}\"\n\n[paths]\ndeny = []\n",
-        format!("{mode:?}").to_lowercase()
+        crate::wizard::mode_str(mode)
     )
 }
 
-fn write_new(path: &Path, text: &str, force: bool, log: &mut Vec<String>) -> Result<()> {
+fn write_new(path: &Path, text: &str, force: bool, mode: u32, log: &mut Vec<String>) -> Result<()> {
     if path.exists() && !force {
         log.push(format!(
-            "exists, not overwritten (use --force): {}",
-            path.display()
+            "exists, kept: {} (`middleman init` can update it)",
+            pretty(path)
         ));
         return Ok(());
+    }
+    if path.exists() {
+        let b = crate::wizard::backup_file(path)?;
+        log.push(format!("backed up {} to {}", pretty(path), pretty(&b)));
     }
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
     }
-    std::fs::write(path, text).with_context(|| format!("cannot write {}", path.display()))?;
-    log.push(format!("wrote {}", path.display()));
+    crate::fsutil::write_atomic(path, text.as_bytes(), Some(mode))
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    log.push(format!("wrote {}", pretty(path)));
     Ok(())
 }
 
 /// Write middleman's config files. Returns log lines; never touches Claude Code settings.
 pub fn init_write(o: &InitOptions) -> Result<Vec<String>> {
     let mut log = Vec::new();
-    write_new(&o.config_path, &render_user_config(o)?, o.force, &mut log)?;
+    let text = render_user_config(o)?;
+    Config::from_toml(&text).context("the generated config is invalid; nothing was written")?;
+    write_new(&o.config_path, &text, o.force, 0o600, &mut log)?;
     if o.scope == Scope::Project {
-        write_new(
-            &o.project_dir.join(PROJECT_FILE),
-            &render_project_overlay(o.mode),
-            o.force,
-            &mut log,
-        )?;
+        write_overlay(o, &mut log)?;
     }
     Ok(log)
+}
+
+/// Write `<project>/.middleman.toml` (0644: it is meant to be committed).
+pub fn write_overlay(o: &InitOptions, log: &mut Vec<String>) -> Result<()> {
+    write_new(
+        &o.project_dir.join(PROJECT_FILE),
+        &render_project_overlay(o.mode),
+        o.force,
+        0o644,
+        log,
+    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -362,13 +414,28 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let o = InitOptions {
             scope: Scope::Project,
-            providers: vec!["openrouter".into(), "ollama".into()],
+            providers: vec![
+                ProviderEntry {
+                    key_source: Some(KeySource::Keychain),
+                    model: Some("qwen/qwen3-coder".into()),
+                    ..ProviderEntry::preset("openrouter")
+                },
+                ProviderEntry {
+                    base_url: Some("http://localhost:11500/v1".into()),
+                    ..ProviderEntry::preset("ollama")
+                },
+                ProviderEntry {
+                    name: "work".into(),
+                    base_url: Some("https://llm.example.com/v1".into()),
+                    key_source: Some(KeySource::File),
+                    ..Default::default()
+                },
+            ],
             mode: RoutingMode::Confirm,
             roots: vec![d.path().to_path_buf()],
             config_path: d.path().join("cfg/config.toml"),
             project_dir: d.path().to_path_buf(),
             force: false,
-            key_sources: [("openrouter".to_string(), KeySource::Keychain)].into(),
         };
         let log = init_write(&o).unwrap();
         assert_eq!(log.len(), 2);
@@ -381,8 +448,20 @@ mod tests {
         let (c2, f) = Config::load_with_project(&o.config_path, d.path()).unwrap();
         assert!(f.is_some());
         assert_eq!(c2.routing.mode, RoutingMode::Confirm);
+        assert_eq!(c.providers["ollama"].base_url, "http://localhost:11500/v1");
+        assert_eq!(c.providers["work"].key_source, Some(KeySource::File));
+        assert_eq!(c.routes["write_tests"].chain[0], "openrouter");
         // second run does not overwrite
         let log = init_write(&o).unwrap();
-        assert!(log[0].starts_with("exists"));
+        assert!(log[0].starts_with("exists, kept"), "{log:?}");
+        // --force backs up first
+        let o = InitOptions { force: true, ..o };
+        let log = init_write(&o).unwrap();
+        assert!(log[0].starts_with("backed up"), "{log:?}");
+        assert!(std::fs::read_dir(d.path().join("cfg")).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".bak-")));
     }
 }

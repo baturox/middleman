@@ -64,6 +64,15 @@ fn forced_file() -> bool {
     std::env::var("MIDDLEMAN_KEYSTORE").is_ok_and(|v| v.eq_ignore_ascii_case("file"))
 }
 
+/// Where a new key will go, for prompts: "your macOS Keychain" or "a private file (0600)".
+pub fn preferred_store_name() -> String {
+    if forced_file() {
+        "a private file (mode 0600)".into()
+    } else {
+        format!("your {}", keychain_name())
+    }
+}
+
 fn valid_account(name: &str) -> Result<()> {
     if name.is_empty()
         || !name

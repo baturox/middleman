@@ -31,8 +31,10 @@ pub mod routing;
 pub mod setup;
 pub mod statusline;
 pub mod tune;
+pub mod ui;
 pub mod usage;
 pub mod watch;
+pub mod wizard;
 
 use serde::{Deserialize, Serialize};
 

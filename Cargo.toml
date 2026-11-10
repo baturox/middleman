@@ -35,6 +35,7 @@ unicode-normalization = "0.1"
 url = "2"
 keyring = "4"
 dialoguer = "0.12"
+console = "0.16"
 zeroize = "1"
 open = "5"
 clap_complete = "4"
@@ -54,3 +55,7 @@ lto = "thin"
 
 [target."cfg(unix)".dependencies]
 libc = "0.2"
+
+[target."cfg(unix)".dev-dependencies]
+# drives the real `init` wizard through a pseudo-terminal (tests/init_wizard_pty.rs)
+rexpect = "0.7"

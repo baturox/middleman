@@ -66,10 +66,7 @@ pub async fn get_json(url: &str, key: Option<&Secret>) -> Result<(u16, Option<Va
     if let Some(k) = key.filter(|k| !k.expose().is_empty()) {
         rb = rb.header("authorization", bearer(k));
     }
-    let resp = rb
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot reach {}: {}", host(url), e.without_url()))?;
+    let resp = rb.send().await.map_err(|e| net_err(url, e))?;
     finish(resp).await
 }
 
@@ -80,8 +77,69 @@ pub async fn post_json(url: &str, body: &Value) -> Result<(u16, Option<Value>)> 
         .json(body)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("cannot reach {}: {}", host(url), e.without_url()))?;
+        .map_err(|e| net_err(url, e))?;
     finish(resp).await
+}
+
+/// Why a request never got an HTTP answer (for plain-words advice in `init`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetKind {
+    Timeout,
+    Dns,
+    Tls,
+    Refused,
+    Other,
+}
+
+/// A transport failure. The message names the host only (never the URL path or a key).
+#[derive(Debug, thiserror::Error)]
+#[error("cannot reach {host}: {detail}")]
+pub struct NetError {
+    pub host: String,
+    pub kind: NetKind,
+    pub detail: String,
+}
+
+/// Classify from the error chain text (reqwest/hyper/rustls do not expose typed causes).
+pub fn net_kind(is_timeout: bool, chain: &str) -> NetKind {
+    let c = chain.to_ascii_lowercase();
+    if is_timeout || c.contains("timed out") || c.contains("timeout") {
+        NetKind::Timeout
+    } else if c.contains("dns error")
+        || c.contains("failed to lookup")
+        || c.contains("nodename nor servname")
+        || c.contains("name or service not known")
+        || c.contains("no such host")
+    {
+        NetKind::Dns
+    } else if c.contains("certificate")
+        || c.contains("tls")
+        || c.contains("handshake")
+        || c.contains("ssl")
+    {
+        NetKind::Tls
+    } else if c.contains("connection refused") || c.contains("actively refused") {
+        NetKind::Refused
+    } else {
+        NetKind::Other
+    }
+}
+
+fn net_err(url: &str, e: reqwest::Error) -> anyhow::Error {
+    let e = e.without_url();
+    let mut chain = e.to_string();
+    let mut src = std::error::Error::source(&e);
+    while let Some(s) = src {
+        chain.push_str(": ");
+        chain.push_str(&s.to_string());
+        src = s.source();
+    }
+    let kind = net_kind(e.is_timeout(), &chain);
+    anyhow::Error::new(NetError {
+        host: host(url),
+        kind,
+        detail: crate::fsutil::clean(&chain, 300),
+    })
 }
 
 fn host(url: &str) -> String {
@@ -103,6 +161,46 @@ mod tests {
         assert!(client_for("https://example.com/x").is_ok());
         assert!(client_for("http://127.0.0.1:9/x").is_ok());
         assert!(client_for("http://localhost:9/x").is_ok());
+    }
+
+    #[test]
+    fn classifies_transport_errors() {
+        assert_eq!(net_kind(true, "operation"), NetKind::Timeout);
+        assert_eq!(
+            net_kind(false, "error sending request: client error (Connect): dns error: failed to lookup address information"),
+            NetKind::Dns
+        );
+        assert_eq!(
+            net_kind(
+                false,
+                "client error (Connect): invalid peer certificate: UnknownIssuer"
+            ),
+            NetKind::Tls
+        );
+        assert_eq!(
+            net_kind(
+                false,
+                "client error (Connect): tcp connect error: Connection refused (os error 61)"
+            ),
+            NetKind::Refused
+        );
+        assert_eq!(net_kind(false, "something else"), NetKind::Other);
+    }
+
+    #[tokio::test]
+    async fn refused_connection_is_typed() {
+        // bind then drop a listener so the port is (almost certainly) closed
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let e = get_json(&format!("http://127.0.0.1:{port}/v1/models"), None)
+            .await
+            .unwrap_err();
+        let n = e.downcast_ref::<NetError>().expect("typed error");
+        assert_eq!(n.kind, NetKind::Refused, "{e}");
+        assert!(e.to_string().starts_with("cannot reach 127.0.0.1"));
     }
 
     #[tokio::test]
