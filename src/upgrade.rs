@@ -516,6 +516,28 @@ pub enum Attestation {
     Unavailable,
     /// `gh` is installed but not logged in (`gh auth status` fails), so it cannot check.
     NotLoggedIn,
+    /// `gh` could not run the check at all (too old for the current Sigstore trusted root,
+    /// verifier service unreachable, timed out). Not evidence against the file.
+    ToolError(String),
+}
+
+/// Does this `gh attestation verify` error mean the tool could not check (rather than that the
+/// file failed the check)? E.g. gh 2.55 cannot parse Sigstore's Ed25519 trusted root.
+pub fn is_tool_error(stderr: &str) -> bool {
+    let e = stderr.to_ascii_lowercase();
+    [
+        "failed to get trusted root",
+        "unsupported tlog public key",
+        "failed to create public good sigstore verifier",
+        "failed to create sigstore verifier",
+        "unknown command \"attestation\"",
+        "tls handshake",
+        "connection refused",
+        "no such host",
+        "i/o timeout",
+    ]
+    .iter()
+    .any(|k| e.contains(k))
 }
 
 /// `name` on PATH (no shell, no `which`).
@@ -600,9 +622,13 @@ pub fn verify_attestation(gh: Option<&Path>, file: &Path) -> Attestation {
         Some(o) => {
             let err = String::from_utf8_lossy(&o.stderr);
             let first = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-            Attestation::Failed(clean(first, 200))
+            if is_tool_error(&err) {
+                Attestation::ToolError(clean(first, 200))
+            } else {
+                Attestation::Failed(clean(first, 200))
+            }
         }
-        None => Attestation::Failed("gh attestation verify did not finish".into()),
+        None => Attestation::ToolError("gh attestation verify did not finish".into()),
     }
 }
 
@@ -629,6 +655,38 @@ pub fn attestation_policy(a: &Attestation, require: bool) -> Result<String> {
         (Attestation::NotLoggedIn, false) => Ok(
             "build provenance not checked (gh is not logged in); the checksum matched".into(),
         ),
+        (Attestation::ToolError(e), true) => bail!(
+            "cannot verify the build attestation: gh could not run the check ({e}). Update the GitHub CLI (`brew upgrade gh`); refusing to install (attestation required)"
+        ),
+        (Attestation::ToolError(_), false) => Ok(
+            "build provenance not checked (your GitHub CLI is too old to check it: run `brew upgrade gh`); the checksum matched".into(),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod attestation_tool_error_tests {
+    use super::*;
+
+    /// Regression: gh 2.55 cannot read Sigstore's Ed25519 trusted root; that blocked upgrades.
+    #[test]
+    fn outdated_gh_is_a_tool_error_not_a_failed_verification() {
+        let e = "Error: failed to find recognized issuer from bundle content: failed to create Public Good Sigstore verifier: failed to get trusted root: unsupported tlog public key type: PKIX_ED25519";
+        assert!(is_tool_error(e));
+        let a = Attestation::ToolError(e.into());
+        assert!(attestation_policy(&a, false)
+            .unwrap()
+            .contains("brew upgrade gh"));
+        assert!(attestation_policy(&a, true).is_err());
+        // a real mismatch stays fatal
+        assert!(!is_tool_error(
+            "Error: verifying with issuer \"sigstore.dev\": no matching attestations"
+        ));
+        assert!(attestation_policy(
+            &Attestation::Failed("no matching attestations".into()),
+            false
+        )
+        .is_err());
     }
 }
 

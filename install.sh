@@ -102,6 +102,11 @@ main() {
     need_att
   elif gh attestation verify "$tmp/$name.tar.gz" --repo "$REPO" >/dev/null 2>"$tmp/att.err"; then
     say "   provenance verified: built by $REPO's release workflow"
+  elif grep -qiE "failed to get trusted root|unsupported tlog public key|sigstore verifier|unknown command .attestation.|tls handshake|no such host|i/o timeout" "$tmp/att.err"; then
+    # gh could not run the check (e.g. too old for Sigstore's current keys): not evidence
+    # against the file, whose checksum matched.
+    say "   build provenance not checked (your GitHub CLI is too old: brew upgrade gh)"
+    need_att
   else
     echo "error: build attestation verification failed for $name; refusing to install." >&2
     sed -n '1,3p' "$tmp/att.err" | sed 's/^/  gh: /' >&2
