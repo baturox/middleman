@@ -126,6 +126,7 @@ pub enum By {
     Task,
     Day,
     Project,
+    Mode,
 }
 
 impl By {
@@ -136,6 +137,7 @@ impl By {
             "task" | "task_kind" => Some(By::Task),
             "day" => Some(By::Day),
             "project" => Some(By::Project),
+            "mode" => Some(By::Mode),
             _ => None,
         }
     }
@@ -145,6 +147,7 @@ impl By {
             By::Provider => e.provider.clone(),
             By::Task => e.task_kind.clone(),
             By::Day => e.ts.chars().take(10).collect(),
+            By::Mode => e.mode.clone(),
             By::Project => e.project_label.clone().unwrap_or_else(|| e.project.clone()),
         };
         if k.is_empty() {

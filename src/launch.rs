@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::{valid_model_id, Catalog};
 use crate::config::{Config, ProjectOverlay, Secret, PROJECT_FILE};
+use crate::modes::Mode;
 
 pub const DEFAULT_MODEL: &str = "z-ai/glm-5.3";
 pub const DEFAULT_FAST_MODEL: &str = "deepseek/deepseek-v4.1-flash";
@@ -175,6 +176,7 @@ pub fn refusal(root: &Path) -> String {
 }
 
 pub struct Plan {
+    pub mode: Mode,
     pub key: Secret,
     pub main: String,
     pub fast: String,
@@ -202,6 +204,7 @@ pub fn prepare(
     home: Option<&Path>,
     model: Option<&str>,
     fast_model: Option<&str>,
+    mode: Mode,
     yes: bool,
     interactive: bool,
     args: Vec<String>,
@@ -222,6 +225,7 @@ pub fn prepare(
         .and_then(|c| c.providers.get("openrouter").and_then(|p| p.left_usd()));
     let decision = decide(&root, overlay_allows(cwd), &state, yes, interactive);
     Ok(Plan {
+        mode,
         main_price: price_text(cfg, cat.as_ref(), &main),
         fast_price: price_text(cfg, cat.as_ref(), &fast),
         key,
@@ -247,6 +251,12 @@ pub fn banner(p: &Plan) -> String {
         .credit_usd
         .map(|c| format!(" · credit ${c:.2}"))
         .unwrap_or_default();
+    if p.mode == Mode::Smart {
+        return format!(
+            "🛡 middleman: smart mode · hard prompts on Claude, routine ones on {} · fast {}{credit}",
+            p.main, p.fast
+        );
+    }
     format!(
         "🛡 middleman: Claude Code on OpenRouter · main {} · fast {}{credit} · your Claude plan is not used",
         p.main, p.fast
@@ -259,6 +269,7 @@ pub const MASKED_KEY: &str = "sk-or-…(hidden)";
 pub fn dry_run_text(p: &Plan) -> String {
     let mut out = vec![
         banner(p),
+        format!("  mode     {}", p.mode),
         format!("  main     {}", with_price(&p.main, &p.main_price)),
         format!("  fast     {}", with_price(&p.fast, &p.fast_price)),
         format!("  root     {}", p.root.display()),
@@ -304,6 +315,99 @@ pub fn command(program: PathBuf, p: &Plan) -> LaunchCmd {
         env: build_env(p.key.expose(), &p.main, &p.fast),
         remove: REMOVE_ENV.iter().map(|s| s.to_string()).collect(),
     }
+}
+
+/// Environment for the proxy modes: Claude Code keeps its own login and talks to the local
+/// proxy; the background and subagent roles use marker names the proxy maps to cheap models.
+pub fn proxy_env(base_url: &str) -> Vec<(String, String)> {
+    let e = |k: &str, v: &str| (k.to_string(), v.to_string());
+    vec![
+        e("ANTHROPIC_BASE_URL", base_url),
+        e("ANTHROPIC_DEFAULT_HAIKU_MODEL", crate::proxy::MARK_FAST),
+        e("CLAUDE_CODE_SUBAGENT_MODEL", crate::proxy::MARK_SUB),
+    ]
+}
+
+/// The local proxy as a child process. It exits when this handle is dropped (its stdin closes).
+pub struct ProxyChild {
+    child: std::process::Child,
+    _stdin: Option<std::process::ChildStdin>,
+    pub base_url: String,
+}
+
+impl Drop for ProxyChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub struct ProxySpec<'a> {
+    pub exe: &'a Path,
+    pub cfg_path: &'a Path,
+    pub mode: Mode,
+    pub main: &'a str,
+    pub fast: &'a str,
+    pub key: &'a Secret,
+    pub project: &'a str,
+    /// Bench run id: marks ledger lines `purpose: bench` and pins the mode.
+    pub bench_run: Option<&'a str>,
+}
+
+pub fn spawn_proxy(s: &ProxySpec) -> Result<ProxyChild> {
+    use std::io::BufRead;
+    use std::process::Stdio;
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let mut cmd = std::process::Command::new(s.exe);
+    cmd.arg("--config")
+        .arg(s.cfg_path)
+        .args(["proxy", "--mode"])
+        .arg(s.mode.to_string())
+        .args([
+            "--model",
+            s.main,
+            "--fast-model",
+            s.fast,
+            "--project",
+            s.project,
+        ]);
+    if let Some(r) = s.bench_run {
+        cmd.args(["--bench-run", r]);
+    }
+    let mut child = cmd
+        .env("MM_PROXY_TOKEN", &token)
+        .env("MM_PROXY_KEY", s.key.expose())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("cannot start the middleman proxy")?;
+    let stdin = child.stdin.take();
+    let out = child.stdout.take().context("no proxy output")?;
+    let mut line = String::new();
+    std::io::BufReader::new(out).read_line(&mut line)?;
+    let Ok(port) = line.trim().parse::<u16>() else {
+        let _ = child.kill();
+        bail!("the middleman proxy did not start");
+    };
+    Ok(ProxyChild {
+        child,
+        _stdin: stdin,
+        base_url: format!("http://127.0.0.1:{port}/{token}"),
+    })
+}
+
+/// Run the command as a child (the proxy must outlive nothing: it is stopped on return) and
+/// relay its exit code.
+pub fn run_with_proxy(c: &LaunchCmd, proxy: ProxyChild) -> Result<ExitCode> {
+    let mut cmd = std::process::Command::new(&c.program);
+    cmd.args(&c.args);
+    for k in &c.remove {
+        cmd.env_remove(k);
+    }
+    cmd.envs(c.env.iter().map(|(k, v)| (k, v)));
+    let st = cmd.status().context("cannot start claude")?;
+    drop(proxy);
+    Ok(ExitCode::from(st.code().unwrap_or(1).clamp(0, 255) as u8))
 }
 
 /// Find `name` in a PATH-style value.
@@ -458,6 +562,7 @@ key_env = "MM_TEST_OR_KEY_LAUNCH"
             Some(d.path()),
             None,
             None,
+            Mode::Cheap,
             false,
             false,
             vec!["-p".into()],
@@ -474,6 +579,17 @@ key_env = "MM_TEST_OR_KEY_LAUNCH"
         assert!(cmd.env.iter().any(|(_, v)| v == "sk-or-v1-SECRETSECRET"));
         assert_eq!(cmd.args, vec!["-p"]);
         std::env::remove_var("MM_TEST_OR_KEY_LAUNCH");
-        assert!(prepare(&c, &repo, Some(d.path()), None, None, true, false, vec![]).is_err());
+        assert!(prepare(
+            &c,
+            &repo,
+            Some(d.path()),
+            None,
+            None,
+            Mode::Cheap,
+            true,
+            false,
+            vec![]
+        )
+        .is_err());
     }
 }

@@ -1247,15 +1247,65 @@ pub fn render_jobs(
     let d = mm_data(&v, cfg_path, now, spawn, spawn_update);
     let nowf = now as f64;
     let mm = |l: u8| mm_part(&d, l, o.show_tokens);
-    if o.middleman_only {
-        return fit((0..=3).map(mm).collect(), o.columns).out(o.color);
-    }
-    if o.lines >= 2 {
+    let badge = mode_badge(&v, cfg_path, now);
+    let out = if o.middleman_only {
+        fit((0..=3).map(mm).collect(), o.columns).out(o.color)
+    } else if o.lines >= 2 {
         let l1 = claude_part(&v, claude_level_for(o.columns), &o.env, nowf);
         let l2 = fit((0..=3).map(mm).collect(), o.columns);
-        return format!("{}\n{}", l1.out(o.color), l2.out(o.color));
+        format!("{}\n{}", l1.out(o.color), l2.out(o.color))
+    } else {
+        compact(&v, &d, o).out(o.color)
+    };
+    with_badge(out, badge, o.columns)
+}
+
+/// Writes Claude's 5-hour utilization for the proxy, and returns `🛡 smart → glm-5.3`
+/// (current mode and last route) when a smart session has routed something recently.
+fn mode_badge(v: &Value, cfg_path: &Path, now: i64) -> Option<String> {
+    let state = Config::load(cfg_path).ok()?.state_dir();
+    if let Some(p) = v
+        .pointer("/rate_limits/five_hour/used_percentage")
+        .and_then(Value::as_f64)
+    {
+        let _ = crate::modes::write_usage(&state, p, now);
     }
-    compact(&v, &d, o).out(o.color)
+    let r = crate::modes::read_route(&state).filter(|r| now - r.ts < 6 * 3600)?;
+    let live = crate::modes::read_live_mode(&state)
+        .map(|m| m.to_string())
+        .unwrap_or(r.mode);
+    let to = if r.route == "claude" {
+        "claude".to_string()
+    } else {
+        clean(r.model.rsplit('/').next().unwrap_or(""), 24)
+    };
+    Some(format!("🛡 {live} → {to}"))
+}
+
+/// Append the badge to the last line only when it fits: it is the first thing dropped.
+fn with_badge(out: String, badge: Option<String>, columns: usize) -> String {
+    let Some(b) = badge else { return out };
+    let last = out.rsplit('\n').next().unwrap_or("");
+    let mut w = 0;
+    let mut esc = false;
+    for c in last.chars() {
+        if esc {
+            esc = c != 'm';
+        } else if c == '\u{1b}' {
+            esc = true;
+        } else {
+            w += if (c as u32) >= 0x1F000 { 2 } else { 1 };
+        }
+    }
+    let bw: usize = b
+        .chars()
+        .map(|c| if (c as u32) >= 0x1F000 { 2 } else { 1 })
+        .sum();
+    if w + 3 + bw <= columns {
+        format!("{out} │ {b}")
+    } else {
+        out
+    }
 }
 
 /// Width of the controlling terminal (Claude Code does not set COLUMNS for status line

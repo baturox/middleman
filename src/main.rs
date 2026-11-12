@@ -43,6 +43,8 @@ macro_rules! note {
     }};
 }
 
+mod cli_bench;
+mod cli_claude;
 mod cli_init;
 mod cli_upgrade;
 
@@ -271,15 +273,21 @@ enum Cmd {
     },
     /// Print shell completions (bash, zsh, fish, elvish, powershell)
     Completions { shell: clap_complete::Shell },
-    /// Run a whole Claude Code session on cheap OpenRouter models (your Claude plan is not used)
+    /// Run Claude Code with cheap models doing the routine work (smart | cheap | claude)
     Claude {
-        /// Main model for Opus/Sonnet/subagents [default: [launch] model, else z-ai/glm-5.3]
+        /// smart (default: hard prompts on Claude, routine ones on a cheap model) | cheap | claude
+        #[arg(long)]
+        mode: Option<String>,
+        /// Show the mode picker even if this repo has a remembered choice
+        #[arg(long)]
+        pick: bool,
+        /// Cheap model [default: [launch] model, else z-ai/glm-5.3]
         #[arg(long)]
         model: Option<String>,
         /// Fast/background model [default: [launch] fast_model, else deepseek/deepseek-v4.1-flash]
         #[arg(long)]
         fast_model: Option<String>,
-        /// Allow this repo once without asking (nothing is cleaned in this mode)
+        /// Allow this repo once without asking (cheap turns send files uncleaned)
         #[arg(long)]
         yes: bool,
         /// Show what would be set (key hidden) and exit
@@ -288,6 +296,37 @@ enum Cmd {
         /// Arguments passed to claude, after `--`
         #[arg(last = true)]
         args: Vec<String>,
+    },
+    /// Change the mode of a running smart session: smart | cheap | claude (no argument: pick)
+    Mode { mode: Option<String> },
+    /// The local proxy behind smart mode (started by `middleman claude`; not for direct use)
+    #[command(hide = true)]
+    Proxy {
+        #[arg(long)]
+        mode: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        fast_model: String,
+        #[arg(long, default_value = "")]
+        project: String,
+        #[arg(long)]
+        bench_run: Option<String>,
+    },
+    /// Measure what each mode costs on a small built-in set of tasks (runs real Claude Code)
+    Bench {
+        /// Modes to compare
+        #[arg(long, default_value = "smart,cheap,claude")]
+        modes: String,
+        /// How many of the 5 tasks to run (easiest first)
+        #[arg(long, default_value_t = 5)]
+        tasks: usize,
+        /// Keep the temporary project copies
+        #[arg(long)]
+        keep: bool,
+        /// Do not ask before spending
+        #[arg(long)]
+        yes: bool,
     },
     /// Run the MCP stdio server (Claude Code starts this for you)
     Mcp,
@@ -1466,67 +1505,6 @@ fn setup_refresh(cfg_path: &Path, home: &Path, f: SetupFlags) -> Result<()> {
     Ok(())
 }
 
-fn claude_cmd(
-    cfg_path: &Path,
-    model: Option<String>,
-    fast_model: Option<String>,
-    yes: bool,
-    dry_run: bool,
-    args: Vec<String>,
-) -> Result<ExitCode> {
-    use middleman::launch::{self, Decision};
-    let cfg = load(cfg_path)?;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let plan = match launch::prepare(
-        &cfg,
-        &cwd(),
-        home.as_deref(),
-        model.as_deref(),
-        fast_model.as_deref(),
-        yes,
-        interactive(),
-        args,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            note!("middleman: {e}");
-            return Ok(ExitCode::FAILURE);
-        }
-    };
-    if dry_run {
-        say!("{}", launch::dry_run_text(&plan));
-        return Ok(ExitCode::SUCCESS);
-    }
-    match plan.decision {
-        Decision::Allowed(_) => {}
-        Decision::Refuse => {
-            note!("middleman: {}", launch::refusal(&plan.root));
-            return Ok(ExitCode::FAILURE);
-        }
-        Decision::Ask => {
-            for l in launch::warning(&plan.root, &plan.main) {
-                note!("{l}");
-            }
-            let pick = dialoguer::Select::with_theme(&theme())
-                .items(["Allow once", "Always for this repo", "Cancel"])
-                .default(2)
-                .interact()?;
-            match pick {
-                0 => {}
-                1 => launch::store_allow(&cfg.state_dir(), &plan.root)?,
-                _ => return Ok(ExitCode::FAILURE),
-            }
-        }
-    }
-    let Some(claude) = std::env::var_os("PATH").and_then(|p| launch::find_on_path("claude", &p))
-    else {
-        note!("middleman: `claude` not found on PATH: install Claude Code first");
-        return Ok(ExitCode::FAILURE);
-    };
-    note!("{}", launch::banner(&plan));
-    launch::exec(&launch::command(claude, &plan))
-}
-
 async fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let cfg_path = cli
@@ -1569,13 +1547,43 @@ async fn real_main() -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Claude {
+            mode,
+            pick,
             model,
             fast_model,
             yes,
             dry_run,
             args,
         } => {
-            return claude_cmd(&cfg_path, model, fast_model, yes, dry_run, args);
+            let o = cli_claude::Opts {
+                mode,
+                pick,
+                model,
+                fast_model,
+                yes,
+                dry_run,
+                args,
+            };
+            return cli_claude::claude_cmd(&cfg_path, o);
+        }
+        Cmd::Mode { mode } => return cli_claude::mode_cmd(&cfg_path, mode),
+        Cmd::Proxy {
+            mode,
+            model,
+            fast_model,
+            project,
+            bench_run,
+        } => {
+            return cli_claude::proxy_cmd(&cfg_path, mode, model, fast_model, project, bench_run)
+                .await;
+        }
+        Cmd::Bench {
+            modes,
+            tasks,
+            keep,
+            yes,
+        } => {
+            return cli_bench::bench_cmd(&cfg_path, &modes, tasks, keep, yes).await;
         }
         Cmd::Completions { shell } => {
             clap_complete::generate(
@@ -2047,7 +2055,7 @@ async fn real_main() -> Result<ExitCode> {
         } => {
             let since = middleman::report::parse_since(&since)?;
             let by = middleman::report::By::parse(&by)
-                .context("--by must be model, provider, task, day or project")?;
+                .context("--by must be model, provider, task, day, project or mode")?;
             let l = middleman::ledger::Ledger::new(&cfg.state_dir())?;
             let base = if all {
                 0
@@ -2132,7 +2140,10 @@ async fn real_main() -> Result<ExitCode> {
         | Cmd::Dict { .. }
         | Cmd::Usage { .. }
         | Cmd::Tune { .. }
-        | Cmd::Claude { .. } => unreachable!(),
+        | Cmd::Claude { .. }
+        | Cmd::Mode { .. }
+        | Cmd::Proxy { .. }
+        | Cmd::Bench { .. } => unreachable!(),
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -91,7 +91,7 @@ pub struct LedgerEntry {
 
 impl LedgerEntry {
     pub fn is_test(&self) -> bool {
-        self.purpose.as_deref() == Some("test")
+        matches!(self.purpose.as_deref(), Some("test" | "bench"))
     }
 
     /// Unix seconds parsed from `ts` (RFC 3339); unparseable timestamps count as "now" so a
