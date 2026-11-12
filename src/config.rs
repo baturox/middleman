@@ -135,6 +135,8 @@ pub struct Config {
     pub update: UpdateCfg,
     #[serde(default)]
     pub statusline: StatuslineCfg,
+    #[serde(default)]
+    pub launch: LaunchCfg,
     /// Where ledger and audit files go. Default `~/.local/state/middleman`.
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
@@ -197,6 +199,25 @@ impl Default for StatuslineCfg {
     fn default() -> Self {
         StatuslineCfg { enabled: true }
     }
+}
+
+/// `[launch]`: models for `middleman claude` (a whole Claude Code session on OpenRouter).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct LaunchCfg {
+    pub model: Option<String>,
+    pub fast_model: Option<String>,
+}
+
+/// `[launch]` in `.middleman.toml`: only `allow`. Unlike every other overlay field this is a
+/// permission for `middleman claude` (skip its privacy prompt for this repo), not a change to
+/// the delegation rules, so `tighten` neither applies nor validates it: it is read separately
+/// by `launch::overlay_allows`.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct OverlayLaunch {
+    #[serde(default)]
+    pub allow: bool,
 }
 
 /// `[update]`: the daily background check for a newer release (one GET to api.github.com).
@@ -1081,6 +1102,7 @@ pub struct ProjectOverlay {
     pub paths: Option<OverlayPaths>,
     pub redact: Option<OverlayRedact>,
     pub routing: Option<OverlayRouting>,
+    pub launch: Option<OverlayLaunch>,
     #[serde(default)]
     pub providers: BTreeMap<String, OverlayProvider>,
 }
@@ -1286,6 +1308,16 @@ task_kinds = ["snippet", "docstring"]
         let p = c.providers.get_mut("p").unwrap();
         p.key_file = Some(kf);
         assert_eq!(p.resolve_key().unwrap().expose(), "abc123");
+    }
+
+    #[test]
+    fn overlay_accepts_launch_allow() {
+        let o = overlay("[launch]\nallow = true\n");
+        assert!(o.launch.unwrap().allow);
+        assert!(toml::from_str::<ProjectOverlay>("[launch]\nmodel = \"x\"\n").is_err());
+        let d = tempfile::tempdir().unwrap();
+        let mut c = Config::from_toml(&base(d.path())).unwrap();
+        c.tighten(&overlay("[launch]\nallow = true\n")).unwrap();
     }
 
     fn overlay(s: &str) -> ProjectOverlay {

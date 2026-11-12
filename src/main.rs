@@ -271,6 +271,24 @@ enum Cmd {
     },
     /// Print shell completions (bash, zsh, fish, elvish, powershell)
     Completions { shell: clap_complete::Shell },
+    /// Run a whole Claude Code session on cheap OpenRouter models (your Claude plan is not used)
+    Claude {
+        /// Main model for Opus/Sonnet/subagents [default: [launch] model, else z-ai/glm-5.3]
+        #[arg(long)]
+        model: Option<String>,
+        /// Fast/background model [default: [launch] fast_model, else deepseek/deepseek-v4.1-flash]
+        #[arg(long)]
+        fast_model: Option<String>,
+        /// Allow this repo once without asking (nothing is cleaned in this mode)
+        #[arg(long)]
+        yes: bool,
+        /// Show what would be set (key hidden) and exit
+        #[arg(long)]
+        dry_run: bool,
+        /// Arguments passed to claude, after `--`
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     /// Run the MCP stdio server (Claude Code starts this for you)
     Mcp,
     /// Upgrade to the latest release (checksum-verified), then refresh the Claude Code wiring
@@ -1448,6 +1466,67 @@ fn setup_refresh(cfg_path: &Path, home: &Path, f: SetupFlags) -> Result<()> {
     Ok(())
 }
 
+fn claude_cmd(
+    cfg_path: &Path,
+    model: Option<String>,
+    fast_model: Option<String>,
+    yes: bool,
+    dry_run: bool,
+    args: Vec<String>,
+) -> Result<ExitCode> {
+    use middleman::launch::{self, Decision};
+    let cfg = load(cfg_path)?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let plan = match launch::prepare(
+        &cfg,
+        &cwd(),
+        home.as_deref(),
+        model.as_deref(),
+        fast_model.as_deref(),
+        yes,
+        interactive(),
+        args,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            note!("middleman: {e}");
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    if dry_run {
+        say!("{}", launch::dry_run_text(&plan));
+        return Ok(ExitCode::SUCCESS);
+    }
+    match plan.decision {
+        Decision::Allowed(_) => {}
+        Decision::Refuse => {
+            note!("middleman: {}", launch::refusal(&plan.root));
+            return Ok(ExitCode::FAILURE);
+        }
+        Decision::Ask => {
+            for l in launch::warning(&plan.root, &plan.main) {
+                note!("{l}");
+            }
+            let pick = dialoguer::Select::with_theme(&theme())
+                .items(["Allow once", "Always for this repo", "Cancel"])
+                .default(2)
+                .interact()?;
+            match pick {
+                0 => {}
+                1 => launch::store_allow(&cfg.state_dir(), &plan.root)?,
+                _ => return Ok(ExitCode::FAILURE),
+            }
+        }
+    }
+    let Some(claude) = std::env::var_os("PATH").and_then(|p| launch::find_on_path("claude", &p))
+    else {
+        note!("middleman: `claude` not found on PATH: install Claude Code first");
+        return Ok(ExitCode::FAILURE);
+    };
+    note!("{}", launch::banner(&plan));
+    launch::exec(&launch::command(claude, &plan))
+}
+
 async fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let cfg_path = cli
@@ -1488,6 +1567,15 @@ async fn real_main() -> Result<ExitCode> {
             keystore::set_noninteractive();
             say!("{}", middleman::statusline::run(&cfg_path, &o));
             return Ok(ExitCode::SUCCESS);
+        }
+        Cmd::Claude {
+            model,
+            fast_model,
+            yes,
+            dry_run,
+            args,
+        } => {
+            return claude_cmd(&cfg_path, model, fast_model, yes, dry_run, args);
         }
         Cmd::Completions { shell } => {
             clap_complete::generate(
@@ -2043,7 +2131,8 @@ async fn real_main() -> Result<ExitCode> {
         | Cmd::UpdateSettings { .. }
         | Cmd::Dict { .. }
         | Cmd::Usage { .. }
-        | Cmd::Tune { .. } => unreachable!(),
+        | Cmd::Tune { .. }
+        | Cmd::Claude { .. } => unreachable!(),
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -18,6 +18,7 @@ pub mod http;
 pub mod inflight;
 pub mod intake;
 pub mod keystore;
+pub mod launch;
 pub mod ledger;
 pub mod limits;
 pub mod mcp;
