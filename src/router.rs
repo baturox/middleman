@@ -45,18 +45,48 @@ fn sha(s: &str) -> String {
 }
 
 /// Text of the content (string, or text blocks), skipping injected `<system-reminder>` blocks.
+/// Remove Claude Code's injected `<system-reminder>…</system-reminder>` sections (they can share
+/// a text block with the user's own words), keeping everything else.
+fn strip_reminders(t: &str) -> String {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut out = String::with_capacity(t.len());
+    let mut rest = t;
+    while let Some(i) = rest.find(OPEN) {
+        out.push_str(&rest[..i]);
+        match rest[i..].find(CLOSE) {
+            Some(j) => rest = &rest[i + j + CLOSE.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// The user's own words in a message: text blocks with reminders stripped.
 fn content_text(c: &Value) -> String {
     match c {
-        Value::String(s) => s.clone(),
+        Value::String(s) => strip_reminders(s),
         Value::Array(a) => a
             .iter()
             .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
             .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .filter(|t| !t.trim_start().starts_with("<system-reminder>"))
+            .map(strip_reminders)
+            .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
             .join("\n"),
         _ => String::new(),
     }
+}
+
+fn has_tool_result(c: &Value) -> bool {
+    c.as_array().is_some_and(|a| {
+        a.iter()
+            .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+    })
 }
 
 fn last_message(body: &Value) -> Option<&Value> {
@@ -66,7 +96,8 @@ fn last_message(body: &Value) -> Option<&Value> {
 pub fn is_new_turn(body: &Value) -> bool {
     last_message(body).is_some_and(|m| {
         m.get("role").and_then(Value::as_str) == Some("user")
-            && !content_text(&m["content"]).trim().is_empty()
+            && !has_tool_result(&m["content"])
+            && !content_text(&m["content"]).is_empty()
     })
 }
 
@@ -315,6 +346,30 @@ impl Router {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Regression from the live smart bench: Claude Code puts its reminders and the prompt in
+    /// one text block, and appends reminders to tool-result messages.
+    #[test]
+    fn prompt_inside_a_reminder_block_is_found_and_tool_results_are_not_new_turns() {
+        let first = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "<system-reminder>\nCLAUDE.md says a lot of things\n</system-reminder>\nWrite unit tests for textkit/slug.py"}
+        ]}]});
+        assert!(is_new_turn(&first));
+        assert_eq!(
+            last_user_text(&first),
+            "Write unit tests for textkit/slug.py"
+        );
+        assert_eq!(classify(&last_user_text(&first)), Some(Class::Easy));
+        let tool_step = json!({"messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t", "content": "file"},
+                {"type": "text", "text": "<system-reminder>todo list changed</system-reminder>"}
+            ]}
+        ]});
+        assert!(!is_new_turn(&tool_step));
+    }
 
     fn body(msgs: Value) -> Value {
         json!({"system": "You are Claude Code", "messages": msgs})
