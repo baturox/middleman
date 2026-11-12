@@ -283,16 +283,26 @@ pub fn dry_run_text(p: &Plan) -> String {
         ),
         "  env (child only):".to_string(),
     ];
-    for (k, v) in build_env(MASKED_KEY, &p.main, &p.fast) {
-        let v = if k == "ANTHROPIC_API_KEY" {
-            "\"\"".into()
-        } else {
-            v
-        };
-        out.push(format!("    {k}={v}"));
-    }
-    for k in REMOVE_ENV {
-        out.push(format!("    unset {k}"));
+    if p.mode == Mode::Smart {
+        for (k, v) in proxy_env("http://127.0.0.1:<port>/<token>") {
+            out.push(format!("    {k}={v}"));
+        }
+        out.push(
+            "    (your Claude login is kept; the local proxy sends routine turns to OpenRouter)"
+                .into(),
+        );
+    } else {
+        for (k, v) in build_env(MASKED_KEY, &p.main, &p.fast) {
+            let v = if k == "ANTHROPIC_API_KEY" {
+                "\"\"".into()
+            } else {
+                v
+            };
+            out.push(format!("    {k}={v}"));
+        }
+        for k in REMOVE_ENV {
+            out.push(format!("    unset {k}"));
+        }
     }
     if !p.args.is_empty() {
         out.push(format!("  args     {}", p.args.join(" ")));
@@ -441,6 +451,16 @@ pub fn exec(c: &LaunchCmd) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    trait TapKey {
+        fn tap_key(self, var: &str) -> Self;
+    }
+    impl TapKey for Config {
+        fn tap_key(mut self, var: &str) -> Self {
+            self.providers.get_mut("openrouter").unwrap().key_env = Some(var.into());
+            self
+        }
+    }
 
     fn cfg(dir: &Path, extra: &str) -> Config {
         Config::from_toml(&format!(
@@ -591,5 +611,35 @@ key_env = "MM_TEST_OR_KEY_LAUNCH"
             vec![]
         )
         .is_err());
+    }
+
+    #[test]
+    fn smart_dry_run_keeps_login_and_hides_nothing_secret() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::env::set_var("MM_TEST_OR_KEY_SMART", "sk-or-v1-SECRETSECRET");
+        let c = cfg(d.path(), "").tap_key("MM_TEST_OR_KEY_SMART");
+        let p = prepare(
+            &c,
+            &repo,
+            Some(d.path()),
+            None,
+            None,
+            Mode::Smart,
+            true,
+            false,
+            vec![],
+        )
+        .unwrap();
+        let t = dry_run_text(&p);
+        assert!(
+            t.contains("mm-cheap-fast") && t.contains("mode     smart"),
+            "{t}"
+        );
+        assert!(
+            !t.contains("AUTH_TOKEN") && !t.contains("OAUTH") && !t.contains("SECRET"),
+            "{t}"
+        );
     }
 }
