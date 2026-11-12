@@ -3,6 +3,7 @@
 
 pub mod approval;
 pub mod audit;
+pub mod bench;
 pub mod budget;
 pub mod catalog;
 pub mod classify;

@@ -99,19 +99,27 @@ one extra turn, which re-reads the whole conversation, so it only pays off for l
 short sessions. middleman refuses jobs below that break-even point, based on your session's real
 context size.
 
-### Run a whole session on cheap models
+### Let cheap models do the routine work
 
 ```
-middleman claude            # Claude Code on OpenRouter; your Claude plan is not used
-middleman claude --model moonshotai/kimi-k3.1-pro --dry-run
+middleman claude                 # asks how to run; or: --mode smart | cheap | claude
 ```
 
-Main model `z-ai/glm-5.3`, fast model `deepseek/deepseek-v4.1-flash` (change with `--model`,
-`--fast-model` or `[launch] model` / `fast_model` in the config). Needs an OpenRouter key
-(`middleman provider add openrouter`). Warning: nothing is cleaned in this mode, so every file
-Claude Code reads goes to the model; only use it for code you'd be fine publishing. middleman
-asks once per repo (Allow once / Always); `--yes` allows once, and `[launch]` `allow = true` in
-the repo's `.middleman.toml` skips the question. Extra arguments go to `claude` after `--`.
+| Mode | What happens |
+|---|---|
+| `smart` (default) | A local proxy sends hard prompts to Claude and routine ones to a cheap OpenRouter model. Near your 5-hour limit (90%) everything goes cheap. |
+| `cheap` | Everything on the cheap model (`z-ai/glm-5.3`); your Claude plan is not used. |
+| `claude` | Normal Claude Code. |
+
+Switch while running with `middleman mode cheap`, or per prompt with `!cheap` / `!claude` at the start.
+Needs an OpenRouter key (`middleman provider add openrouter`); change models with `--model` or
+`[launch] model` in the config. Cheap turns send whole files **uncleaned**, so only use this for code
+you'd be fine publishing: middleman asks once per repo (or put `allow = true` under `[launch]` in
+`.middleman.toml`). Cheap models are weaker at hard multi-step work, and a model switch starts a
+fresh prompt cache.
+
+`middleman bench` runs 5 small tasks through each mode with real Claude Code and prints cost and pass
+rate per mode (`--modes cheap` never touches your Claude plan). It shows the worst-case spend first.
 
 ## Is it saving money?
 
@@ -180,7 +188,9 @@ its Keychain key: click **Always Allow**.
 | `setup claude [--undo\|--refresh]` | Connect to Claude Code, undo it, or update it after an upgrade |
 | `doctor` | Checklist of what works |
 | `provider add\|list\|test\|rotate\|remove` | Manage provider keys (never shown) |
-| `claude [--model ID] [--dry-run] [-- args]` | Run a whole Claude Code session on cheap OpenRouter models |
+| `claude [--mode smart\|cheap\|claude]` | Claude Code with cheap models doing the routine work |
+| `mode [smart\|cheap\|claude]` | Change the mode of a running session |
+| `bench` | Measure what each mode costs and whether it passes small tasks |
 | `login openrouter` | Get an OpenRouter key through the browser |
 | `dict suggest` | Propose company and people names for your private list |
 | `check <files>` | Dry run: show exactly what would be sent, without sending |
