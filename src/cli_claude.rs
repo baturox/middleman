@@ -150,7 +150,7 @@ pub fn claude_cmd(cfg_path: &Path, o: Opts) -> Result<ExitCode> {
         remember(asked)?;
         return launch::exec(&launch::LaunchCmd {
             program: claude,
-            args: o.args,
+            args: session_args(cfg_path, &cfg, &o.args),
             env: vec![],
             remove: vec![],
         });
@@ -230,11 +230,37 @@ fn claude_rest(
             bench_run: None,
         })?;
         let mut cmd = launch::command(claude, &plan);
+        cmd.args = session_args(cfg_path, cfg, &cmd.args);
         cmd.env = launch::proxy_env(&proxy.base_url);
         cmd.remove.clear();
         return launch::run_with_proxy(&cmd, proxy);
     }
-    launch::exec(&launch::command(claude, &plan))
+    let mut cmd = launch::command(claude, &plan);
+    cmd.args = session_args(cfg_path, cfg, &cmd.args);
+    launch::exec(&cmd)
+}
+
+/// `--settings` for this session only: middleman's status line (unless the user turned it off
+/// with `middleman statusline off`), so it shows in any repo without changing settings files.
+fn session_args(cfg_path: &Path, cfg: &Config, passthrough: &[String]) -> Vec<String> {
+    let mut args = vec![];
+    if cfg.statusline.enabled && !passthrough.iter().any(|a| a == "--settings") {
+        if let Ok(exe) = std::env::current_exe() {
+            let q = middleman::fsutil::shell_quote;
+            let command = format!(
+                "{} statusline --config {}",
+                q(&exe.display().to_string()),
+                q(&cfg_path.display().to_string())
+            );
+            let v = serde_json::json!({
+                "statusLine": {"type": "command", "command": command, "padding": 0}
+            });
+            args.push("--settings".to_string());
+            args.push(v.to_string());
+        }
+    }
+    args.extend(passthrough.iter().cloned());
+    args
 }
 
 pub fn mode_cmd(cfg_path: &Path, mode: Option<String>) -> Result<ExitCode> {
