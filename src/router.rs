@@ -89,8 +89,14 @@ fn has_tool_result(c: &Value) -> bool {
     })
 }
 
+/// The latest user or assistant message. Claude Code may append mid-conversation `system`
+/// messages (tool additions, effort changes) after the user's prompt; those are skipped.
 fn last_message(body: &Value) -> Option<&Value> {
-    body.get("messages")?.as_array()?.last()
+    body.get("messages")?
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) != Some("system"))
 }
 
 pub fn is_new_turn(body: &Value) -> bool {
@@ -121,7 +127,12 @@ pub fn conv_key(body: &Value) -> String {
 /// `!claude` / `!cheap` at the start of the latest user text forces this turn's route. The
 /// prefix is removed from the body in place; returns the forced route.
 pub fn take_force_prefix(body: &mut Value) -> Option<Route> {
-    let last = body.get_mut("messages")?.as_array_mut()?.last_mut()?;
+    let last = body
+        .get_mut("messages")?
+        .as_array_mut()?
+        .iter_mut()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) != Some("system"))?;
     fn strip(t: &str) -> Option<(Route, String)> {
         let t0 = t.trim_start();
         for (p, r) in [("!claude", Route::Claude), ("!cheap", Route::Cheap)] {
@@ -349,6 +360,17 @@ mod tests {
 
     /// Regression from the live smart bench: Claude Code puts its reminders and the prompt in
     /// one text block, and appends reminders to tool-result messages.
+    #[test]
+    fn trailing_system_message_does_not_hide_the_prompt() {
+        let mut b = json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "!cheap write unit tests for a.py"}]},
+            {"role": "system", "content": [{"type": "tool_addition", "tool": {"definition": {"name": "Bash"}}}]}
+        ]});
+        assert!(is_new_turn(&b));
+        assert_eq!(take_force_prefix(&mut b), Some(Route::Cheap));
+        assert_eq!(last_user_text(&b), "write unit tests for a.py");
+    }
+
     #[test]
     fn prompt_inside_a_reminder_block_is_found_and_tool_results_are_not_new_turns() {
         let first = json!({"messages": [{"role": "user", "content": [
