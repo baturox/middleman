@@ -1,4 +1,4 @@
-//! `middleman claude`: run a whole Claude Code session on OpenRouter models.
+//! `middleman claude`: run a whole Claude Code session on cheap models (OpenRouter or miav).
 //!
 //! Claude Code talks to OpenRouter directly (`ANTHROPIC_BASE_URL` + token), so nothing here is
 //! sanitized: a full session sends every file Claude Code reads to the chosen model. That is why
@@ -21,6 +21,76 @@ pub const DEFAULT_FAST_MODEL: &str = "deepseek/deepseek-v4.1-flash";
 pub const BASE_URL: &str = "https://openrouter.ai/api";
 const ALLOW_FILE: &str = "launch-allowed.json";
 
+/// An Anthropic-compatible upstream `middleman claude` can run a session on (`[launch]
+/// provider`). The key comes from `[providers.<name>]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Upstream {
+    pub name: &'static str,
+    pub label: &'static str,
+    /// Anthropic API root (Claude Code appends `/v1/messages`).
+    pub base_url: &'static str,
+    pub main: &'static str,
+    pub fast: &'static str,
+    /// Strip Claude-only request features before sending (the upstream is not Claude).
+    pub adapt: bool,
+    /// Extra child environment for direct (cheap) sessions.
+    pub extra_env: &'static [(&'static str, &'static str)],
+}
+
+pub const UPSTREAMS: &[Upstream] = &[
+    Upstream {
+        name: "openrouter",
+        label: "OpenRouter",
+        base_url: BASE_URL,
+        main: DEFAULT_MODEL,
+        fast: DEFAULT_FAST_MODEL,
+        adapt: true,
+        extra_env: &[],
+    },
+    // miav.cloud: a third-party gateway serving Claude-family models (200k context)
+    Upstream {
+        name: "miav",
+        label: "miav",
+        base_url: "https://miav.cloud/api/gateway",
+        main: "claude-opus-5.5",
+        fast: "gpt-6.1-sol",
+        adapt: false,
+        extra_env: &[("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "200000")],
+    },
+];
+
+/// `[launch] provider` (default openrouter).
+pub fn upstream(cfg: &Config) -> Result<&'static Upstream> {
+    let name = cfg.launch.provider.as_deref().unwrap_or("openrouter");
+    upstream_named(name)
+}
+
+pub fn upstream_named(name: &str) -> Result<&'static Upstream> {
+    UPSTREAMS.iter().find(|u| u.name == name).with_context(|| {
+        let known: Vec<_> = UPSTREAMS.iter().map(|u| u.name).collect();
+        format!(
+            "unknown [launch] provider `{name}` (known: {})",
+            known.join(", ")
+        )
+    })
+}
+
+/// The upstream's key from `[providers.<name>]`.
+pub fn upstream_key(cfg: &Config, u: &Upstream) -> Result<Secret> {
+    let hint = || {
+        anyhow::anyhow!(
+            "no {} key: run `middleman provider add {}`",
+            u.label,
+            u.name
+        )
+    };
+    cfg.providers
+        .get(u.name)
+        .ok_or_else(hint)?
+        .resolve_key()
+        .map_err(|_| hint())
+}
+
 /// Main and fast model: flag, then `[launch]` in the user config, then the default.
 pub fn resolve_models(
     cli_model: Option<&str>,
@@ -32,8 +102,9 @@ pub fn resolve_models(
             .or_else(|| conf.clone())
             .unwrap_or_else(|| def.to_string())
     };
-    let main = pick(cli_model, &cfg.launch.model, DEFAULT_MODEL);
-    let fast = pick(cli_fast, &cfg.launch.fast_model, DEFAULT_FAST_MODEL);
+    let u = upstream(cfg)?;
+    let main = pick(cli_model, &cfg.launch.model, u.main);
+    let fast = pick(cli_fast, &cfg.launch.fast_model, u.fast);
     for (what, id) in [("model", &main), ("fast model", &fast)] {
         if !valid_model_id(id) {
             bail!("invalid {what} id (allowed: letters, digits and . _ : / @ + -)");
@@ -43,10 +114,10 @@ pub fn resolve_models(
 }
 
 /// Environment for the child only. Opus/Sonnet/Fable/subagents use the main model, Haiku the fast one.
-pub fn build_env(key: &str, main: &str, fast: &str) -> Vec<(String, String)> {
+pub fn build_env(u: &Upstream, key: &str, main: &str, fast: &str) -> Vec<(String, String)> {
     let e = |k: &str, v: &str| (k.to_string(), v.to_string());
-    vec![
-        e("ANTHROPIC_BASE_URL", BASE_URL),
+    let mut v = vec![
+        e("ANTHROPIC_BASE_URL", u.base_url),
         e("ANTHROPIC_AUTH_TOKEN", key),
         e("ANTHROPIC_API_KEY", ""),
         e("ANTHROPIC_DEFAULT_OPUS_MODEL", main),
@@ -54,7 +125,9 @@ pub fn build_env(key: &str, main: &str, fast: &str) -> Vec<(String, String)> {
         e("ANTHROPIC_DEFAULT_FABLE_MODEL", main),
         e("CLAUDE_CODE_SUBAGENT_MODEL", main),
         e("ANTHROPIC_DEFAULT_HAIKU_MODEL", fast),
-    ]
+    ];
+    v.extend(u.extra_env.iter().map(|(k, x)| e(k, x)));
+    v
 }
 
 /// Variables removed from the child so the subscription login is not used.
@@ -177,6 +250,7 @@ pub fn refusal(root: &Path) -> String {
 
 pub struct Plan {
     pub mode: Mode,
+    pub upstream: &'static Upstream,
     pub key: Secret,
     pub main: String,
     pub fast: String,
@@ -188,8 +262,8 @@ pub struct Plan {
     pub args: Vec<String>,
 }
 
-fn price_text(cfg: &Config, cat: Option<&Catalog>, id: &str) -> Option<String> {
-    let p = Catalog::lookup(cfg, cat, "openrouter", id)?.prices?;
+fn price_text(cfg: &Config, cat: Option<&Catalog>, provider: &str, id: &str) -> Option<String> {
+    let p = Catalog::lookup(cfg, cat, provider, id)?.prices?;
     Some(format!(
         "(${:.2} / ${:.2} per 1M)",
         p.in_per_1m, p.out_per_1m
@@ -209,25 +283,20 @@ pub fn prepare(
     interactive: bool,
     args: Vec<String>,
 ) -> Result<Plan> {
-    let key = cfg
-        .providers
-        .get("openrouter")
-        .context("no OpenRouter key: run `middleman provider add openrouter`")?
-        .resolve_key()
-        .map_err(|_| {
-            anyhow::anyhow!("no OpenRouter key: run `middleman provider add openrouter`")
-        })?;
+    let u = upstream(cfg)?;
+    let key = upstream_key(cfg, u)?;
     let (main, fast) = resolve_models(model, fast_model, cfg)?;
     let root = project_root(cwd, home)?;
     let state = cfg.state_dir();
     let cat = Catalog::load(cfg);
     let credit_usd = crate::limits::load(&state)
-        .and_then(|c| c.providers.get("openrouter").and_then(|p| p.left_usd()));
+        .and_then(|c| c.providers.get(u.name).and_then(|p| p.left_usd()));
     let decision = decide(&root, overlay_allows(cwd), &state, yes, interactive);
     Ok(Plan {
         mode,
-        main_price: price_text(cfg, cat.as_ref(), &main),
-        fast_price: price_text(cfg, cat.as_ref(), &fast),
+        upstream: u,
+        main_price: price_text(cfg, cat.as_ref(), u.name, &main),
+        fast_price: price_text(cfg, cat.as_ref(), u.name, &fast),
         key,
         main,
         fast,
@@ -258,12 +327,12 @@ pub fn banner(p: &Plan) -> String {
         );
     }
     format!(
-        "🛡 middleman: Claude Code on OpenRouter · main {} · fast {}{credit} · your Claude plan is not used",
-        p.main, p.fast
+        "🛡 middleman: Claude Code on {} · main {} · fast {}{credit} · your Claude plan is not used",
+        p.upstream.label, p.main, p.fast
     )
 }
 
-pub const MASKED_KEY: &str = "sk-or-…(hidden)";
+pub const MASKED_KEY: &str = "…(hidden)";
 
 /// `--dry-run` text: what would be set (key masked), the root and the allow status.
 pub fn dry_run_text(p: &Plan) -> String {
@@ -287,12 +356,12 @@ pub fn dry_run_text(p: &Plan) -> String {
         for (k, v) in proxy_env("http://127.0.0.1:<port>/<token>") {
             out.push(format!("    {k}={v}"));
         }
-        out.push(
-            "    (your Claude login is kept; the local proxy sends routine turns to OpenRouter)"
-                .into(),
-        );
+        out.push(format!(
+            "    (your Claude login is kept; the local proxy sends routine turns to {})",
+            p.upstream.label
+        ));
     } else {
-        for (k, v) in build_env(MASKED_KEY, &p.main, &p.fast) {
+        for (k, v) in build_env(p.upstream, MASKED_KEY, &p.main, &p.fast) {
             let v = if k == "ANTHROPIC_API_KEY" {
                 "\"\"".into()
             } else {
@@ -322,7 +391,7 @@ pub fn command(program: PathBuf, p: &Plan) -> LaunchCmd {
     LaunchCmd {
         program,
         args: p.args.clone(),
-        env: build_env(p.key.expose(), &p.main, &p.fast),
+        env: build_env(p.upstream, p.key.expose(), &p.main, &p.fast),
         remove: REMOVE_ENV.iter().map(|s| s.to_string()).collect(),
     }
 }
@@ -359,6 +428,7 @@ pub struct ProxySpec<'a> {
     pub main: &'a str,
     pub fast: &'a str,
     pub key: &'a Secret,
+    pub provider: &'a str,
     pub project: &'a str,
     /// Bench run id: marks ledger lines `purpose: bench` and pins the mode.
     pub bench_run: Option<&'a str>,
@@ -380,6 +450,8 @@ pub fn spawn_proxy(s: &ProxySpec) -> Result<ProxyChild> {
             s.fast,
             "--project",
             s.project,
+            "--provider",
+            s.provider,
         ]);
     if let Some(r) = s.bench_run {
         cmd.args(["--bench-run", r]);
@@ -481,7 +553,7 @@ key_env = "MM_TEST_OR_KEY_LAUNCH"
 
     #[test]
     fn env_has_all_roles() {
-        let env = build_env("k", "m/main", "f/fast");
+        let env = build_env(&UPSTREAMS[0], "k", "m/main", "f/fast");
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("ANTHROPIC_BASE_URL"), Some(BASE_URL));
         assert_eq!(get("ANTHROPIC_AUTH_TOKEN"), Some("k"));
@@ -511,6 +583,47 @@ key_env = "MM_TEST_OR_KEY_LAUNCH"
             ("x/cli".into(), "b/conf".into())
         );
         assert!(resolve_models(Some("bad id</x>"), None, &c).is_err());
+    }
+
+    #[test]
+    fn miav_upstream_defaults_env_and_key() {
+        let d = tempfile::tempdir().unwrap();
+        let c = cfg(
+            d.path(),
+            "[providers.miav]\npreset = \"miav\"\nkey_env = \"MM_TEST_MIAV_KEY_LAUNCH\"\n[launch]\nprovider = \"miav\"\n",
+        );
+        let u = upstream(&c).unwrap();
+        assert_eq!(u.name, "miav");
+        assert!(
+            !u.adapt,
+            "miav serves Claude models: send requests unchanged"
+        );
+        assert_eq!(
+            resolve_models(None, None, &c).unwrap(),
+            ("claude-opus-5.5".into(), "gpt-6.1-sol".into())
+        );
+        let env = build_env(u, "k", "m", "f");
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(
+            get("ANTHROPIC_BASE_URL"),
+            Some("https://miav.cloud/api/gateway")
+        );
+        assert_eq!(get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"), Some("200000"));
+        assert!(upstream_key(&c, u)
+            .unwrap_err()
+            .to_string()
+            .contains("provider add miav"));
+        std::env::set_var("MM_TEST_MIAV_KEY_LAUNCH", "miav-test-key");
+        assert_eq!(upstream_key(&c, u).unwrap().expose(), "miav-test-key");
+        std::env::remove_var("MM_TEST_MIAV_KEY_LAUNCH");
+        // the default stays OpenRouter, and an unknown name is a clear error
+        let d2 = tempfile::tempdir().unwrap();
+        assert_eq!(upstream(&cfg(d2.path(), "")).unwrap().name, "openrouter");
+        assert!(upstream_named("nope")
+            .unwrap_err()
+            .to_string()
+            .contains("miav"));
+        assert!(crate::providers::presets::find("miav").is_some());
     }
 
     #[test]
@@ -590,7 +703,7 @@ key_env = "MM_TEST_OR_KEY_LAUNCH"
         .unwrap();
         assert_eq!(p.decision, Decision::Refuse);
         let t = dry_run_text(&p);
-        assert!(t.contains("sk-or-…(hidden)"));
+        assert!(t.contains("…(hidden)"));
         assert!(!t.contains("SECRETSECRET"));
         assert!(t.contains("ANTHROPIC_API_KEY=\"\""));
         assert!(t.contains("unset CLAUDE_CODE_OAUTH_TOKEN"));

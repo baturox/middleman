@@ -205,6 +205,8 @@ impl Default for StatuslineCfg {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct LaunchCfg {
+    /// Upstream for the cheap side: `openrouter` (default) or `miav`.
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub fast_model: Option<String>,
 }

@@ -31,10 +31,12 @@ fn header(cfg: &Config) -> String {
     {
         parts.push(format!("Claude 5h: {:.0}% used", u.pct));
     }
-    if let Some(c) = middleman::limits::load(&state)
-        .and_then(|c| c.providers.get("openrouter").and_then(|p| p.left_usd()))
-    {
-        parts.push(format!("OpenRouter: ${c:.2} left"));
+    if let Ok(u) = launch::upstream(cfg) {
+        if let Some(c) = middleman::limits::load(&state)
+            .and_then(|c| c.providers.get(u.name).and_then(|p| p.left_usd()))
+        {
+            parts.push(format!("{}: ${c:.2} left", u.label));
+        }
     }
     let mut h = "🛡 middleman · how should this session run?".to_string();
     if !parts.is_empty() {
@@ -226,6 +228,7 @@ fn claude_rest(
             main: &plan.main,
             fast: &plan.fast,
             key: &plan.key,
+            provider: plan.upstream.name,
             project: &project,
             bench_run: None,
         })?;
@@ -307,14 +310,17 @@ pub async fn proxy_cmd(
     fast: String,
     project: String,
     bench_run: Option<String>,
+    provider: String,
 ) -> Result<ExitCode> {
     let cfg = Config::load(cfg_path)?;
+    let up = launch::upstream_named(&provider)?;
     let key = Secret::new(std::env::var("MM_PROXY_KEY").context("MM_PROXY_KEY not set")?);
     let token = std::env::var("MM_PROXY_TOKEN").context("MM_PROXY_TOKEN not set")?;
     std::env::remove_var("MM_PROXY_KEY");
     std::env::remove_var("MM_PROXY_TOKEN");
     let mut pc = middleman::proxy::ProxyCfg::from_config(
         &cfg,
+        up,
         key,
         token,
         mode.parse()?,
@@ -332,7 +338,7 @@ pub async fn proxy_cmd(
         pc.anthropic_url = u;
     }
     if let Some(u) = loopback_override("MM_PROXY_OPENROUTER_URL") {
-        pc.openrouter_url = u;
+        pc.cheap_url = u;
     }
     let (listener, port) = middleman::proxy::bind().await?;
     say!("{port}");

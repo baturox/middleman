@@ -31,7 +31,6 @@ use crate::pseudo::Vault;
 use crate::router::{self, Class, Route, Router, Step};
 
 pub const ANTHROPIC_URL: &str = "https://api.anthropic.com";
-pub const OPENROUTER_URL: &str = "https://openrouter.ai/api";
 /// Model names the launcher gives Claude Code for its background and subagent roles.
 pub const MARK_FAST: &str = "mm-cheap-fast";
 pub const MARK_SUB: &str = "mm-cheap-sub";
@@ -46,8 +45,12 @@ pub struct ProxyCfg {
     pub state_dir: PathBuf,
     pub token: String,
     pub anthropic_url: String,
-    pub openrouter_url: String,
-    pub openrouter_key: Secret,
+    pub cheap_url: String,
+    pub cheap_key: Secret,
+    /// Ledger name of the cheap upstream (`openrouter`, `miav`).
+    pub cheap_provider: String,
+    /// Strip Claude-only features before a cheap request (false for Claude-backed upstreams).
+    pub adapt: bool,
     pub main_model: String,
     pub fast_model: String,
     pub mode: Mode,
@@ -64,8 +67,10 @@ pub struct ProxyCfg {
 }
 
 impl ProxyCfg {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_config(
         cfg: &Config,
+        up: &crate::launch::Upstream,
         key: Secret,
         token: String,
         mode: Mode,
@@ -79,16 +84,17 @@ impl ProxyCfg {
             .as_ref()
             .and_then(|p| crate::detect::Dictionary::load(p).ok());
         let cat = crate::catalog::Catalog::load(cfg);
-        let cheap_prices =
-            crate::catalog::Catalog::lookup(cfg, cat.as_ref(), "openrouter", &main_model)
-                .and_then(|p| p.prices)
-                .map(|p| (p.in_per_1m, p.out_per_1m));
+        let cheap_prices = crate::catalog::Catalog::lookup(cfg, cat.as_ref(), up.name, &main_model)
+            .and_then(|p| p.prices)
+            .map(|p| (p.in_per_1m, p.out_per_1m));
         ProxyCfg {
             state_dir: cfg.state_dir(),
             token,
             anthropic_url: ANTHROPIC_URL.into(),
-            openrouter_url: OPENROUTER_URL.into(),
-            openrouter_key: key,
+            cheap_url: up.base_url.into(),
+            cheap_key: key,
+            cheap_provider: up.name.into(),
+            adapt: up.adapt,
             main_model,
             fast_model,
             mode,
@@ -127,7 +133,7 @@ pub async fn bind() -> Result<(tokio::net::TcpListener, u16)> {
 
 pub async fn serve(cfg: ProxyCfg, listener: tokio::net::TcpListener) -> Result<()> {
     check_upstream(&cfg.anthropic_url)?;
-    check_upstream(&cfg.openrouter_url)?;
+    check_upstream(&cfg.cheap_url)?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(15))
@@ -207,7 +213,7 @@ async fn send(
 ) -> Result<reqwest::Response> {
     let base = match target {
         Target::Anthropic => &st.cfg.anthropic_url,
-        Target::OpenRouter => &st.cfg.openrouter_url,
+        Target::OpenRouter => &st.cfg.cheap_url,
     };
     let mut rb = st
         .client
@@ -229,7 +235,7 @@ async fn send(
     if target == Target::OpenRouter {
         let mut v = reqwest::header::HeaderValue::from_str(&format!(
             "Bearer {}",
-            st.cfg.openrouter_key.expose()
+            st.cfg.cheap_key.expose()
         ))?;
         v.set_sensitive(true);
         rb = rb.header("authorization", v);
@@ -329,7 +335,9 @@ async fn handle_inner(st: Arc<St>, req: Request<Incoming>) -> Result<Response<Bo
     let cheap_body = |j: &Value| -> Result<Bytes> {
         let mut c = j.clone();
         c["model"] = json!(cheap_id);
-        adapt_for_cheap(&mut c);
+        if st.cfg.adapt {
+            adapt_for_cheap(&mut c);
+        }
         if std::env::var_os("MIDDLEMAN_PROXY_SHAPE").is_some() {
             log_shape(&st, &c);
         }
@@ -584,7 +592,7 @@ fn log_shape(st: &St, j: &Value) {
 /// first 2 KB of the body with the OpenRouter key scrubbed. Never the request.
 fn log_provider_error(st: &St, status: u16, body: &[u8]) {
     use std::io::Write;
-    let key = st.cfg.openrouter_key.expose();
+    let key = st.cfg.cheap_key.expose();
     let mut text: String = String::from_utf8_lossy(body).into_owned();
     if !key.is_empty() {
         text = text.replace(key, "[key]");
@@ -616,23 +624,21 @@ async fn ask_router(st: &St, text: &str) -> Option<Class> {
         },
         &Vault::new(""),
         &st.cfg.detector,
-        &[&st.cfg.openrouter_key],
+        &[&st.cfg.cheap_key],
     )
     .ok()?;
     let r = sealed.get();
     let body = json!({"model": r.model, "max_tokens": r.max_tokens, "system": r.system,
         "messages": [{"role": "user", "content": r.user}]});
-    let mut auth = reqwest::header::HeaderValue::from_str(&format!(
-        "Bearer {}",
-        st.cfg.openrouter_key.expose()
-    ))
-    .ok()?;
+    let mut auth =
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", st.cfg.cheap_key.expose()))
+            .ok()?;
     auth.set_sensitive(true);
     let resp = st
         .client
         .post(format!(
             "{}/v1/messages",
-            st.cfg.openrouter_url.trim_end_matches('/')
+            st.cfg.cheap_url.trim_end_matches('/')
         ))
         .header("authorization", auth)
         .header("anthropic-version", "2023-06-01")
@@ -806,7 +812,11 @@ fn finish(st: &St, ctx: Ctx, status: StatusCode, stream_ok: bool, buf: &[u8]) {
         task_kind: "session".into(),
         mode: ctx.mode,
         chain_step: ctx.route.as_str().into(),
-        provider: if cheap { "openrouter" } else { "anthropic" }.into(),
+        provider: if cheap {
+            st.cfg.cheap_provider.clone()
+        } else {
+            "anthropic".into()
+        },
         model: ctx.model,
         status: if success { "ok" } else { "error" }.into(),
         closing: Some(true),

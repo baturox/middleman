@@ -113,7 +113,8 @@ middleman claude                 # asks how to run; or: --mode smart | cheap | c
 
 Switch while running with `middleman mode cheap`, or per prompt with `!cheap` / `!claude` at the start.
 Needs an OpenRouter key (`middleman provider add openrouter`); change models with `--model` or
-`[launch] model` in the config. Cheap turns send whole files **uncleaned**, so only use this for code
+`[launch] model` in the config. To run on miav instead (`claude-opus-5.5`, `gpt-6.1-sol`):
+`middleman provider add miav`, then `provider = "miav"` under `[launch]`. Cheap turns send whole files **uncleaned**, so only use this for code
 you'd be fine publishing: middleman asks once per repo (or put `allow = true` under `[launch]` in
 `.middleman.toml`). Cheap models are weaker at hard multi-step work, and a model switch starts a
 fresh prompt cache.

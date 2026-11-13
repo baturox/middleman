@@ -34,16 +34,10 @@ pub async fn bench_cmd(
     if launch::find_on_path("python3", &path).is_none() {
         bail!("`python3` not found on PATH (the sample project needs it)");
     }
+    let up = launch::upstream(&cfg)?;
     let key = if modes.iter().any(|m| *m != Mode::Claude) {
         let (main, fast) = launch::resolve_models(None, None, &cfg)?;
-        let k = cfg
-            .providers
-            .get("openrouter")
-            .context("no OpenRouter key: run `middleman provider add openrouter`")?
-            .resolve_key()
-            .map_err(|_| {
-                anyhow::anyhow!("no OpenRouter key: run `middleman provider add openrouter`")
-            })?;
+        let k = launch::upstream_key(&cfg, up)?;
         Some((k, main, fast))
     } else {
         None
@@ -61,7 +55,7 @@ pub async fn bench_cmd(
         e.max_usd
     );
     if e.claude_requests == 0 {
-        note!("  your Claude plan is not used (OpenRouter only)");
+        note!("  your Claude plan is not used ({} only)", up.label);
     }
     match bench::guard(yes, interactive()) {
         Guard::Go => {}
@@ -98,6 +92,7 @@ pub async fn bench_cmd(
                     main,
                     fast,
                     key: k,
+                    provider: up.name,
                     project: "bench",
                     bench_run: Some(&run_id),
                 })?;

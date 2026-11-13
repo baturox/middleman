@@ -36,6 +36,7 @@ async fn harness(mode: Mode) -> H {
     .unwrap();
     let mut pc = ProxyCfg::from_config(
         &cfg,
+        &middleman::launch::UPSTREAMS[0],
         Secret::new("sk-or-v1-secretkey"),
         TOKEN.into(),
         mode,
@@ -44,7 +45,7 @@ async fn harness(mode: Mode) -> H {
         "p-test".into(),
     );
     pc.anthropic_url = anthropic.uri();
-    pc.openrouter_url = openrouter.uri();
+    pc.cheap_url = openrouter.uri();
     pc.cheap_prices = Some((1.0, 2.0));
     let (l, port) = proxy::bind().await.unwrap();
     tokio::spawn(proxy::serve(pc, l));

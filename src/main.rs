@@ -312,6 +312,8 @@ enum Cmd {
         project: String,
         #[arg(long)]
         bench_run: Option<String>,
+        #[arg(long, default_value = "openrouter")]
+        provider: String,
     },
     /// Measure what each mode costs on a small built-in set of tasks (runs real Claude Code)
     Bench {
@@ -1573,9 +1575,12 @@ async fn real_main() -> Result<ExitCode> {
             fast_model,
             project,
             bench_run,
+            provider,
         } => {
-            return cli_claude::proxy_cmd(&cfg_path, mode, model, fast_model, project, bench_run)
-                .await;
+            return cli_claude::proxy_cmd(
+                &cfg_path, mode, model, fast_model, project, bench_run, provider,
+            )
+            .await;
         }
         Cmd::Bench {
             modes,

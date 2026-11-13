@@ -240,6 +240,19 @@ pub const PRESETS: &[Preset] = &[
         ..BASE
     },
     Preset {
+        name: "miav",
+        label: "miav",
+        blurb: "miav.cloud gateway: Claude-family models (claude-opus-5.5, gpt-6.1-sol)",
+        api: Api::Anthropic,
+        base_url: "https://miav.cloud/api/gateway/v1",
+        key_env: Some("MIAV_KEY"),
+        key_url: Some("https://miav.cloud"),
+        key_prefix: Some("miav_"),
+        verified: true,
+        hidden: true,
+        ..BASE
+    },
+    Preset {
         name: "yapayzekalab",
         label: "yapayzekalab",
         blurb: "legacy gateway preset",
