@@ -1157,44 +1157,42 @@ pub enum Pick {
     Custom,
 }
 
-fn group_short(g: Group) -> &'static str {
+/// Short tag after the one-liner: only for groups worth flagging.
+fn group_tag(ui: &Ui, g: Group) -> String {
     match g {
-        Group::Recommended => "Recommended",
-        Group::Direct => "Direct",
-        Group::Local => "Local, free",
+        Group::Recommended => ui.green(" · recommended"),
+        Group::Local => ui.green(" · local, free"),
+        Group::Direct => String::new(),
     }
 }
 
-/// Picker rows: a group column (shown on the first row of each group), the name and a dim
-/// one-liner. `added(name)` marks providers already set up in this run.
+/// Picker rows: the name in a column sized to the longest name, then a dim one-liner and a
+/// short tag (recommended / local). Rows stay grouped by order, without a wide group column.
+/// `added(name)` marks providers already set up in this run.
 pub fn picker_items(ui: &Ui, added: impl Fn(&str) -> bool) -> (Vec<String>, Vec<Pick>) {
+    let visible = presets::visible();
+    let w = visible
+        .iter()
+        .map(|p| p.label.chars().count())
+        .chain(std::iter::once("Custom URL".len()))
+        .max()
+        .unwrap_or(10);
     let mut items = vec![];
     let mut picks = vec![];
-    let mut last = None;
-    for p in presets::visible() {
-        let g = if last != Some(p.group) {
-            last = Some(p.group);
-            group_short(p.group)
-        } else {
-            ""
-        };
+    for p in visible {
         let mut blurb = ui.dim(p.blurb);
         if !p.verified && p.trust != middleman::config::Trust::Local {
             blurb.push_str(&ui.yellow(" · URL unverified"));
         }
+        blurb.push_str(&group_tag(ui, p.group));
         if added(p.name) {
             blurb.push_str(&ui.green(" ✓ added"));
         }
-        items.push(format!(
-            "{} {:<17} {blurb}",
-            ui.dim(&format!("{g:<12}")),
-            p.label
-        ));
+        items.push(format!("{:<w$}  {blurb}", p.label));
         picks.push(Pick::Preset(p));
     }
     items.push(format!(
-        "{} {:<17} {}",
-        ui.dim(&format!("{:<12}", "Other")),
+        "{:<w$}  {}",
         "Custom URL",
         ui.dim("any OpenAI-compatible endpoint")
     ));

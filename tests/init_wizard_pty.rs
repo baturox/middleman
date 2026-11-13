@@ -159,7 +159,7 @@ fn wizard_update_existing_config_adds_a_local_provider() {
     r.send("\r"); // user
     r.expect("Pick a provider");
     r.expect("Custom URL");
-    for _ in 0..11 {
+    for _ in 0..13 {
         r.send(DOWN); // ... Ollama, the first local entry
     }
     r.send("\r");

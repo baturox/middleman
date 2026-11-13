@@ -302,14 +302,17 @@ fn non_interactive_init_checks_and_stores_the_key() {
         KEY
     );
 
-    // --list: grouped, no legacy/alias presets, key status without the value
+    // --list: grouped, no alias presets, key status without the value
     let (out, _) = run(mm(home).args(["init", "--list", "--config", &cfg_s]));
     assert!(
         out.contains("Recommended") && out.contains("Direct vendors"),
         "{out}"
     );
     assert!(out.find("openrouter").unwrap() < out.find("deepseek").unwrap());
-    assert!(!out.contains("yapayzekalab") && !out.contains("YZLAB"));
+    assert!(
+        out.contains("miav") && out.contains("yapayzekalab"),
+        "{out}"
+    );
     assert!(out.contains("✓ key stored"), "{out}");
     assert!(out.contains("— not set"), "{out}");
     let (out2, _) = run(mm(home).args(["provider", "list", "--all", "--config", &cfg_s]));

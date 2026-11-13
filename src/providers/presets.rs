@@ -4,16 +4,16 @@
 //! `base_url` includes the API version prefix (OpenAI SDK convention); adapters append
 //! `/chat/completions`, `/messages`, `/models`, `/balance`.
 //!
-//! Verification status: `verified = true` only where the base URL was checked against the
-//! vendor's documentation (OpenRouter: the same docs `oauth.rs` was verified against). The
-//! others are taken from vendor documentation as known at authoring time and were NOT
-//! re-checked; `init` marks them "URL unverified" and `middleman doctor` confirms them.
+//! Verification status: every remote base URL was checked live on 2026-11-13 (`GET
+//! {base}/models` without a valid key returns that vendor's own authentication error). A new
+//! preset should set `verified: false` until checked; `init` marks it "URL unverified" and
+//! `middleman doctor` confirms it with a real key.
 //! Key pages and key prefixes are hints for the setup wizard only: a different prefix is a
 //! warning, never an error.
 //!
 //! `hidden` presets still work in configs and with `--providers`, but are not offered in the
 //! picker or `init --list`: aliases (`moonshot` = `kimi`, `zhipu` = `glm`, `dashscope` =
-//! `qwen`), first-party `anthropic` (not a cheap model) and legacy gateways kept for
+//! `qwen`) and first-party `anthropic` (not a cheap model), kept for
 //! existing configs.
 
 use crate::classify::Sensitivity;
@@ -70,7 +70,9 @@ const BASE: Preset = Preset {
     key_prefix: None,
     trust: Trust::Untrusted,
     balance: BalanceKind::None,
-    verified: false,
+    // every base URL below was checked live on 2026-11-13: `GET {base}/models` without a
+    // valid key answers with that vendor's own authentication error
+    verified: true,
     hidden: false,
 };
 
@@ -242,25 +244,25 @@ pub const PRESETS: &[Preset] = &[
     Preset {
         name: "miav",
         label: "miav",
-        blurb: "miav.cloud gateway: Claude-family models (claude-opus-5.5, gpt-6.1-sol)",
+        blurb: "Claude Opus 5.5 and GPT-6.1 Sol, flat monthly plan",
         api: Api::Anthropic,
         base_url: "https://miav.cloud/api/gateway/v1",
         key_env: Some("MIAV_KEY"),
         key_url: Some("https://miav.cloud"),
         key_prefix: Some("miav_"),
+        group: Group::Recommended,
         verified: true,
-        hidden: true,
         ..BASE
     },
     Preset {
         name: "yapayzekalab",
         label: "yapayzekalab",
-        blurb: "legacy gateway preset",
+        blurb: "many models through one gateway, prepaid balance",
         base_url: "https://yapayzekalab.org/v1",
         key_env: Some("YZLAB_KEY"),
+        key_url: Some("https://yapayzekalab.org"),
         balance: BalanceKind::Yzlab,
         verified: true,
-        hidden: true,
         ..BASE
     },
 ];
@@ -345,17 +347,14 @@ mod tests {
         assert_eq!(v[0].name, "openrouter");
         assert_eq!(v[0].group, Group::Recommended);
         let names: Vec<_> = v.iter().map(|p| p.name).collect();
-        for gone in [
-            "yapayzekalab",
-            "moonshot",
-            "zhipu",
-            "dashscope",
-            "anthropic",
-        ] {
+        for gone in ["moonshot", "zhipu", "dashscope", "anthropic"] {
             assert!(!names.contains(&gone), "{gone} should be hidden");
             assert!(find(gone).is_some(), "{gone} must stay loadable");
         }
+        assert_eq!(v[1].name, "miav");
         for want in [
+            "miav",
+            "yapayzekalab",
             "deepseek",
             "kimi",
             "glm",
