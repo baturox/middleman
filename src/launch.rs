@@ -55,7 +55,12 @@ pub const UPSTREAMS: &[Upstream] = &[
         main: "claude-opus-5.5",
         fast: "gpt-6.1-sol",
         adapt: false,
-        extra_env: &[("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "200000")],
+        // 200k context; and miav cannot carry auto mode's server-side checks (it rewrites
+        // requests), so Claude Code should not ask for them there (no fallback notice)
+        extra_env: &[
+            ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "200000"),
+            ("CLAUDE_CODE_AUTO_MODE_SERVER", "0"),
+        ],
     },
 ];
 
@@ -609,6 +614,7 @@ key_env = "MM_TEST_OR_KEY_LAUNCH"
             Some("https://miav.cloud/api/gateway")
         );
         assert_eq!(get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"), Some("200000"));
+        assert_eq!(get("CLAUDE_CODE_AUTO_MODE_SERVER"), Some("0"));
         assert!(upstream_key(&c, u)
             .unwrap_err()
             .to_string()
