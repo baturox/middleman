@@ -9,25 +9,11 @@ use anyhow::{bail, Context, Result};
 use middleman::bench::{self, Guard, TaskResult, TASKS};
 use middleman::launch;
 use middleman::ledger::{now_unix, Ledger};
-use middleman::modes::Mode;
 
 use crate::{interactive, load, theme};
 
-pub async fn bench_cmd(
-    cfg_path: &Path,
-    modes: &str,
-    tasks: usize,
-    keep: bool,
-    yes: bool,
-) -> Result<ExitCode> {
+pub async fn bench_cmd(cfg_path: &Path, tasks: usize, keep: bool, yes: bool) -> Result<ExitCode> {
     let cfg = load(cfg_path)?;
-    let modes: Vec<Mode> = modes
-        .split(',')
-        .map(|m| m.trim().parse())
-        .collect::<Result<_>>()?;
-    if modes.is_empty() {
-        bail!("--modes needs at least one of smart, cheap, claude");
-    }
     let n = tasks.clamp(1, TASKS.len());
     let path = std::env::var_os("PATH").unwrap_or_default();
     let claude = launch::find_on_path("claude", &path).context("`claude` not found on PATH")?;
@@ -35,32 +21,27 @@ pub async fn bench_cmd(
         bail!("`python3` not found on PATH (the sample project needs it)");
     }
     let up = launch::upstream(&cfg)?;
-    let key = if modes.iter().any(|m| *m != Mode::Claude) {
-        let (main, fast) = launch::resolve_models(None, None, &cfg)?;
-        let k = launch::upstream_key(&cfg, up)?;
-        Some((k, main, fast))
-    } else {
-        None
-    };
+    let (main, fast) = launch::resolve_models(None, None, &cfg)?;
+    let key = launch::upstream_key(&cfg, up)?;
 
-    let e = bench::estimate(&modes, n);
+    let e = bench::estimate(n);
     note!(
-        "middleman bench: {} task(s) x {} mode(s) on a built-in sample project, in temporary folders.",
-        n,
-        modes.len()
+        "middleman bench: {} task(s) on a built-in sample project, in temporary folders.",
+        n
+    );
+    note!(
+        "  Claude plans and checks; its subagents run on {main} ({})",
+        up.label
     );
     note!(
         "  worst case: up to {} Claude requests and about ${:.2} in total (typically far less)",
         e.claude_requests,
         e.max_usd
     );
-    if e.claude_requests == 0 {
-        note!("  your Claude plan is not used ({} only)", up.label);
-    }
     match bench::guard(yes, interactive()) {
         Guard::Go => {}
         Guard::Refuse => {
-            bail!("re-run with --yes to spend this (or `--modes cheap` to avoid Claude)")
+            bail!("re-run with --yes to spend this")
         }
         Guard::Ask => {
             if !dialoguer::Confirm::with_theme(&theme())
@@ -76,31 +57,25 @@ pub async fn bench_cmd(
     let state = cfg.state_dir();
     let exe = std::env::current_exe()?;
     let mut results: Vec<TaskResult> = vec![];
-    for mode in &modes {
-        for task in TASKS.iter().take(n) {
+    for task in TASKS.iter().take(n) {
+        {
             let tmp = std::env::temp_dir()
                 .join(format!("middleman-bench-{}", uuid::Uuid::new_v4().simple()));
             bench::copy_fixture(&tmp)?;
             let run_id = uuid::Uuid::new_v4().to_string();
-            let mut env: Vec<(String, String)> = vec![];
-            let mut proxy = None;
-            if let Some((k, main, fast)) = key.as_ref().filter(|_| *mode != Mode::Claude) {
-                let p = launch::spawn_proxy(&launch::ProxySpec {
-                    exe: &exe,
-                    cfg_path,
-                    mode: *mode,
-                    main,
-                    fast,
-                    key: k,
-                    provider: up.name,
-                    project: "bench",
-                    bench_run: Some(&run_id),
-                })?;
-                env = launch::proxy_env(&p.base_url);
-                proxy = Some(p);
-            }
-            let out =
-                bench::run_claude(&claude, &tmp, task.prompt, &env, bench::TASK_TIMEOUT).await;
+            let proxy = launch::spawn_proxy(&launch::ProxySpec {
+                exe: &exe,
+                cfg_path,
+                main: &main,
+                fast: &fast,
+                key: &key,
+                provider: up.name,
+                project: "bench",
+                bench_run: Some(&run_id),
+            })?;
+            let env = launch::proxy_env(&proxy.base_url, &main);
+            let prompt = format!("{}{}", bench::DELEGATE_PREFIX, task.prompt);
+            let out = bench::run_claude(&claude, &tmp, &prompt, &env, bench::TASK_TIMEOUT).await;
             tokio::time::sleep(std::time::Duration::from_millis(400)).await; // proxy ledger writes
             drop(proxy);
             let (stdout, secs, mut reason) = match out {
@@ -111,15 +86,14 @@ pub async fn bench_cmd(
                     e.to_string(),
                 ),
             };
-            let (total, turns) = bench::parse_claude_json(&stdout);
+            let (total, _turns) = bench::parse_claude_json(&stdout);
             let run: Vec<_> = Ledger::new(&state)
                 .and_then(|l| l.entries())
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|e| e.session_id.as_deref() == Some(run_id.as_str()))
                 .collect();
-            let (claude_usd, cheap_usd, claude_turns, cheap_turns) =
-                bench::split_cost(*mode, total, turns, &run);
+            let (claude_usd, cheap_usd, claude_turns, cheap_turns) = bench::split_cost(total, &run);
             let passed = match bench::check_task(&tmp, task) {
                 Ok(()) => reason.is_empty(),
                 Err(why) => {
@@ -130,15 +104,16 @@ pub async fn bench_cmd(
                 }
             };
             note!(
-                "  {:<7} {:<20} {} {:>5.0}s  ${:.3}",
-                mode,
+                "  {:<20} {} {:>5.0}s  ${:.3}  ({} Claude / {} agent requests)",
                 task.id,
                 if passed { "pass" } else { "FAIL" },
                 secs,
-                claude_usd + cheap_usd
+                claude_usd + cheap_usd,
+                claude_turns,
+                cheap_turns
             );
             results.push(TaskResult {
-                mode: mode.to_string(),
+                mode: "middleman".into(),
                 task: task.id.into(),
                 passed,
                 reason,

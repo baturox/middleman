@@ -99,28 +99,25 @@ one extra turn, which re-reads the whole conversation, so it only pays off for l
 short sessions. middleman refuses jobs below that break-even point, based on your session's real
 context size.
 
-### Let cheap models do the routine work
+### Claude is the brain, middleman runs the agents
 
 ```
-middleman claude                 # asks how to run; or: --mode smart | cheap | claude
+middleman claude
 ```
 
-| Mode | What happens |
-|---|---|
-| `smart` (default) | A local proxy sends hard prompts to Claude and routine ones to a cheap OpenRouter model. Near your 5-hour limit (90%) everything goes cheap. |
-| `cheap` | Everything on the cheap model (`z-ai/glm-5.3`); your Claude plan is not used. |
-| `claude` | Normal Claude Code. |
+Your prompts and the main conversation stay on Claude, with your normal login. The agents Claude
+starts (subagents) and its background jobs run on middleman's worker provider through a local
+proxy, so the heavy lifting does not use your Claude plan.
 
-Switch while running with `middleman mode cheap`, or per prompt with `!cheap` / `!claude` at the start.
-Needs an OpenRouter key (`middleman provider add openrouter`); change models with `--model` or
-`[launch] model` in the config. To run on miav instead (`claude-opus-5.5`, `gpt-6.1-sol`):
-`middleman provider add miav`, then `provider = "miav"` under `[launch]`. Cheap turns send whole files **uncleaned**, so only use this for code
-you'd be fine publishing: middleman asks once per repo (or put `allow = true` under `[launch]` in
-`.middleman.toml`). Cheap models are weaker at hard multi-step work, and a model switch starts a
-fresh prompt cache.
+Pick the worker provider under `[launch]` in the config: `provider = "miav"` (`claude-opus-5.5`,
+`gpt-6.1-sol`; `middleman provider add miav`) or `"openrouter"` (default, `z-ai/glm-5.3`); change
+the agent model with `--model` or `[launch] model`. Agents send the files they read to that
+provider **uncleaned**, so middleman asks once per repo (or put `allow = true` under `[launch]` in
+`.middleman.toml`).
 
-`middleman bench` runs 5 small tasks through each mode with real Claude Code and prints cost and pass
-rate per mode (`--modes cheap` never touches your Claude plan). It shows the worst-case spend first.
+`middleman bench` runs 5 small tasks with real Claude Code, Claude delegating each to a subagent,
+and prints pass rate, cost and how many requests went to Claude and to the agents. It shows the
+worst-case spend first.
 
 ## Is it saving money?
 
@@ -131,7 +128,7 @@ middleman report --since 7d        # also --by model|task|day, --html for a dash
 **Saved** is what Claude would have charged to write the output, minus:
 
 - Claude's own cost for the hand-off (the tool call, the extra turn, reading the result);
-- the cheap model's cost, as billed by OpenRouter.
+- the cheap model's cost, as billed by the provider.
 
 Blocked jobs count their overhead too, and a loss is shown as a loss. `middleman report --reconcile`
 checks the log against your OpenRouter account. On a Pro/Max subscription, savings mean more usage
@@ -189,9 +186,8 @@ its Keychain key: click **Always Allow**.
 | `setup claude [--undo\|--refresh]` | Connect to Claude Code, undo it, or update it after an upgrade |
 | `doctor` | Checklist of what works |
 | `provider add\|list\|test\|rotate\|remove` | Manage provider keys (never shown) |
-| `claude [--mode smart\|cheap\|claude]` | Claude Code with cheap models doing the routine work |
-| `mode [smart\|cheap\|claude]` | Change the mode of a running session |
-| `bench` | Measure what each mode costs and whether it passes small tasks |
+| `claude` | Claude Code with Claude as the brain and the worker provider running its agents |
+| `bench` | Measure `middleman claude` on small tasks: pass rate, cost, Claude vs agent requests |
 | `login openrouter` | Get an OpenRouter key through the browser |
 | `dict suggest` | Propose company and people names for your private list |
 | `check <files>` | Dry run: show exactly what would be sent, without sending |

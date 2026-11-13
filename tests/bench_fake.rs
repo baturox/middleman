@@ -1,6 +1,7 @@
 //! `middleman bench` orchestration with a fake `claude` on PATH (no real Claude, no network):
-//! the fake edits the sample project, calls the local proxy (whose "OpenRouter" is a mock that
-//! bills a fixed cost), and prints Claude Code style JSON.
+//! the fake edits the sample project, makes one brain request and one agent request through the
+//! local proxy (both upstreams are a mock; the worker bills a fixed cost), and prints Claude
+//! Code style JSON.
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
@@ -22,8 +23,11 @@ class T(unittest.TestCase):
     def test_e(self): self.assertFalse(is_slug("A b"))
 PY
 case "$ANTHROPIC_BASE_URL" in
-  http://127.0.0.1*) curl -s -X POST "$ANTHROPIC_BASE_URL/v1/messages" -H 'content-type: application/json' \
-    -d '{"model":"claude-sonnet-4-5","max_tokens":9,"messages":[{"role":"user","content":"write tests for slug.py"}]}' >/dev/null ;;
+  http://127.0.0.1*)
+    curl -s -X POST "$ANTHROPIC_BASE_URL/v1/messages" -H 'content-type: application/json' \
+      -d '{"model":"claude-opus-5-5","max_tokens":9,"messages":[{"role":"user","content":"plan"}]}' >/dev/null
+    curl -s -X POST "$ANTHROPIC_BASE_URL/v1/messages" -H 'content-type: application/json' \
+      -d '{"model":"'"$CLAUDE_CODE_SUBAGENT_MODEL"'","max_tokens":9,"messages":[{"role":"user","content":"write tests for slug.py"}]}' >/dev/null ;;
 esac
 echo '{"total_cost_usd":0.5,"num_turns":3,"result":"done"}'
 "#;
@@ -72,13 +76,14 @@ fn bench(e: &Env, args: &[&str], or_url: &str) -> std::process::Output {
         )
         .env("OPENROUTER_API_KEY", "sk-or-v1-fake0000")
         .env("MM_PROXY_OPENROUTER_URL", or_url)
+        .env("MM_PROXY_ANTHROPIC_URL", or_url)
         .env("MIDDLEMAN_KEYSTORE", "file")
         .output()
         .unwrap()
 }
 
 #[test]
-fn bench_runs_modes_and_summarizes() {
+fn bench_runs_the_brain_and_workers_and_summarizes() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mock = rt.block_on(async {
         let m = MockServer::start().await;
@@ -91,20 +96,18 @@ fn bench_runs_modes_and_summarizes() {
         m
     });
     let e = env();
-    let o = bench(
-        &e,
-        &["--modes", "cheap,claude", "--tasks", "1", "--yes"],
-        &mock.uri(),
-    );
+    let o = bench(&e, &["--tasks", "1", "--yes"], &mock.uri());
     let out = String::from_utf8_lossy(&o.stdout);
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(o.status.success(), "{out}\n{err}");
-    assert!(out.contains("cheap") && out.contains("1/1"), "{out}");
-    // cheap: $0.01 from the proxy ledger; claude: $0.50 from Claude's own JSON
+    assert!(out.contains("middleman") && out.contains("1/1"), "{out}");
+    // one brain and one agent request, equal tokens: half of Claude's $0.50, plus the
+    // worker's billed $0.01
     assert!(
-        out.contains("cheap passed 1/1 at 2% of claude's cost"),
+        out.contains("middleman passed 1/1 for $0.26"),
         "{out}\n{err}"
     );
+    assert!(err.contains("(1 Claude / 1 agent requests)"), "{err}");
     let saved: Vec<_> = std::fs::read_dir(&e.state)
         .unwrap()
         .filter_map(|f| f.ok())
@@ -119,11 +122,7 @@ fn bench_runs_modes_and_summarizes() {
 #[test]
 fn cost_guard_refuses_without_yes_when_not_interactive() {
     let e = env();
-    let o = bench(
-        &e,
-        &["--modes", "claude", "--tasks", "2"],
-        "http://127.0.0.1:9",
-    );
+    let o = bench(&e, &["--tasks", "2"], "http://127.0.0.1:9");
     assert!(!o.status.success());
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(

@@ -1247,7 +1247,7 @@ pub fn render_jobs(
     let d = mm_data(&v, cfg_path, now, spawn, spawn_update);
     let nowf = now as f64;
     let mm = |l: u8| mm_part(&d, l, o.show_tokens);
-    let badge = mode_badge(&v, cfg_path, now);
+    let badge = mode_badge();
     let out = if o.middleman_only {
         fit((0..=3).map(mm).collect(), o.columns).out(o.color)
     } else if o.lines >= 2 {
@@ -1260,26 +1260,22 @@ pub fn render_jobs(
     with_badge(out, badge, o.columns)
 }
 
-/// Writes Claude's 5-hour utilization for the proxy, and returns `🛡 smart → glm-5.3`
-/// (current mode and last route) when a smart session has routed something recently.
-fn mode_badge(v: &Value, cfg_path: &Path, now: i64) -> Option<String> {
-    let state = Config::load(cfg_path).ok()?.state_dir();
-    if let Some(p) = v
-        .pointer("/rate_limits/five_hour/used_percentage")
-        .and_then(Value::as_f64)
-    {
-        let _ = crate::modes::write_usage(&state, p, now);
-    }
-    let r = crate::modes::read_route(&state).filter(|r| now - r.ts < 6 * 3600)?;
-    let live = crate::modes::read_live_mode(&state)
-        .map(|m| m.to_string())
-        .unwrap_or(r.mode);
-    let to = if r.route == "claude" {
-        "claude".to_string()
-    } else {
-        clean(r.model.rsplit('/').next().unwrap_or(""), 24)
-    };
-    Some(format!("🛡 {live} → {to}"))
+/// `🛡 agents → claude-opus-5.5` in sessions started by `middleman claude`: the launcher puts
+/// the worker model in Claude Code's environment, which the status line inherits.
+fn mode_badge() -> Option<String> {
+    badge_text(
+        std::env::var(crate::launch::SESSION_WORKER_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub fn badge_text(worker: Option<&str>) -> Option<String> {
+    let w = worker.filter(|w| !w.is_empty())?;
+    Some(format!(
+        "🛡 agents → {}",
+        clean(w.rsplit('/').next().unwrap_or(""), 24)
+    ))
 }
 
 /// Append the badge to the last line only when it fits: it is the first thing dropped.

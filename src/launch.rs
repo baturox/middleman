@@ -1,9 +1,12 @@
-//! `middleman claude`: run a whole Claude Code session on cheap models (OpenRouter or miav).
+//! `middleman claude`: Claude Code with Claude as the brain and middleman's provider as the
+//! workers.
 //!
-//! Claude Code talks to OpenRouter directly (`ANTHROPIC_BASE_URL` + token), so nothing here is
-//! sanitized: a full session sends every file Claude Code reads to the chosen model. That is why
-//! a repo must be allowed first (project overlay `[launch] allow = true`, or a stored per-repo
-//! choice). The pieces are pure functions so they can be tested without launching anything.
+//! Claude Code keeps its own login and talks to a local proxy (`proxy.rs`): the user's own
+//! conversation goes to Claude unchanged, while the subagents and background jobs Claude starts
+//! run on the worker provider (miav or OpenRouter). Those worker requests carry whatever files
+//! the agents read, uncleaned, which is why a repo must be allowed first (project overlay
+//! `[launch] allow = true`, or a stored per-repo choice). The pieces are pure functions so they
+//! can be tested without launching anything.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -14,27 +17,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::{valid_model_id, Catalog};
 use crate::config::{Config, ProjectOverlay, Secret, PROJECT_FILE};
-use crate::modes::Mode;
 
 pub const DEFAULT_MODEL: &str = "z-ai/glm-5.3";
 pub const DEFAULT_FAST_MODEL: &str = "deepseek/deepseek-v4.1-flash";
 pub const BASE_URL: &str = "https://openrouter.ai/api";
 const ALLOW_FILE: &str = "launch-allowed.json";
 
-/// An Anthropic-compatible upstream `middleman claude` can run a session on (`[launch]
-/// provider`). The key comes from `[providers.<name>]`.
+/// An Anthropic-compatible worker provider (`[launch] provider`). The key comes from
+/// `[providers.<name>]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Upstream {
     pub name: &'static str,
     pub label: &'static str,
-    /// Anthropic API root (Claude Code appends `/v1/messages`).
+    /// Anthropic API root (the proxy appends `/v1/messages`).
     pub base_url: &'static str,
+    /// Worker model for subagents.
     pub main: &'static str,
+    /// Worker model for background jobs.
     pub fast: &'static str,
-    /// Strip Claude-only request features before sending (the upstream is not Claude).
+    /// Strip Claude-only request features before sending (the provider is not Claude).
     pub adapt: bool,
-    /// Extra child environment for direct (cheap) sessions.
-    pub extra_env: &'static [(&'static str, &'static str)],
 }
 
 pub const UPSTREAMS: &[Upstream] = &[
@@ -45,7 +47,6 @@ pub const UPSTREAMS: &[Upstream] = &[
         main: DEFAULT_MODEL,
         fast: DEFAULT_FAST_MODEL,
         adapt: true,
-        extra_env: &[],
     },
     // miav.cloud: a third-party gateway serving Claude-family models (200k context)
     Upstream {
@@ -55,12 +56,6 @@ pub const UPSTREAMS: &[Upstream] = &[
         main: "claude-opus-5.5",
         fast: "gpt-6.1-sol",
         adapt: false,
-        // 200k context; and miav cannot carry auto mode's server-side checks (it rewrites
-        // requests), so Claude Code should not ask for them there (no fallback notice)
-        extra_env: &[
-            ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "200000"),
-            ("CLAUDE_CODE_AUTO_MODE_SERVER", "0"),
-        ],
     },
 ];
 
@@ -96,7 +91,7 @@ pub fn upstream_key(cfg: &Config, u: &Upstream) -> Result<Secret> {
         .map_err(|_| hint())
 }
 
-/// Main and fast model: flag, then `[launch]` in the user config, then the default.
+/// Worker models (subagents, background): flag, then `[launch]` in the user config, then the default.
 pub fn resolve_models(
     cli_model: Option<&str>,
     cli_fast: Option<&str>,
@@ -118,25 +113,9 @@ pub fn resolve_models(
     Ok((main, fast))
 }
 
-/// Environment for the child only. Opus/Sonnet/Fable/subagents use the main model, Haiku the fast one.
-pub fn build_env(u: &Upstream, key: &str, main: &str, fast: &str) -> Vec<(String, String)> {
-    let e = |k: &str, v: &str| (k.to_string(), v.to_string());
-    let mut v = vec![
-        e("ANTHROPIC_BASE_URL", u.base_url),
-        e("ANTHROPIC_AUTH_TOKEN", key),
-        e("ANTHROPIC_API_KEY", ""),
-        e("ANTHROPIC_DEFAULT_OPUS_MODEL", main),
-        e("ANTHROPIC_DEFAULT_SONNET_MODEL", main),
-        e("ANTHROPIC_DEFAULT_FABLE_MODEL", main),
-        e("CLAUDE_CODE_SUBAGENT_MODEL", main),
-        e("ANTHROPIC_DEFAULT_HAIKU_MODEL", fast),
-    ];
-    v.extend(u.extra_env.iter().map(|(k, x)| e(k, x)));
-    v
-}
-
-/// Variables removed from the child so the subscription login is not used.
-pub const REMOVE_ENV: &[&str] = &["CLAUDE_CODE_OAUTH_TOKEN"];
+/// Set in Claude Code's environment by `middleman claude` so the status line (a child of
+/// Claude Code) can show the worker model.
+pub const SESSION_WORKER_ENV: &str = "MIDDLEMAN_WORKER_MODEL";
 
 /// Git root of `cwd` (nearest ancestor with `.git`), else `cwd`. Refuses `$HOME` and `/`.
 pub fn project_root(cwd: &Path, home: Option<&Path>) -> Result<PathBuf> {
@@ -237,10 +216,10 @@ pub fn decide(
 pub fn warning(root: &Path, model: &str) -> [String; 3] {
     [
         format!(
-            "This sends every file Claude Code reads in {} to {model} on OpenRouter,",
+            "Agents started in {} run on {model}: every file they read is sent to it,",
             root.display()
         ),
-        "without middleman's cleaning.".to_string(),
+        "without middleman's cleaning (your own prompts stay on Claude).".to_string(),
         "Only do this for code you'd be fine publishing.".to_string(),
     ]
 }
@@ -254,7 +233,6 @@ pub fn refusal(root: &Path) -> String {
 }
 
 pub struct Plan {
-    pub mode: Mode,
     pub upstream: &'static Upstream,
     pub key: Secret,
     pub main: String,
@@ -283,7 +261,6 @@ pub fn prepare(
     home: Option<&Path>,
     model: Option<&str>,
     fast_model: Option<&str>,
-    mode: Mode,
     yes: bool,
     interactive: bool,
     args: Vec<String>,
@@ -298,7 +275,6 @@ pub fn prepare(
         .and_then(|c| c.providers.get(u.name).and_then(|p| p.left_usd()));
     let decision = decide(&root, overlay_allows(cwd), &state, yes, interactive);
     Ok(Plan {
-        mode,
         upstream: u,
         main_price: price_text(cfg, cat.as_ref(), u.name, &main),
         fast_price: price_text(cfg, cat.as_ref(), u.name, &fast),
@@ -325,26 +301,18 @@ pub fn banner(p: &Plan) -> String {
         .credit_usd
         .map(|c| format!(" · credit ${c:.2}"))
         .unwrap_or_default();
-    if p.mode == Mode::Smart {
-        return format!(
-            "🛡 middleman: smart mode · hard prompts on Claude, routine ones on {} · fast {}{credit}",
-            p.main, p.fast
-        );
-    }
     format!(
-        "🛡 middleman: Claude Code on {} · main {} · fast {}{credit} · your Claude plan is not used",
-        p.upstream.label, p.main, p.fast
+        "🛡 middleman: Claude is the brain · agents run on {} ({}) · background on {}{credit}",
+        p.main, p.upstream.label, p.fast
     )
 }
 
-pub const MASKED_KEY: &str = "…(hidden)";
-
-/// `--dry-run` text: what would be set (key masked), the root and the allow status.
+/// `--dry-run` text: what would be set, the root and the allow status. No key is shown: the
+/// worker key goes only to the proxy.
 pub fn dry_run_text(p: &Plan) -> String {
     let mut out = vec![
         banner(p),
-        format!("  mode     {}", p.mode),
-        format!("  main     {}", with_price(&p.main, &p.main_price)),
+        format!("  agents   {}", with_price(&p.main, &p.main_price)),
         format!("  fast     {}", with_price(&p.fast, &p.fast_price)),
         format!("  root     {}", p.root.display()),
         format!(
@@ -357,58 +325,35 @@ pub fn dry_run_text(p: &Plan) -> String {
         ),
         "  env (child only):".to_string(),
     ];
-    if p.mode == Mode::Smart {
-        for (k, v) in proxy_env("http://127.0.0.1:<port>/<token>") {
-            out.push(format!("    {k}={v}"));
-        }
-        out.push(format!(
-            "    (your Claude login is kept; the local proxy sends routine turns to {})",
-            p.upstream.label
-        ));
-    } else {
-        for (k, v) in build_env(p.upstream, MASKED_KEY, &p.main, &p.fast) {
-            let v = if k == "ANTHROPIC_API_KEY" {
-                "\"\"".into()
-            } else {
-                v
-            };
-            out.push(format!("    {k}={v}"));
-        }
-        for k in REMOVE_ENV {
-            out.push(format!("    unset {k}"));
-        }
+    for (k, v) in proxy_env("http://127.0.0.1:<port>/<token>", &p.main) {
+        out.push(format!("    {k}={v}"));
     }
+    out.push(format!(
+        "    (your Claude login is kept; the local proxy sends agent requests to {})",
+        p.upstream.label
+    ));
     if !p.args.is_empty() {
         out.push(format!("  args     {}", p.args.join(" ")));
     }
     out.join("\n")
 }
 
-/// What to run; the real exec is injected so tests never start `claude`.
+/// What to run; the real run is injected so tests never start `claude`.
 pub struct LaunchCmd {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
-    pub remove: Vec<String>,
 }
 
-pub fn command(program: PathBuf, p: &Plan) -> LaunchCmd {
-    LaunchCmd {
-        program,
-        args: p.args.clone(),
-        env: build_env(p.upstream, p.key.expose(), &p.main, &p.fast),
-        remove: REMOVE_ENV.iter().map(|s| s.to_string()).collect(),
-    }
-}
-
-/// Environment for the proxy modes: Claude Code keeps its own login and talks to the local
-/// proxy; the background and subagent roles use marker names the proxy maps to cheap models.
-pub fn proxy_env(base_url: &str) -> Vec<(String, String)> {
+/// Claude Code's environment: it keeps its own login and talks to the local proxy; the
+/// background and subagent roles use marker names the proxy sends to the worker provider.
+pub fn proxy_env(base_url: &str, worker: &str) -> Vec<(String, String)> {
     let e = |k: &str, v: &str| (k.to_string(), v.to_string());
     vec![
         e("ANTHROPIC_BASE_URL", base_url),
         e("ANTHROPIC_DEFAULT_HAIKU_MODEL", crate::proxy::MARK_FAST),
         e("CLAUDE_CODE_SUBAGENT_MODEL", crate::proxy::MARK_SUB),
+        e(SESSION_WORKER_ENV, worker),
     ]
 }
 
@@ -429,13 +374,12 @@ impl Drop for ProxyChild {
 pub struct ProxySpec<'a> {
     pub exe: &'a Path,
     pub cfg_path: &'a Path,
-    pub mode: Mode,
     pub main: &'a str,
     pub fast: &'a str,
     pub key: &'a Secret,
     pub provider: &'a str,
     pub project: &'a str,
-    /// Bench run id: marks ledger lines `purpose: bench` and pins the mode.
+    /// Bench run id: marks ledger lines `purpose: bench`.
     pub bench_run: Option<&'a str>,
 }
 
@@ -444,20 +388,16 @@ pub fn spawn_proxy(s: &ProxySpec) -> Result<ProxyChild> {
     use std::process::Stdio;
     let token = uuid::Uuid::new_v4().simple().to_string();
     let mut cmd = std::process::Command::new(s.exe);
-    cmd.arg("--config")
-        .arg(s.cfg_path)
-        .args(["proxy", "--mode"])
-        .arg(s.mode.to_string())
-        .args([
-            "--model",
-            s.main,
-            "--fast-model",
-            s.fast,
-            "--project",
-            s.project,
-            "--provider",
-            s.provider,
-        ]);
+    cmd.arg("--config").arg(s.cfg_path).arg("proxy").args([
+        "--model",
+        s.main,
+        "--fast-model",
+        s.fast,
+        "--project",
+        s.project,
+        "--provider",
+        s.provider,
+    ]);
     if let Some(r) = s.bench_run {
         cmd.args(["--bench-run", r]);
     }
@@ -488,9 +428,6 @@ pub fn spawn_proxy(s: &ProxySpec) -> Result<ProxyChild> {
 pub fn run_with_proxy(c: &LaunchCmd, proxy: ProxyChild) -> Result<ExitCode> {
     let mut cmd = std::process::Command::new(&c.program);
     cmd.args(&c.args);
-    for k in &c.remove {
-        cmd.env_remove(k);
-    }
     cmd.envs(c.env.iter().map(|(k, v)| (k, v)));
     let st = cmd.status().context("cannot start claude")?;
     drop(proxy);
@@ -504,40 +441,9 @@ pub fn find_on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Replace this process with the command (unix), or run it and relay its exit code.
-pub fn exec(c: &LaunchCmd) -> Result<ExitCode> {
-    let mut cmd = std::process::Command::new(&c.program);
-    cmd.args(&c.args);
-    for k in &c.remove {
-        cmd.env_remove(k);
-    }
-    cmd.envs(c.env.iter().map(|(k, v)| (k, v)));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let e = cmd.exec();
-        Err(anyhow::anyhow!("cannot start claude: {e}"))
-    }
-    #[cfg(not(unix))]
-    {
-        let st = cmd.status().context("cannot start claude")?;
-        Ok(ExitCode::from(st.code().unwrap_or(1).clamp(0, 255) as u8))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    trait TapKey {
-        fn tap_key(self, var: &str) -> Self;
-    }
-    impl TapKey for Config {
-        fn tap_key(mut self, var: &str) -> Self {
-            self.providers.get_mut("openrouter").unwrap().key_env = Some(var.into());
-            self
-        }
-    }
 
     fn cfg(dir: &Path, extra: &str) -> Config {
         Config::from_toml(&format!(
@@ -557,18 +463,27 @@ key_env = "MM_TEST_OR_KEY_LAUNCH"
     }
 
     #[test]
-    fn env_has_all_roles() {
-        let env = build_env(&UPSTREAMS[0], "k", "m/main", "f/fast");
+    fn env_keeps_login_and_marks_worker_roles() {
+        let env = proxy_env("http://127.0.0.1:1/t", "w/model");
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-        assert_eq!(get("ANTHROPIC_BASE_URL"), Some(BASE_URL));
-        assert_eq!(get("ANTHROPIC_AUTH_TOKEN"), Some("k"));
-        assert_eq!(get("ANTHROPIC_API_KEY"), Some(""));
-        for r in ["OPUS", "SONNET", "FABLE"] {
-            assert_eq!(get(&format!("ANTHROPIC_DEFAULT_{r}_MODEL")), Some("m/main"));
+        assert_eq!(get("ANTHROPIC_BASE_URL"), Some("http://127.0.0.1:1/t"));
+        assert_eq!(
+            get("CLAUDE_CODE_SUBAGENT_MODEL"),
+            Some(crate::proxy::MARK_SUB)
+        );
+        assert_eq!(
+            get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            Some(crate::proxy::MARK_FAST)
+        );
+        assert_eq!(get(SESSION_WORKER_ENV), Some("w/model"));
+        // the main model and the login are Claude Code's own: nothing overrides them
+        for k in [
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        ] {
+            assert_eq!(get(k), None, "{k}");
         }
-        assert_eq!(get("CLAUDE_CODE_SUBAGENT_MODEL"), Some("m/main"));
-        assert_eq!(get("ANTHROPIC_DEFAULT_HAIKU_MODEL"), Some("f/fast"));
-        assert!(REMOVE_ENV.contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
     }
 
     #[test]
@@ -607,14 +522,7 @@ key_env = "MM_TEST_OR_KEY_LAUNCH"
             resolve_models(None, None, &c).unwrap(),
             ("claude-opus-5.5".into(), "gpt-6.1-sol".into())
         );
-        let env = build_env(u, "k", "m", "f");
-        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-        assert_eq!(
-            get("ANTHROPIC_BASE_URL"),
-            Some("https://miav.cloud/api/gateway")
-        );
-        assert_eq!(get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"), Some("200000"));
-        assert_eq!(get("CLAUDE_CODE_AUTO_MODE_SERVER"), Some("0"));
+        assert_eq!(u.base_url, "https://miav.cloud/api/gateway");
         assert!(upstream_key(&c, u)
             .unwrap_err()
             .to_string()
@@ -689,7 +597,7 @@ key_env = "MM_TEST_OR_KEY_LAUNCH"
     }
 
     #[test]
-    fn dry_run_masks_key_and_noninteractive_refuses() {
+    fn dry_run_hides_the_key_and_noninteractive_refuses() {
         let d = tempfile::tempdir().unwrap();
         let repo = d.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -701,64 +609,24 @@ key_env = "MM_TEST_OR_KEY_LAUNCH"
             Some(d.path()),
             None,
             None,
-            Mode::Cheap,
             false,
             false,
             vec!["-p".into()],
         )
         .unwrap();
         assert_eq!(p.decision, Decision::Refuse);
+        assert_eq!(p.args, vec!["-p"]);
         let t = dry_run_text(&p);
-        assert!(t.contains("…(hidden)"));
-        assert!(!t.contains("SECRETSECRET"));
-        assert!(t.contains("ANTHROPIC_API_KEY=\"\""));
-        assert!(t.contains("unset CLAUDE_CODE_OAUTH_TOKEN"));
-        assert!(t.contains("not allowed"));
-        let cmd = command(PathBuf::from("claude"), &p);
-        assert!(cmd.env.iter().any(|(_, v)| v == "sk-or-v1-SECRETSECRET"));
-        assert_eq!(cmd.args, vec!["-p"]);
+        assert!(
+            t.contains("Claude is the brain") && t.contains("mm-cheap-sub"),
+            "{t}"
+        );
+        assert!(t.contains("not allowed"), "{t}");
+        assert!(
+            !t.contains("SECRET") && !t.contains("AUTH_TOKEN") && !t.contains("OAUTH"),
+            "{t}"
+        );
         std::env::remove_var("MM_TEST_OR_KEY_LAUNCH");
-        assert!(prepare(
-            &c,
-            &repo,
-            Some(d.path()),
-            None,
-            None,
-            Mode::Cheap,
-            true,
-            false,
-            vec![]
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn smart_dry_run_keeps_login_and_hides_nothing_secret() {
-        let d = tempfile::tempdir().unwrap();
-        let repo = d.path().join("repo");
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-        std::env::set_var("MM_TEST_OR_KEY_SMART", "sk-or-v1-SECRETSECRET");
-        let c = cfg(d.path(), "").tap_key("MM_TEST_OR_KEY_SMART");
-        let p = prepare(
-            &c,
-            &repo,
-            Some(d.path()),
-            None,
-            None,
-            Mode::Smart,
-            true,
-            false,
-            vec![],
-        )
-        .unwrap();
-        let t = dry_run_text(&p);
-        assert!(
-            t.contains("mm-cheap-fast") && t.contains("mode     smart"),
-            "{t}"
-        );
-        assert!(
-            !t.contains("AUTH_TOKEN") && !t.contains("OAUTH") && !t.contains("SECRET"),
-            "{t}"
-        );
+        assert!(prepare(&c, &repo, Some(d.path()), None, None, true, false, vec![]).is_err());
     }
 }

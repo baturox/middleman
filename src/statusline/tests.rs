@@ -754,3 +754,18 @@ fn newer_release_marker_and_daily_check() {
     assert!(!out.contains('↑'), "{out}");
     assert_eq!(checks.get(), 1);
 }
+
+#[test]
+fn badge_shows_the_worker_model_only_in_middleman_sessions() {
+    assert_eq!(
+        badge_text(Some("claude-opus-5.5")),
+        Some("🛡 agents → claude-opus-5.5".into())
+    );
+    assert_eq!(
+        badge_text(Some("z-ai/glm-5.3")),
+        Some("🛡 agents → glm-5.3".into())
+    );
+    // plain Claude Code sessions get no badge
+    assert_eq!(badge_text(None), None);
+    assert_eq!(badge_text(Some("")), None);
+}

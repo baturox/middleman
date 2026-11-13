@@ -273,21 +273,15 @@ enum Cmd {
     },
     /// Print shell completions (bash, zsh, fish, elvish, powershell)
     Completions { shell: clap_complete::Shell },
-    /// Run Claude Code with cheap models doing the routine work (smart | cheap | claude)
+    /// Run Claude Code with Claude as the brain and middleman's provider running its agents
     Claude {
-        /// smart (default: hard prompts on Claude, routine ones on a cheap model) | cheap | claude
-        #[arg(long)]
-        mode: Option<String>,
-        /// Show the mode picker even if this repo has a remembered choice
-        #[arg(long)]
-        pick: bool,
-        /// Cheap model [default: [launch] model, else z-ai/glm-5.3]
+        /// Model for the agents (subagents) [default: [launch] model, else the provider's default]
         #[arg(long)]
         model: Option<String>,
-        /// Fast/background model [default: [launch] fast_model, else deepseek/deepseek-v4.1-flash]
+        /// Model for background jobs [default: [launch] fast_model, else the provider's default]
         #[arg(long)]
         fast_model: Option<String>,
-        /// Allow this repo once without asking (cheap turns send files uncleaned)
+        /// Allow this repo once without asking (agents send the files they read uncleaned)
         #[arg(long)]
         yes: bool,
         /// Show what would be set (key hidden) and exit
@@ -297,13 +291,9 @@ enum Cmd {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Change the mode of a running smart session: smart | cheap | claude (no argument: pick)
-    Mode { mode: Option<String> },
-    /// The local proxy behind smart mode (started by `middleman claude`; not for direct use)
+    /// The local proxy behind `middleman claude` (started by it; not for direct use)
     #[command(hide = true)]
     Proxy {
-        #[arg(long)]
-        mode: String,
         #[arg(long)]
         model: String,
         #[arg(long)]
@@ -315,11 +305,8 @@ enum Cmd {
         #[arg(long, default_value = "openrouter")]
         provider: String,
     },
-    /// Measure what each mode costs on a small built-in set of tasks (runs real Claude Code)
+    /// Measure `middleman claude` on a small built-in set of tasks (runs real Claude Code)
     Bench {
-        /// Modes to compare
-        #[arg(long, default_value = "smart,cheap,claude")]
-        modes: String,
         /// How many of the 5 tasks to run (easiest first)
         #[arg(long, default_value_t = 5)]
         tasks: usize,
@@ -1549,8 +1536,6 @@ async fn real_main() -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Claude {
-            mode,
-            pick,
             model,
             fast_model,
             yes,
@@ -1558,8 +1543,6 @@ async fn real_main() -> Result<ExitCode> {
             args,
         } => {
             let o = cli_claude::Opts {
-                mode,
-                pick,
                 model,
                 fast_model,
                 yes,
@@ -1568,9 +1551,7 @@ async fn real_main() -> Result<ExitCode> {
             };
             return cli_claude::claude_cmd(&cfg_path, o);
         }
-        Cmd::Mode { mode } => return cli_claude::mode_cmd(&cfg_path, mode),
         Cmd::Proxy {
-            mode,
             model,
             fast_model,
             project,
@@ -1578,17 +1559,12 @@ async fn real_main() -> Result<ExitCode> {
             provider,
         } => {
             return cli_claude::proxy_cmd(
-                &cfg_path, mode, model, fast_model, project, bench_run, provider,
+                &cfg_path, model, fast_model, project, bench_run, provider,
             )
             .await;
         }
-        Cmd::Bench {
-            modes,
-            tasks,
-            keep,
-            yes,
-        } => {
-            return cli_bench::bench_cmd(&cfg_path, &modes, tasks, keep, yes).await;
+        Cmd::Bench { tasks, keep, yes } => {
+            return cli_bench::bench_cmd(&cfg_path, tasks, keep, yes).await;
         }
         Cmd::Completions { shell } => {
             clap_complete::generate(
@@ -2146,7 +2122,6 @@ async fn real_main() -> Result<ExitCode> {
         | Cmd::Usage { .. }
         | Cmd::Tune { .. }
         | Cmd::Claude { .. }
-        | Cmd::Mode { .. }
         | Cmd::Proxy { .. }
         | Cmd::Bench { .. } => unreachable!(),
     }

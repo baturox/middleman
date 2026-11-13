@@ -11,14 +11,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ledger::LedgerEntry;
-use crate::modes::Mode;
 
 /// Planning figures for the cost guard (upper bounds per task, USD).
 pub const CLAUDE_MAX_PER_TASK: f64 = 1.50;
 pub const CHEAP_MAX_PER_TASK: f64 = 0.10;
 pub const MAX_TURNS: u32 = 25;
 pub const TASK_TIMEOUT: Duration = Duration::from_secs(360);
-pub const ALLOWED_TOOLS: &str = "Read Edit Write Glob Grep Bash(python3:*)";
+pub const ALLOWED_TOOLS: &str = "Read Edit Write Glob Grep Bash(python3:*) Agent Task";
+/// Put before every task prompt so the work runs the way `middleman claude` is meant to be
+/// used: Claude plans and checks, a subagent (on the worker provider) does the work.
+pub const DELEGATE_PREFIX: &str = "Use a subagent (the Agent tool) to do the actual work below, then check its result yourself.\n\n";
 
 macro_rules! fx {
     ($p:literal) => {
@@ -151,22 +153,15 @@ pub fn parse_claude_json(out: &str) -> (f64, u64) {
     )
 }
 
-/// Split one run into Claude and cheap spend. `total` is Claude Code's own cost figure, which
-/// prices every turn as a Claude turn; with the proxy, only the Claude-routed share of the
-/// tokens is attributed to Claude, and the cheap side is what OpenRouter billed (the ledger).
-pub fn split_cost(
-    mode: Mode,
-    total: f64,
-    num_turns: u64,
-    run: &[LedgerEntry],
-) -> (f64, f64, u64, u64) {
-    if mode == Mode::Claude {
-        return (total, 0.0, num_turns, 0);
-    }
+/// Split one run into Claude and worker spend. `total` is Claude Code's own cost figure, which
+/// prices every request as a Claude request; only the Claude share of the tokens (from the
+/// proxy's ledger lines) is attributed to Claude, and the worker side is what the provider
+/// billed. (claude_usd, worker_usd, claude_requests, worker_requests)
+pub fn split_cost(total: f64, run: &[LedgerEntry]) -> (f64, f64, u64, u64) {
     let toks = |e: &LedgerEntry| e.input_tokens.unwrap_or(0) + e.output_tokens.unwrap_or(0);
     let (mut ct, mut at, mut cn, mut an, mut cheap_usd) = (0u64, 0u64, 0u64, 0u64, 0.0);
     for e in run {
-        if e.chain_step == "cheap" {
+        if matches!(e.chain_step.as_str(), "worker" | "cheap") {
             ct += toks(e);
             cn += 1;
             cheap_usd += e.cost_usd;
@@ -274,28 +269,12 @@ pub struct Estimate {
     pub max_usd: f64,
 }
 
-/// Worst case before running: every turn of every task on Claude (smart can route all of
-/// them there), cheap mode only OpenRouter.
-pub fn estimate(modes: &[Mode], tasks: usize) -> Estimate {
-    let t = tasks as f64;
-    let mut e = Estimate {
-        claude_requests: 0,
-        max_usd: 0.0,
-    };
-    for m in modes {
-        match m {
-            Mode::Cheap => e.max_usd += t * CHEAP_MAX_PER_TASK,
-            Mode::Smart => {
-                e.claude_requests += tasks as u64 * MAX_TURNS as u64;
-                e.max_usd += t * (CLAUDE_MAX_PER_TASK + CHEAP_MAX_PER_TASK);
-            }
-            Mode::Claude => {
-                e.claude_requests += tasks as u64 * MAX_TURNS as u64;
-                e.max_usd += t * CLAUDE_MAX_PER_TASK;
-            }
-        }
+/// Worst case before running: every request of every task on Claude, plus the workers.
+pub fn estimate(tasks: usize) -> Estimate {
+    Estimate {
+        claude_requests: tasks as u64 * MAX_TURNS as u64,
+        max_usd: tasks as f64 * (CLAUDE_MAX_PER_TASK + CHEAP_MAX_PER_TASK),
     }
-    e
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -409,8 +388,8 @@ mod tests {
         let rs = vec![
             r("claude", true, 1.0, 0.0),
             r("claude", true, 1.0, 0.0),
-            r("smart", true, 0.3, 0.1),
-            r("smart", false, 0.1, 0.0),
+            r("middleman", true, 0.3, 0.1),
+            r("middleman", false, 0.1, 0.0),
         ];
         let s = summarize(&rs);
         assert_eq!((s[0].passed, s[0].tasks), (2, 2));
@@ -420,11 +399,14 @@ mod tests {
         assert!((s[1].total_usd - 0.5).abs() < 1e-9);
         let v = verdict(&s);
         assert!(
-            v.contains("smart passed 1/2 at 25% of claude's cost"),
+            v.contains("middleman passed 1/2 at 25% of claude's cost"),
             "{v}"
         );
         assert!(table(&s).contains("1/2"));
-        assert_eq!(verdict(&summarize(&rs[2..3])), "smart passed 1/1 for $0.40");
+        assert_eq!(
+            verdict(&summarize(&rs[2..3])),
+            "middleman passed 1/1 for $0.40"
+        );
     }
 
     #[test]
@@ -438,13 +420,13 @@ mod tests {
         };
         let run = vec![
             e("claude", 100, 0.0),
-            e("cheap", 300, 0.02),
+            e("worker", 300, 0.02),
             e("cheap", 100, 0.01),
         ];
-        let (c, ch, ct, cht) = split_cost(Mode::Smart, 2.0, 9, &run);
+        let (c, ch, ct, cht) = split_cost(2.0, &run);
         assert!((c - 0.4).abs() < 1e-9 && (ch - 0.03).abs() < 1e-9);
         assert_eq!((ct, cht), (1, 2));
-        assert_eq!(split_cost(Mode::Claude, 2.0, 9, &[]), (2.0, 0.0, 9, 0));
+        assert_eq!(split_cost(2.0, &[]), (0.0, 0.0, 0, 0));
         assert_eq!(
             parse_claude_json(r#"{"total_cost_usd":0.5,"num_turns":4}"#),
             (0.5, 4)
@@ -453,12 +435,9 @@ mod tests {
 
     #[test]
     fn estimate_and_guard() {
-        let e = estimate(&[Mode::Cheap], 5);
-        assert_eq!(e.claude_requests, 0);
-        assert!((e.max_usd - 0.5).abs() < 1e-9);
-        let e = estimate(&[Mode::Smart, Mode::Claude], 5);
-        assert_eq!(e.claude_requests, 250);
-        assert!(e.max_usd > 10.0);
+        let e = estimate(5);
+        assert_eq!(e.claude_requests, 125);
+        assert!((e.max_usd - 8.0).abs() < 1e-9);
         assert_eq!(guard(true, false), Guard::Go);
         assert_eq!(guard(false, true), Guard::Ask);
         assert_eq!(guard(false, false), Guard::Refuse);

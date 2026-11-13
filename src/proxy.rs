@@ -1,11 +1,13 @@
-//! `middleman proxy`: the local Anthropic-compatible proxy behind `middleman claude` smart mode.
+//! `middleman proxy`: the local Anthropic-compatible proxy behind `middleman claude`.
 //!
-//! Claude Code talks to `http://127.0.0.1:PORT/<token>` (the launcher sets ANTHROPIC_BASE_URL).
-//! Every request is forwarded to Anthropic (the client's own auth headers pass through
-//! untouched, and are never logged or stored) or, when the router says so, to OpenRouter (auth
-//! replaced with the OpenRouter key, `model` rewritten to the cheap model). Response bodies are
-//! streamed back as they arrive; a copy is kept only to read the usage for the ledger.
-//! Bound to 127.0.0.1; a request without the per-launch token gets 403.
+//! Claude is the brain, middleman supplies the workers. Claude Code talks to
+//! `http://127.0.0.1:PORT/<token>` (the launcher sets ANTHROPIC_BASE_URL and gives its subagent
+//! and background roles marker model names). Requests with a marker model go to the worker
+//! provider (auth replaced with its key, `model` set to the worker model); everything else, the
+//! user's own conversation, goes to Anthropic untouched (the client's auth headers pass through
+//! and are never logged or stored). Response bodies are streamed back as they arrive; a copy is
+//! kept only to read the usage for the ledger. Bound to 127.0.0.1; a request without the
+//! per-launch token gets 403.
 
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -22,20 +24,14 @@ use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 
 use crate::config::{Config, Secret};
-use crate::detect::Detector;
 use crate::economics::ClaudePrices;
-use crate::egress::{self, OutboundRequest};
 use crate::ledger::{now_rfc3339, now_unix, Ledger, LedgerEntry};
-use crate::modes::{self, Mode, RouteNote};
-use crate::pseudo::Vault;
-use crate::router::{self, Class, Route, Router, Step};
 
 pub const ANTHROPIC_URL: &str = "https://api.anthropic.com";
-/// Model names the launcher gives Claude Code for its background and subagent roles.
+/// Model names the launcher gives Claude Code for its background and subagent roles: the
+/// requests that go to the worker provider.
 pub const MARK_FAST: &str = "mm-cheap-fast";
 pub const MARK_SUB: &str = "mm-cheap-sub";
-/// Real Claude model used for a marker request when the live mode is `claude`.
-const CLAUDE_FAST: &str = "claude-haiku-4-5";
 const MAX_REQUEST: usize = 64 << 20;
 const MAX_CAPTURE: usize = 16 << 20;
 
@@ -51,16 +47,14 @@ pub struct ProxyCfg {
     pub cheap_provider: String,
     /// Strip Claude-only features before a cheap request (false for Claude-backed upstreams).
     pub adapt: bool,
+    /// Worker model for subagents.
     pub main_model: String,
+    /// Worker model for background work (titles, summaries).
     pub fast_model: String,
-    pub mode: Mode,
-    /// Ignore `middleman mode` changes (bench runs keep their own mode).
-    pub fixed_mode: bool,
     pub project: String,
     /// `bench` marks ledger lines so they stay out of the savings totals.
     pub purpose: Option<String>,
     pub run_id: Option<String>,
-    pub detector: Detector,
     pub claude_prices: ClaudePrices,
     /// (input, output) USD per 1M for the cheap model, used when the response has no cost.
     pub cheap_prices: Option<(f64, f64)>,
@@ -73,16 +67,10 @@ impl ProxyCfg {
         up: &crate::launch::Upstream,
         key: Secret,
         token: String,
-        mode: Mode,
         main_model: String,
         fast_model: String,
         project: String,
     ) -> ProxyCfg {
-        let dict = cfg
-            .redact
-            .dictionary_file
-            .as_ref()
-            .and_then(|p| crate::detect::Dictionary::load(p).ok());
         let cat = crate::catalog::Catalog::load(cfg);
         let cheap_prices = crate::catalog::Catalog::lookup(cfg, cat.as_ref(), up.name, &main_model)
             .and_then(|p| p.prices)
@@ -97,12 +85,9 @@ impl ProxyCfg {
             adapt: up.adapt,
             main_model,
             fast_model,
-            mode,
-            fixed_mode: false,
             project,
             purpose: None,
             run_id: None,
-            detector: Detector::new(vec![], cfg.public_hosts(), dict),
             claude_prices: cfg.economics.prices().unwrap_or(ClaudePrices::ZERO),
             cheap_prices,
         }
@@ -121,7 +106,6 @@ pub fn check_upstream(url: &str) -> Result<()> {
 
 struct St {
     cfg: ProxyCfg,
-    router: Router,
     client: reqwest::Client,
 }
 
@@ -138,11 +122,7 @@ pub async fn serve(cfg: ProxyCfg, listener: tokio::net::TcpListener) -> Result<(
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(15))
         .build()?;
-    let st = Arc::new(St {
-        cfg,
-        router: Router::default(),
-        client,
-    });
+    let st = Arc::new(St { cfg, client });
     loop {
         let (sock, _) = listener.accept().await?;
         let st = st.clone();
@@ -177,17 +157,12 @@ async fn handle(st: Arc<St>, req: Request<Incoming>) -> Response<Body> {
 #[derive(Clone, Copy, PartialEq)]
 enum Target {
     Anthropic,
-    OpenRouter,
+    Worker,
 }
 
 struct Ctx {
-    key: Option<String>,
-    mode: String,
-    route: Route,
-    reason: String,
+    worker: bool,
     model: String,
-    /// Count outcomes in the router (not for background-model requests).
-    track: bool,
     started: std::time::Instant,
 }
 
@@ -213,7 +188,7 @@ async fn send(
 ) -> Result<reqwest::Response> {
     let base = match target {
         Target::Anthropic => &st.cfg.anthropic_url,
-        Target::OpenRouter => &st.cfg.cheap_url,
+        Target::Worker => &st.cfg.cheap_url,
     };
     let mut rb = st
         .client
@@ -227,12 +202,12 @@ async fn send(
         if HOP.contains(&n) {
             continue;
         }
-        if target == Target::OpenRouter && matches!(n, "authorization" | "x-api-key") {
+        if target == Target::Worker && matches!(n, "authorization" | "x-api-key") {
             continue;
         }
         rb = rb.header(k, v);
     }
-    if target == Target::OpenRouter {
+    if target == Target::Worker {
         let mut v = reqwest::header::HeaderValue::from_str(&format!(
             "Bearer {}",
             st.cfg.cheap_key.expose()
@@ -267,146 +242,56 @@ async fn handle_inner(st: Arc<St>, req: Request<Incoming>) -> Result<Response<Bo
     let Some(mut j) = json else {
         // count_tokens and everything else: straight to Anthropic
         let r = send(&st, Target::Anthropic, &parts, &path_q, bytes).await?;
-        return Ok(relay(&st, r, None, Target::Anthropic));
+        return Ok(relay(&st, r, None));
     };
 
-    let live = if st.cfg.fixed_mode {
-        st.cfg.mode
-    } else {
-        modes::read_live_mode(&st.cfg.state_dir).unwrap_or(st.cfg.mode)
-    };
     let model = j["model"].as_str().unwrap_or("").to_string();
-    let marker = match model.as_str() {
-        MARK_FAST => Some(st.cfg.fast_model.clone()),
-        MARK_SUB => Some(st.cfg.main_model.clone()),
-        _ => None,
-    };
-    let key = router::conv_key(&j);
-    let new_turn = router::is_new_turn(&j);
-    let force = if new_turn {
-        router::take_force_prefix(&mut j)
-    } else {
-        None
-    };
-    let mut modified = force.is_some();
-    let util = modes::read_usage(&st.cfg.state_dir)
-        .filter(|u| now_unix() - u.ts < 5 * 3600)
-        .map(|u| u.pct);
-
-    let (route, reason, track) = if marker.is_some() {
-        if live == Mode::Claude {
-            j["model"] = json!(CLAUDE_FAST);
-            modified = true;
-            (
-                Route::Claude,
-                "background model (claude mode)".to_string(),
-                false,
-            )
-        } else {
-            (Route::Cheap, "background model".to_string(), false)
-        }
-    } else {
-        let text = router::last_user_text(&j);
-        match st.router.plan(&key, new_turn, live, util, force, &text) {
-            Step::Route(r, why) => (r, why, true),
-            Step::Ask { hash } => {
-                let class = ask_router(&st, &text).await;
-                let (r, why) = st.router.settle(&key, &hash, class);
-                (r, why, true)
-            }
+    let worker_model = match model.as_str() {
+        MARK_FAST => st.cfg.fast_model.clone(),
+        MARK_SUB => st.cfg.main_model.clone(),
+        _ => {
+            // the brain: the user's own conversation always goes to Claude, unchanged
+            let ctx = Ctx {
+                worker: false,
+                model,
+                started: std::time::Instant::now(),
+            };
+            let r = send(&st, Target::Anthropic, &parts, &path_q, bytes).await?;
+            return Ok(relay(&st, r, Some(ctx)));
         }
     };
-    let mut ctx = Ctx {
-        key: track.then_some(key.clone()),
-        mode: live.to_string(),
-        route,
-        reason,
-        model: model.clone(),
-        track,
+    j["model"] = json!(worker_model);
+    if st.cfg.adapt {
+        adapt_for_cheap(&mut j);
+    }
+    if std::env::var_os("MIDDLEMAN_PROXY_SHAPE").is_some() {
+        log_shape(&st, &j);
+    }
+    let ctx = Ctx {
+        worker: true,
+        model: worker_model,
         started: std::time::Instant::now(),
     };
-    let cheap_id = marker.clone().unwrap_or_else(|| st.cfg.main_model.clone());
-    let original = if modified {
-        Bytes::from(serde_json::to_vec(&j)?)
-    } else {
-        bytes
-    };
-
-    let cheap_body = |j: &Value| -> Result<Bytes> {
-        let mut c = j.clone();
-        c["model"] = json!(cheap_id);
-        if st.cfg.adapt {
-            adapt_for_cheap(&mut c);
-        }
-        if std::env::var_os("MIDDLEMAN_PROXY_SHAPE").is_some() {
-            log_shape(&st, &c);
-        }
-        Ok(Bytes::from(serde_json::to_vec(&c)?))
-    };
-
-    if ctx.route == Route::Cheap {
-        ctx.model = cheap_id.clone();
-        let r = send(&st, Target::OpenRouter, &parts, &path_q, cheap_body(&j)?).await;
-        match r {
-            Ok(r) if r.status().is_success() => {
-                return Ok(relay(&st, r, Some(ctx), Target::OpenRouter));
-            }
-            other => {
-                // Keep the provider's reason (key scrubbed, capped) so failures can be diagnosed,
-                // then rebuild the response for the client from the bytes we read.
-                let other = match other {
-                    Ok(r) => {
-                        let status = r.status();
-                        let headers = r.headers().clone();
-                        let body = r.bytes().await.unwrap_or_default();
-                        log_provider_error(&st, status.as_u16(), &body);
-                        let mut b = hyper::http::Response::builder().status(status);
-                        for (k, v) in headers.iter() {
-                            if !HOP.contains(&k.as_str()) {
-                                b = b.header(k, v);
-                            }
-                        }
-                        Ok(reqwest::Response::from(b.body(body.to_vec())?))
-                    }
-                    Err(e) => {
-                        log_provider_error(&st, 0, format!("{e:#}").as_bytes());
-                        Err(e)
-                    }
-                };
-                // Cheap mode never falls back to Claude: the user chose not to use the plan.
-                let next = if track && live != Mode::Cheap {
-                    st.router.cheap_failed(&key, util)
-                } else {
-                    Route::Cheap
-                };
-                if next == Route::Claude && marker.is_none() {
-                    ctx.route = Route::Claude;
-                    ctx.reason = "cheap model failed twice".into();
-                    ctx.model = model;
-                    let r = send(&st, Target::Anthropic, &parts, &path_q, original).await?;
-                    return Ok(relay(&st, r, Some(ctx), Target::Anthropic));
-                }
-                return match other {
-                    Ok(r) => Ok(relay(&st, r, Some(ctx), Target::OpenRouter)),
-                    Err(e) => Err(e),
-                };
-            }
+    let body = Bytes::from(serde_json::to_vec(&j)?);
+    let r = send(&st, Target::Worker, &parts, &path_q, body).await?;
+    if r.status().is_success() {
+        return Ok(relay(&st, r, Some(ctx)));
+    }
+    // Keep the provider's reason (key scrubbed, capped) so failures can be diagnosed, then
+    // rebuild the response for the client from the bytes we read. A failed worker request is
+    // never retried on Claude: workers do not spend the Claude plan.
+    let status = r.status();
+    let headers = r.headers().clone();
+    let body = r.bytes().await.unwrap_or_default();
+    log_provider_error(&st, status.as_u16(), &body);
+    let mut b = hyper::http::Response::builder().status(status);
+    for (k, v) in headers.iter() {
+        if !HOP.contains(&k.as_str()) {
+            b = b.header(k, v);
         }
     }
-
-    let r = send(&st, Target::Anthropic, &parts, &path_q, original).await?;
-    let code = r.status().as_u16();
-    if (code == 429 || code == 529) && marker.is_none() {
-        // Claude is rate limited or overloaded: the same request continues on the cheap model
-        st.router
-            .pin_cheap(&key, &format!("Claude returned {code}"));
-        ctx.route = Route::Cheap;
-        ctx.reason = format!("Claude returned {code}: retried on cheap model");
-        ctx.model = cheap_id.clone();
-        let r2 = send(&st, Target::OpenRouter, &parts, &path_q, cheap_body(&j)?).await?;
-        return Ok(relay(&st, r2, Some(ctx), Target::OpenRouter));
-    }
-    Ok(relay(&st, r, Some(ctx), Target::Anthropic))
+    let r = reqwest::Response::from(b.body(body.to_vec())?);
+    Ok(relay(&st, r, Some(ctx)))
 }
 
 /// Make a Claude Code request acceptable to a non-Claude model. Claude Code believes it talks
@@ -598,6 +483,7 @@ fn log_provider_error(st: &St, status: u16, body: &[u8]) {
         text = text.replace(key, "[key]");
     }
     let text: String = crate::fsutil::clean(&text, 2048);
+    let _ = crate::ledger::ensure_private_dir(&st.cfg.state_dir);
     let path = st.cfg.state_dir.join("proxy-errors.log");
     let mut o = std::fs::OpenOptions::new();
     o.create(true).append(true);
@@ -608,56 +494,6 @@ fn log_provider_error(st: &St, status: u16, body: &[u8]) {
     }
     if let Ok(mut f) = o.open(&path) {
         let _ = writeln!(f, "{} HTTP {status} {text}", now_unix());
-    }
-}
-
-/// Router model: HARD or EASY. Only sanitized text leaves; a blocked prompt is HARD.
-async fn ask_router(st: &St, text: &str) -> Option<Class> {
-    let system = "Classify the coding request. Reply with exactly one word: EASY for routine work (tests, docstrings, renames, boilerplate, formatting, explanations, small well-specified edits), HARD for anything needing design, debugging, multi-file reasoning or judgement.";
-    let user: String = text.chars().take(2000).collect();
-    let sealed = egress::seal(
-        OutboundRequest {
-            model: st.cfg.fast_model.clone(),
-            system: system.into(),
-            user,
-            max_tokens: 5,
-        },
-        &Vault::new(""),
-        &st.cfg.detector,
-        &[&st.cfg.cheap_key],
-    )
-    .ok()?;
-    let r = sealed.get();
-    let body = json!({"model": r.model, "max_tokens": r.max_tokens, "system": r.system,
-        "messages": [{"role": "user", "content": r.user}]});
-    let mut auth =
-        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", st.cfg.cheap_key.expose()))
-            .ok()?;
-    auth.set_sensitive(true);
-    let resp = st
-        .client
-        .post(format!(
-            "{}/v1/messages",
-            st.cfg.cheap_url.trim_end_matches('/')
-        ))
-        .header("authorization", auth)
-        .header("anthropic-version", "2023-06-01")
-        .timeout(Duration::from_secs(15))
-        .json(&body)
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let v: Value = resp.json().await.ok()?;
-    let t = v["content"][0]["text"].as_str()?.to_uppercase();
-    if t.contains("EASY") {
-        Some(Class::Easy)
-    } else if t.contains("HARD") {
-        Some(Class::Hard)
-    } else {
-        None
     }
 }
 
@@ -698,36 +534,8 @@ pub fn parse_usage(buf: &[u8]) -> Usage {
     u
 }
 
-/// A non-streamed response whose tool_use input is not a JSON object (unusable tool call).
-pub fn invalid_tool_output(buf: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(buf)
-        .ok()
-        .and_then(|v| v["content"].as_array().cloned())
-        .is_some_and(|c| {
-            c.iter()
-                .any(|b| b["type"] == "tool_use" && !b["input"].is_object())
-        })
-}
-
-/// Utilization percent from Anthropic's unified rate-limit headers (fraction 0..1 or percent).
-fn utilization(h: &reqwest::header::HeaderMap) -> Option<f64> {
-    let v = h
-        .get("anthropic-ratelimit-unified-5h-utilization")?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<f64>()
-        .ok()?;
-    Some(if v <= 1.0 { v * 100.0 } else { v })
-}
-
-fn relay(st: &Arc<St>, r: reqwest::Response, ctx: Option<Ctx>, target: Target) -> Response<Body> {
+fn relay(st: &Arc<St>, r: reqwest::Response, ctx: Option<Ctx>) -> Response<Body> {
     let status = r.status();
-    if target == Target::Anthropic {
-        if let Some(p) = utilization(r.headers()) {
-            let _ = modes::write_usage(&st.cfg.state_dir, p, now_unix());
-        }
-    }
     let mut b = Response::builder().status(status);
     for (k, v) in r.headers() {
         if !HOP.contains(&k.as_str()) && k != "content-encoding" {
@@ -771,26 +579,8 @@ fn relay(st: &Arc<St>, r: reqwest::Response, ctx: Option<Ctx>, target: Target) -
 
 fn finish(st: &St, ctx: Ctx, status: StatusCode, stream_ok: bool, buf: &[u8]) {
     let success = status.is_success() && stream_ok;
-    if ctx.route == Route::Cheap && ctx.track {
-        if let Some(k) = &ctx.key {
-            if success && !invalid_tool_output(buf) {
-                st.router.cheap_ok(k);
-            } else if success {
-                st.router.cheap_failed(k, None);
-            }
-        }
-    }
     let u = parse_usage(buf);
-    let _ = modes::write_route(
-        &st.cfg.state_dir,
-        &RouteNote {
-            mode: ctx.mode.clone(),
-            route: ctx.route.as_str().into(),
-            model: ctx.model.clone(),
-            ts: now_unix(),
-        },
-    );
-    let cheap = ctx.route == Route::Cheap;
+    let cheap = ctx.worker;
     let (cost, source) = match (cheap, u.cost, st.cfg.cheap_prices) {
         (false, _, _) => (0.0, "estimate"),
         (true, Some(c), _) => (c, "provider"),
@@ -810,8 +600,8 @@ fn finish(st: &St, ctx: Ctx, status: StatusCode, stream_ok: bool, buf: &[u8]) {
         project: st.cfg.project.clone(),
         via: Some("proxy".into()),
         task_kind: "session".into(),
-        mode: ctx.mode,
-        chain_step: ctx.route.as_str().into(),
+        mode: "workers".into(),
+        chain_step: if cheap { "worker" } else { "claude" }.into(),
         provider: if cheap {
             st.cfg.cheap_provider.clone()
         } else {
@@ -820,7 +610,6 @@ fn finish(st: &St, ctx: Ctx, status: StatusCode, stream_ok: bool, buf: &[u8]) {
         model: ctx.model,
         status: if success { "ok" } else { "error" }.into(),
         closing: Some(true),
-        block_reason_category: Some(ctx.reason),
         input_tokens: Some(u.input),
         output_tokens: Some(u.output),
         cost_usd: cost,
@@ -862,12 +651,6 @@ mod tests {
                 cost: None
             }
         );
-        assert!(invalid_tool_output(
-            br#"{"content":[{"type":"tool_use","input":"oops"}]}"#
-        ));
-        assert!(!invalid_tool_output(
-            br#"{"content":[{"type":"tool_use","input":{}}]}"#
-        ));
     }
 
     /// Regression from the first live bench: GLM rejected Claude-only request features with
@@ -918,20 +701,5 @@ mod tests {
         assert_eq!(msgs[1]["content"].as_array().unwrap().len(), 1);
         assert_eq!(msgs[1]["content"][0]["type"], "tool_use");
         assert_eq!(j["system"][1]["text"], "reminder: run tests");
-    }
-
-    #[test]
-    fn utilization_header() {
-        let mut h = reqwest::header::HeaderMap::new();
-        h.insert(
-            "anthropic-ratelimit-unified-5h-utilization",
-            "0.41".parse().unwrap(),
-        );
-        assert_eq!(utilization(&h), Some(41.0));
-        h.insert(
-            "anthropic-ratelimit-unified-5h-utilization",
-            "87".parse().unwrap(),
-        );
-        assert_eq!(utilization(&h), Some(87.0));
     }
 }
