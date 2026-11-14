@@ -89,6 +89,11 @@ fn launches_with_claude_as_brain_and_agents_on_the_worker() {
     assert!(t.contains("worker=z-ai/glm-5.3"), "{t}");
     // the status line is passed for this session only
     assert!(t.contains("--settings"), "{t}");
+    // the brain is told its agents are free for the user's plan
+    assert!(
+        t.contains("--append-system-prompt") && t.contains("does not use the user's Claude plan"),
+        "{t}"
+    );
     assert!(err.contains("Claude is the brain"), "{err}");
 }
 

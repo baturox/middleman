@@ -353,8 +353,27 @@ pub fn proxy_env(base_url: &str, worker: &str) -> Vec<(String, String)> {
         e("ANTHROPIC_BASE_URL", base_url),
         e("ANTHROPIC_DEFAULT_HAIKU_MODEL", crate::proxy::MARK_FAST),
         e("CLAUDE_CODE_SUBAGENT_MODEL", crate::proxy::MARK_SUB),
+        // agents that pin `model: sonnet` in their definition are workers too (the brain
+        // runs on Opus or Fable)
+        e("ANTHROPIC_DEFAULT_SONNET_MODEL", crate::proxy::MARK_SUB),
         e(SESSION_WORKER_ENV, worker),
     ]
+}
+
+/// Appended to Claude's system prompt so the brain knows its agents are free for the user's
+/// plan, and hands them the heavy work.
+pub fn brain_note(worker: &str, provider: &str) -> String {
+    format!(
+        "middleman: in this session your subagents (the Agent tool, including custom agents) and \
+         background jobs run on a separate worker model ({worker} via {provider}) that does not \
+         use the user's Claude plan; only your own turns do. To save the user's Claude limits, \
+         hand self-contained work that needs a lot of reading or writing (exploring the \
+         codebase, reading long files or logs, implementing a well-specified change, writing \
+         tests or boilerplate, producing drafts) to a subagent with a precise brief, and keep \
+         yourself to planning, decisions and reviewing results. Ask agents for short summaries, \
+         not file dumps. The middleman MCP delegate_task tool is separate and rarely worth it \
+         here: prefer subagents."
+    )
 }
 
 /// The local proxy as a child process. It exits when this handle is dropped (its stdin closes).
@@ -476,6 +495,11 @@ key_env = "MM_TEST_OR_KEY_LAUNCH"
             Some(crate::proxy::MARK_FAST)
         );
         assert_eq!(get(SESSION_WORKER_ENV), Some("w/model"));
+        assert_eq!(
+            get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            Some(crate::proxy::MARK_SUB)
+        );
+        assert!(brain_note("w/model", "miav").contains("does not use the user's Claude plan"));
         // the main model and the login are Claude Code's own: nothing overrides them
         for k in [
             "ANTHROPIC_AUTH_TOKEN",

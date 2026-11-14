@@ -85,7 +85,12 @@ pub fn claude_cmd(cfg_path: &Path, o: Opts) -> Result<ExitCode> {
     })?;
     let cmd = launch::LaunchCmd {
         program: claude.unwrap_or_default(),
-        args: session_args(cfg_path, &cfg, &plan.args),
+        args: session_args(
+            cfg_path,
+            &cfg,
+            &launch::brain_note(&plan.main, plan.upstream.label),
+            &plan.args,
+        ),
         env: launch::proxy_env(&proxy.base_url, &plan.main),
     };
     launch::run_with_proxy(&cmd, proxy)
@@ -93,8 +98,13 @@ pub fn claude_cmd(cfg_path: &Path, o: Opts) -> Result<ExitCode> {
 
 /// `--settings` for this session only: middleman's status line (unless the user turned it off
 /// with `middleman statusline off`), so it shows in any repo without changing settings files.
-fn session_args(cfg_path: &Path, cfg: &Config, passthrough: &[String]) -> Vec<String> {
+/// Also `--append-system-prompt` with the brain note, unless the user passes their own.
+fn session_args(cfg_path: &Path, cfg: &Config, note: &str, passthrough: &[String]) -> Vec<String> {
     let mut args = vec![];
+    if !passthrough.iter().any(|a| a == "--append-system-prompt") {
+        args.push("--append-system-prompt".to_string());
+        args.push(note.to_string());
+    }
     if cfg.statusline.enabled && !passthrough.iter().any(|a| a == "--settings") {
         if let Ok(exe) = std::env::current_exe() {
             let q = middleman::fsutil::shell_quote;
